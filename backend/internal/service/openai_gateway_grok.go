@@ -20,6 +20,8 @@ import (
 const (
 	grokComposerImageBridgeVisionModel     = "grok-build-0.1"
 	grokComposerImageBridgeMaxOutputTokens = 512
+	grokUpstreamUserAgent                  = "sub2api-grok/1.0"
+	grokCLIVersion                         = "0.2.93"
 )
 
 func (s *OpenAIGatewayService) forwardGrokResponses(
@@ -635,13 +637,23 @@ func buildGrokResponsesRequest(ctx context.Context, c *gin.Context, account *Acc
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json, text/event-stream")
-	req.Header.Set("User-Agent", "sub2api-grok/1.0")
+	applyGrokCLIHeaders(req.Header)
 	if c != nil {
 		if v := c.GetHeader("OpenAI-Beta"); strings.TrimSpace(v) != "" {
 			req.Header.Set("OpenAI-Beta", v)
 		}
 	}
 	return req, nil
+}
+
+// applyGrokCLIHeaders identifies proxied subscription traffic as a supported
+// Grok CLI version. The CLI gateway rejects requests without this header.
+func applyGrokCLIHeaders(headers http.Header) {
+	if headers == nil {
+		return
+	}
+	headers.Set("User-Agent", grokUpstreamUserAgent)
+	headers.Set("X-Grok-Client-Version", grokCLIVersion)
 }
 
 func (s *OpenAIGatewayService) updateGrokUsageSnapshot(ctx context.Context, accountID int64, snapshot *xai.QuotaSnapshot) {
