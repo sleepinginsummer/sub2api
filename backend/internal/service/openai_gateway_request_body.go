@@ -132,20 +132,148 @@ func sanitizeEncryptedReasoningInputItem(item any) (next any, changed bool, keep
 	}
 
 	itemType, _ := inputItem["type"].(string)
-	if strings.TrimSpace(itemType) != "reasoning" {
+	switch strings.TrimSpace(itemType) {
+	case "compaction", "compaction_summary":
+		if _, encrypted := inputItem["encrypted_content"]; encrypted {
+			return nil, true, false
+		}
+		return item, false, true
+	case "reasoning":
+	default:
 		return item, false, true
 	}
 
-	_, hasEncryptedContent := inputItem["encrypted_content"]
-	if !hasEncryptedContent {
-		return item, false, true
+	if _, has := inputItem["encrypted_content"]; has {
+		delete(inputItem, "encrypted_content")
+		changed = true
 	}
 
-	delete(inputItem, "encrypted_content")
+	// xAI 422: "content": null 导致 untagged enum 反序列化失败
+	if v, has := inputItem["content"]; has && v == nil {
+		delete(inputItem, "content")
+		changed = true
+	}
+
+	if !changed {
+		return item, false, true
+	}
 	if len(inputItem) == 1 {
 		return nil, true, false
 	}
 	return inputItem, true, true
+}
+
+// SanitizeOpenAICrossModeFailoverReasoning derives a failover attempt body from
+// the canonical request body by dropping provider-specific encrypted reasoning
+// input items in full (encrypted_content plus the coupled id/summary shape).
+//
+// This is the proactive counterpart to the reactive same-account
+// invalid_encrypted_content recovery in Forward: when a failover switches from an
+// OpenAI passthrough account (which forwards upstream-native encrypted reasoning,
+// e.g. Kiro) to a non-passthrough account (e.g. Bedrock Mantle) that rejects the
+// provider-specific reasoning IDs/shape, the whole reasoning item must go before
+// the request reaches the new upstream. Unlike trimOpenAIEncryptedReasoningItems,
+// which only strips the encrypted_content / null-content fields while preserving
+// the reasoning item's id and summary, this drops the entire item.
+//
+// The input slice is treated as immutable and is never mutated; a distinct slice
+// is returned only when changed is true.
+func SanitizeOpenAICrossModeFailoverReasoning(body []byte) (sanitized []byte, changed bool, err error) {
+	if len(body) == 0 {
+		return body, false, nil
+	}
+	if !gjson.GetBytes(body, "input").Exists() {
+		return body, false, nil
+	}
+	var decoded map[string]any
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.UseNumber()
+	if err := decoder.Decode(&decoded); err != nil {
+		return body, false, fmt.Errorf("decode cross-mode failover body: %w", err)
+	}
+	if !dropOpenAIEncryptedReasoningInputItems(decoded) {
+		return body, false, nil
+	}
+	out, marshalErr := marshalOpenAIUpstreamJSON(decoded)
+	if marshalErr != nil {
+		return body, false, fmt.Errorf("serialize cross-mode failover body: %w", marshalErr)
+	}
+	return out, true, nil
+}
+
+// dropOpenAIEncryptedReasoningInputItems removes reasoning input items that carry
+// provider-specific encrypted_content in full — including their coupled id and
+// summary — and reports whether anything changed. Contrast with
+// trimOpenAIEncryptedReasoningItems, which only strips fields while keeping the
+// reasoning item skeleton.
+func dropOpenAIEncryptedReasoningInputItems(reqBody map[string]any) bool {
+	if len(reqBody) == 0 {
+		return false
+	}
+	inputValue, has := reqBody["input"]
+	if !has {
+		return false
+	}
+	switch input := inputValue.(type) {
+	case []any:
+		filtered := input[:0]
+		changed := false
+		for _, item := range input {
+			if isOpenAIEncryptedReasoningInputItem(item) {
+				changed = true
+				continue
+			}
+			filtered = append(filtered, item)
+		}
+		if !changed {
+			return false
+		}
+		if len(filtered) == 0 {
+			delete(reqBody, "input")
+			return true
+		}
+		reqBody["input"] = filtered
+		return true
+	case []map[string]any:
+		filtered := input[:0]
+		changed := false
+		for _, item := range input {
+			if isOpenAIEncryptedReasoningInputItem(item) {
+				changed = true
+				continue
+			}
+			filtered = append(filtered, item)
+		}
+		if !changed {
+			return false
+		}
+		if len(filtered) == 0 {
+			delete(reqBody, "input")
+			return true
+		}
+		reqBody["input"] = filtered
+		return true
+	case map[string]any:
+		if isOpenAIEncryptedReasoningInputItem(input) {
+			delete(reqBody, "input")
+			return true
+		}
+		return false
+	default:
+		return false
+	}
+}
+
+func isOpenAIEncryptedReasoningInputItem(item any) bool {
+	inputItem, ok := item.(map[string]any)
+	if !ok {
+		return false
+	}
+	if itemType, _ := inputItem["type"].(string); strings.TrimSpace(itemType) != "reasoning" {
+		return false
+	}
+	_, has := inputItem["encrypted_content"]
+	return has
 }
 
 func IsOpenAIResponsesCompactPathForTest(c *gin.Context) bool {
@@ -243,7 +371,27 @@ func resolveOpenAICompactSessionID(c *gin.Context) string {
 	return uuid.NewString()
 }
 
+// openAIResponsesRequestPathSuffix 返回可拼接到上游 /responses URL 后面的子路径。
+// 不可转发的子路径返回空串（退化为裸 /responses）；真正的拒绝由入口守卫
+// IsForwardableOpenAIResponsesRequestPath 负责。这样即便将来新增路由漏挂守卫，
+// 拼进上游 URL 的也只会是合规片段。
 func openAIResponsesRequestPathSuffix(c *gin.Context) string {
+	suffix, ok := sanitizedUpstreamPathSuffix(rawOpenAIResponsesRequestPathSuffix(c))
+	if !ok {
+		return ""
+	}
+	return suffix
+}
+
+// IsForwardableOpenAIResponsesRequestPath 判断入站请求携带的 /responses 子路径
+// 是否可以安全转发。路由层用它在鉴权后、调度前直接拒绝畸形子路径。
+func IsForwardableOpenAIResponsesRequestPath(c *gin.Context) bool {
+	_, ok := sanitizedUpstreamPathSuffix(rawOpenAIResponsesRequestPathSuffix(c))
+	return ok
+}
+
+// rawOpenAIResponsesRequestPathSuffix 仅做提取，不做任何安全判断。
+func rawOpenAIResponsesRequestPathSuffix(c *gin.Context) string {
 	if c == nil || c.Request == nil || c.Request.URL == nil {
 		return ""
 	}
@@ -267,8 +415,9 @@ func openAIResponsesRequestPathSuffix(c *gin.Context) string {
 
 func appendOpenAIResponsesRequestPathSuffix(baseURL, suffix string) string {
 	trimmedBase := strings.TrimRight(strings.TrimSpace(baseURL), "/")
-	trimmedSuffix := strings.TrimSpace(suffix)
-	if trimmedBase == "" || trimmedSuffix == "" {
+	// 兜底：调用方漏了校验时，这里也不会把不合规的片段拼进上游 URL。
+	trimmedSuffix, ok := sanitizedUpstreamPathSuffix(suffix)
+	if !ok || trimmedBase == "" || trimmedSuffix == "" {
 		return trimmedBase
 	}
 	return trimmedBase + trimmedSuffix
@@ -365,15 +514,57 @@ func newOpenAIRequestView(body []byte) openAIRequestView {
 	if len(body) == 0 {
 		return openAIRequestView{}
 	}
-	return openAIRequestView{
-		body:               body,
-		Model:              strings.TrimSpace(gjson.GetBytes(body, "model").String()),
-		Stream:             gjson.GetBytes(body, "stream").Bool(),
-		PromptCacheKey:     strings.TrimSpace(gjson.GetBytes(body, "prompt_cache_key").String()),
-		PreviousResponseID: strings.TrimSpace(gjson.GetBytes(body, "previous_response_id").String()),
-		ServiceTier:        strings.TrimSpace(gjson.GetBytes(body, "service_tier").String()),
-		ReasoningEffort:    strings.TrimSpace(gjson.GetBytes(body, "reasoning.effort").String()),
-	}
+
+	const (
+		modelField uint8 = 1 << iota
+		streamField
+		promptCacheKeyField
+		previousResponseIDField
+		serviceTierField
+		reasoningField
+		allRequestViewFields = modelField | streamField | promptCacheKeyField |
+			previousResponseIDField | serviceTierField | reasoningField
+	)
+
+	view := openAIRequestView{body: body}
+	var seen uint8
+	// parseRawJSONView reads body without copying; view keeps body alive for extracted strings.
+	parseRawJSONView(body).ForEach(func(key, value gjson.Result) bool {
+		switch key.Str {
+		case "model":
+			if seen&modelField == 0 {
+				view.Model = strings.TrimSpace(value.String())
+				seen |= modelField
+			}
+		case "stream":
+			if seen&streamField == 0 {
+				view.Stream = value.Bool()
+				seen |= streamField
+			}
+		case "prompt_cache_key":
+			if seen&promptCacheKeyField == 0 {
+				view.PromptCacheKey = strings.TrimSpace(value.String())
+				seen |= promptCacheKeyField
+			}
+		case "previous_response_id":
+			if seen&previousResponseIDField == 0 {
+				view.PreviousResponseID = strings.TrimSpace(value.String())
+				seen |= previousResponseIDField
+			}
+		case "service_tier":
+			if seen&serviceTierField == 0 {
+				view.ServiceTier = strings.TrimSpace(value.String())
+				seen |= serviceTierField
+			}
+		case "reasoning":
+			if seen&reasoningField == 0 {
+				view.ReasoningEffort = strings.TrimSpace(value.Get("effort").String())
+				seen |= reasoningField
+			}
+		}
+		return seen != allRequestViewFields
+	})
+	return view
 }
 
 // Decode 保留阶段一既有 full-map 行为；后续阶段会把调用点下沉到复杂分支。
@@ -525,6 +716,34 @@ func normalizeOpenAIPassthroughOAuthBody(body []byte, compact bool) ([]byte, boo
 		changed = true
 	}
 
+	if inputResult := gjson.GetBytes(normalized, "input"); inputResult.Exists() {
+		switch {
+		case inputResult.Type == gjson.String:
+			text := inputResult.String()
+			var inputValue any
+			if strings.TrimSpace(text) != "" {
+				inputValue = []any{map[string]any{
+					"type": "message", "role": "user", "content": text,
+				}}
+			} else {
+				inputValue = []any{}
+			}
+			next, err := sjson.SetBytes(normalized, "input", inputValue)
+			if err != nil {
+				return body, false, fmt.Errorf("normalize passthrough body input string: %w", err)
+			}
+			normalized = next
+			changed = true
+		case inputResult.Type == gjson.JSON && !inputResult.IsArray():
+			next, err := sjson.SetRawBytes(normalized, "input", []byte("["+inputResult.Raw+"]"))
+			if err != nil {
+				return body, false, fmt.Errorf("normalize passthrough body input object: %w", err)
+			}
+			normalized = next
+			changed = true
+		}
+	}
+
 	if compact {
 		if store := gjson.GetBytes(normalized, "store"); store.Exists() {
 			next, err := sjson.DeleteBytes(normalized, "store")
@@ -565,14 +784,13 @@ func normalizeOpenAIPassthroughOAuthBody(body []byte, compact bool) ([]byte, boo
 }
 
 func detectOpenAIPassthroughInstructionsRejectReason(reqModel string, body []byte) string {
-	model := strings.ToLower(strings.TrimSpace(reqModel))
-	if !strings.Contains(model, "codex") {
+	if !isOpenAICodexModel(reqModel) {
 		return ""
 	}
 
 	instructions := gjson.GetBytes(body, "instructions")
 	if !instructions.Exists() {
-		return "instructions_missing"
+		return ""
 	}
 	if instructions.Type != gjson.String {
 		return "instructions_not_string"
@@ -581,6 +799,10 @@ func detectOpenAIPassthroughInstructionsRejectReason(reqModel string, body []byt
 		return "instructions_empty"
 	}
 	return ""
+}
+
+func isOpenAICodexModel(model string) bool {
+	return strings.Contains(strings.ToLower(strings.TrimSpace(model)), "codex")
 }
 
 // extractOpenAIReasoningEffortFromBody 按优先级传入模型候选（如 upstreamModel,
