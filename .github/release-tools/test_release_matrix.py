@@ -145,6 +145,20 @@ class ReleaseMatrixTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'does not match'):
                 release.plan(args)
 
+    def test_sleepinsum_tag_selects_fork_linux_release(self):
+        sha = 'a' * 40
+        args = argparse.Namespace(ref='v9.8.7-sleepinsum.1', dry_run=False, simple=False, linux_only=False)
+        with patch.dict(os.environ, {'GITHUB_OUTPUT': 'outputs'}), patch.object(
+                subprocess, 'check_output', side_effect=[sha + '\n', sha + '\n']):
+            release.plan(args)
+        output = dict(line.split('=', 1) for line in Path('outputs').read_text().splitlines())
+        self.assertEqual(output['fork_release'], 'true')
+        self.assertEqual(output['linux_only'], 'true')
+        self.assertEqual(json.loads(output['matrix'])['include'], [
+            {'goos': 'linux', 'goarch': 'amd64'},
+            {'goos': 'linux', 'goarch': 'arm64'},
+        ])
+
     def test_dry_run_plan_resolves_matrix_without_a_new_tag(self):
         with patch.dict(os.environ, {'GITHUB_OUTPUT': 'outputs', 'GITHUB_REPOSITORY_OWNER': 'ExampleOwner'}), patch.object(subprocess, 'check_output', return_value='a' * 40 + '\n'):
             release.plan(argparse.Namespace(ref='feature/matrix', dry_run=True, simple=False, linux_only=True))

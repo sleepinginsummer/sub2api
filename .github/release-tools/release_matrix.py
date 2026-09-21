@@ -18,6 +18,7 @@ FULL_CONFIG = Path('.goreleaser.yaml')
 SIMPLE_CONFIG = Path('.goreleaser.simple.yaml')
 VERSION_FILE = Path('backend/cmd/server/VERSION')
 VERSION_RE = re.compile(r'\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?')
+FORK_TAG_MARKER = '-sleepinsum.'
 
 
 def config(simple=False):
@@ -71,12 +72,14 @@ def plan(args):
     if not VERSION_RE.fullmatch(version):
         raise ValueError('invalid VERSION')
     VERSION_FILE.write_text(version + '\n')
+    fork_release = args.ref.startswith('v') and FORK_TAG_MARKER in args.ref
+    linux_only = args.linux_only or fork_release
     result = {'sha': sha, 'tag': tag, 'version': version,
               'owner_lower': os.environ.get('GITHUB_REPOSITORY_OWNER', '').lower(),
-              'simple': str(args.simple).lower(), 'linux_only': str(args.linux_only).lower(),
-              'dry_run': str(args.dry_run).lower(),
+              'simple': str(args.simple).lower(), 'linux_only': str(linux_only).lower(),
+              'fork_release': str(fork_release).lower(), 'dry_run': str(args.dry_run).lower(),
               'date': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
-              'matrix': json.dumps({'include': targets(args.simple, args.linux_only)}, separators=(',', ':'))}
+              'matrix': json.dumps({'include': targets(args.simple, linux_only)}, separators=(',', ':'))}
     with Path(os.environ['GITHUB_OUTPUT']).open('a') as output:
         for key, value in result.items():
             output.write(f'{key}={value}\n')

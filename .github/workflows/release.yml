@@ -35,7 +35,7 @@ permissions:
 
 env:
   SIMPLE_RELEASE: ${{ inputs.simple_release == true || vars.SIMPLE_RELEASE == 'true' }}
-  LINUX_ONLY_RELEASE: ${{ inputs.linux_only == true || startsWith(github.ref_name, 'v') && contains(github.ref_name, '-sleepinsum.') }}
+  REQUESTED_LINUX_ONLY: ${{ inputs.linux_only == true }}
   DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run == true }}
 
 jobs:
@@ -50,6 +50,7 @@ jobs:
       matrix: ${{ steps.plan.outputs.matrix }}
       simple: ${{ steps.plan.outputs.simple }}
       linux_only: ${{ steps.plan.outputs.linux_only }}
+      fork_release: ${{ steps.plan.outputs.fork_release }}
       dry_run: ${{ steps.plan.outputs.dry_run }}
     steps:
       - name: Checkout workflow tooling
@@ -74,7 +75,7 @@ jobs:
         run: |
           args=(--ref "$REQUESTED_REF")
           if [[ "$SIMPLE_RELEASE" == true ]]; then args+=(--simple); fi
-          if [[ "$LINUX_ONLY_RELEASE" == true ]]; then args+=(--linux-only); fi
+          if [[ "$REQUESTED_LINUX_ONLY" == true ]]; then args+=(--linux-only); fi
           if [[ "$DRY_RUN" == true ]]; then args+=(--dry-run); fi
           python "$RUNNER_TEMP/release-tools/release_matrix.py" plan "${args[@]}"
       - uses: actions/upload-artifact@v7
@@ -387,7 +388,7 @@ jobs:
 
   sync-version-file:
     needs: [prepare, release]
-    if: ${{ needs.release.result == 'success' && needs.prepare.outputs.dry_run != 'true' && !contains(needs.prepare.outputs.tag, '-sleepinsum.') }}
+    if: ${{ needs.release.result == 'success' && needs.prepare.outputs.dry_run != 'true' && needs.prepare.outputs.fork_release != 'true' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
