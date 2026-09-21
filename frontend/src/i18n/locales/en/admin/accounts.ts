@@ -217,7 +217,9 @@ export default {
         creditsExhaustedUntil: 'AI Credits exhausted, expected recovery at {time}',
         overloadedUntil: 'Overloaded until {time}',
         viewTempUnschedDetails: 'View temp unschedulable details',
-        tempUnschedulableUntil: 'Resumes {time}'
+        tempUnschedulableUntil: 'Resumes {time}',
+        turnStateHold: 'Degraded pause · {model} is paused on this account while the hunter looks for a ticket; resumes on a hit, re-pauses on the next request after expiry',
+        turnStateHoldShort: 'Degraded'
       },
       columns: {
         name: 'Name',
@@ -249,7 +251,7 @@ export default {
         ungrouped: 'Ungrouped',
         hint: 'Displayed as "group / base score / sticky bonus". The base score is computed within the current filtered candidate set and includes priority, load, queue depth, error rate, first-token latency, reset window, quota headroom, billing rate, and related factors. The sticky bonus applies only when sticky weighting is enabled for previous_response_id or session_hash. Higher scores are preferred.'
       },
-      usageWindowsHint: '"5h / 7d" are the upstream account\'s official rolling usage windows (e.g. OpenAI ChatGPT, Claude). They are imposed by the upstream provider on the account itself — not configured by sub2api, and unrelated to the models you map. Usage resets automatically once each window rolls over, and the limit cannot be lifted from within sub2api.',
+      usageWindowsHint: '"5h / 7d" are the upstream account\'s official rolling usage windows (e.g. OpenAI ChatGPT, Claude). They are imposed by the upstream provider on the account itself — not configured by sub2api, and unrelated to the models you map. Usage resets automatically once each window rolls over, and the limit cannot be lifted from within sub2api. Purple/amber rows are the Codex turn-states currently in effect for this account (one per model); the countdown is the remainder of the one-hour validity from minting, and amber means the ticket looks degraded.',
       ollamaCloud: {
         title: 'Ollama Cloud usage',
         sessionSecurityHint: 'The browser session is encrypted at rest and sent only to the fixed official settings URL.',
@@ -363,8 +365,9 @@ export default {
           normal: 'RPM normal',
           tieredNormal: 'RPM limit (Tiered) - Normal',
           tieredWarning: 'RPM limit (Tiered) - Approaching limit',
-          tieredStickyOnly: 'RPM limit (Tiered) - Sticky only | Buffer: {buffer}',
-          tieredBlocked: 'RPM limit (Tiered) - Blocked | Buffer: {buffer}',
+          // A bare `|` is vue-i18n's plural separator: t() without a count renders only the first form. Use {'|'}.
+          tieredStickyOnly: "RPM limit (Tiered) - Sticky only {'|'} Buffer: {buffer}",
+          tieredBlocked: "RPM limit (Tiered) - Blocked {'|'} Buffer: {buffer}",
           stickyExemptNormal: 'RPM limit (Sticky Exempt) - Normal',
           stickyExemptWarning: 'RPM limit (Sticky Exempt) - Approaching limit',
           stickyExemptOver: 'RPM limit (Sticky Exempt) - Over limit, sticky only'
@@ -523,6 +526,9 @@ export default {
       recoverStateSuccess: 'Account state recovered successfully',
       recoverStateFailed: 'Failed to recover account state',
       fallbackActive: 'Fallback',
+      cprOutbound: 'CPR exit',
+      cprOutboundHint:
+        'The real exit is set on CPR: {endpoint}. The proxy above only covers the sub2api → CPR hop.',
       fallbackActiveTip: 'Origin proxy {origin} expired',
       revertProxy: 'Revert proxy',
       revertProxySuccess: 'Successfully reverted to original proxy',
@@ -663,10 +669,18 @@ export default {
           "Effective only when the switch above is on. When enabled, this account also allows third-party clients that embed the Codex engine over the app-server protocol (e.g. Claude Code's codex plugin); they still pass the global engine-fingerprint gate. OR-combined with the global app-server toggle.",
         codexFingerprintMode: 'Codex fingerprint convergence',
         codexFingerprintModeDesc: 'When multiple users share the same OAuth account, converge device/session identifiers to account-level stable values to reduce upstream-visible device and session count. Off by default (client identifiers pass through as-is); opt in explicitly when needed. Some accounts reported quota shrinkage after enabling convergence, so choose based on your own measurements.',
+        codexFingerprintConvergence: 'Experimental fingerprint convergence (klno)',
+        codexFingerprintConvergenceDesc: "Make this account's outbound identity match a real Codex client on HTTP and WS: forward session-id / thread-id headers, x-client-request-id equals thread-id, drop session_id / conversation_id aliases, derive root_turn_id and related fields consistently, keep UUIDv7. Off means upstream behaviour; enabling rotates the account's session identifiers once.",
         codexFingerprintOff: 'Off (passthrough, default)',
         codexFingerprintDevice: 'Device only',
         codexFingerprintSession: 'Device + Session',
         codexFingerprintFull: 'Full convergence',
+        codexUserAgent: 'Codex outbound User-Agent',
+        codexUserAgentDesc: 'Client identity this account reports upstream, shared by HTTP, the WS handshake and quota queries. '
+          + 'Leave empty to use the global setting. Keep it consistent with the real OS of this account\u0027s users: a Windows UA '
+          + 'paired with Linux paths and shell in the request body contradicts itself. The gateway rewrites the version segment '
+          + 'to the effective client version, so the value you type there does not matter.',
+        codexUserAgentPlaceholder: 'Leave empty to use the global setting',
         codexImageTool: 'Codex image bridge policy',
         codexImageToolDesc:
           'Controls the hosted image_generation bridge and client-declared image tools on Codex /responses text requests. Hosted auto-injection applies only to non-Responses Lite requests. Account policy takes precedence over channel and global settings; standalone image-generation endpoints are unaffected.',
@@ -682,6 +696,77 @@ export default {
         codexImageToolBadgeEnabled: 'Hosted bridge on',
         codexImageToolBadgeDisabled: 'No hosted injection',
         codexImageToolBadgeBlock: 'Client image tools stripped',
+        turnStateOverride: 'Turn-state override',
+        turnStateOverrideDesc: 'One ticket per model: a turn-state is bound to the model that minted it, so it no longer applies once the model changes. Pick a model, paste its blob, and every outbound request on that model carries it, overriding whatever the client echoed. Models with no ticket are left alone. Diagnostic use only.',
+        turnStateOverridePlaceholder: 'Paste a turn-state starting with gAAAAAB...',
+        turnStateOverrideLength: 'Length {n}',
+        turnStateOverrideValidUntil: 'About {minutes} min of validity left (expires {expires})',
+        turnStateOverrideExpired: 'Expired (minted {minted}) — it will not be injected, replace it',
+        turnStateAuto: 'Auto turn-state takeover',
+        turnStateAutoDesc:
+          'When enabled, the system takes over: once a session is seen at 312, the most recent valid 292 for this account and model is injected. If the upstream still mints 312 after injection, that candidate is marked failed and the next one is used; when every candidate for that model fails the account is disabled with the reason recorded. Candidates are bucketed per account and model (a turn-state does not carry across models) and are valid for 1 hour from minting — once expired nothing is injected and the system waits for a fresh 292. The manual value above stops taking effect. HTTP paths only — WebSocket passthrough is not covered.',
+        turnStateAutoTakeover: 'Managed automatically',
+        turnStateModelsEmpty: '(model list unavailable)',
+        turnStateOverrideConfigured: 'Models with a ticket: {models}',
+        turnStateHunter: '292 hunter',
+        turnStateHunterDesc:
+          'Shortly before the live ticket expires, open fresh sessions through the selected proxies until a 292 is minted, then pool it for automatic takeover. Probes hang up as soon as the response headers arrive; the main cost is the input tokens of each probe (including the model base prompt). While the hunter is on, every session gets the pooled ticket. Hourly cap applies; models without real traffic inside the idle window are not hunted. Every probe opens a new proxy connection, so webshare -rotate endpoints change exit per probe; other proxies are treated as fixed exits: the exit IP is resolved before probing, each exit is probed once, and an exit that minted 312 is left alone for 7 days.',
+        turnStateHunterNeedsAuto: 'Enable automatic takeover first, otherwise the hunter does not run',
+        turnStateHunterInvalid: 'With the hunter enabled, pick 1–8 models (or tick auto) and 1–64 proxies',
+        turnStateHunterAutoModels: 'Pick models from real traffic automatically (every model with real requests inside the idle window that upstream has minted a turn-state for is hunted; image models are excluded; manual picks above are ignored)',
+        turnStateHunterEffortDefault: 'default (high)',
+        turnStateHunterModels: 'Models to hunt',
+        turnStateHunterProxies: 'Probe proxies',
+        turnStateHunterRotating: 'Tick proxies that change exit on every connection (webshare -rotate is detected automatically); unticked ones are fixed exits: probed once per round, an exit that minted 312 cools down for 7 days',
+        turnStateHunterMaxPerHour: 'Max probes per hour',
+        turnStateHunterGap: 'Gap between probes (s)',
+        turnStateHunterLead: 'Open window before expiry (min)',
+        turnStateHunterIdle: 'Idle threshold (min, -1 = off)',
+        turnStateHunterEffort: 'Probe reasoning effort',
+        turnStateHunterUsageKey: 'Usage API key ID (blank = no usage log)',
+        turnStateHunterUsageKeyDesc:
+          'When set, every 200 probe is recorded under this key through the standard usage path (type "Hunter probe", billed normally, bumps last-used); input tokens are estimated locally (base prompt included), output is always 0. Use a dedicated key: probes consume its quota/rate limits, and subscription groups need an active subscription.',
+        turnStateHunterHold: 'Pause scheduling while degraded',
+        turnStateHunterHoldDesc:
+          'When a hunted model has no injectable 292, pause that model on this account for one idle window (idle_minutes) and fail the request over (503 if no other account); after expiry the next request re-pauses it if still no ticket, and a new ticket resumes it immediately. Other models are unaffected; a model nobody requests anymore simply expires.',
+        turnStateRecovery: 'Degradation recovery probe',
+        turnStateRecoveryDesc:
+          "Probes through the account's own exit at randomized intervals; a streak of healthy 292 mints marks the account as recovered, while the same number of consecutive failures starts a cooldown. Independent of the hunter (works with the hunter off), it only records a marker and a log line and never changes any setting. Probing stops once marked, and a natural 312 from real traffic clears the marker.",
+        turnStateRecoveryModel: 'Probe model',
+        turnStateRecoveryModelAuto: 'blank = latest model with traffic',
+        turnStateRecoveryStreak: 'Streak target',
+        turnStateRecoveryCooldown: 'Failure cooldown (hours)',
+        turnStateRecoveryMin: 'Min interval (minutes)',
+        turnStateRecoveryMax: 'Max interval (minutes)',
+        turnStatePool: {
+          empty: 'Turn-state —',
+          starved: 'Turn-state: no ticket, passing through',
+          manualTag: 'manual',
+          observedTag: 'last minted',
+          summary: '{n} model(s) with a live turn-state',
+          summaryObservedOnly: 'no live ticket, {n} reading(s) only',
+          detail: '{model}: {shape} {health}, minted {minted}, expires {expires}',
+          healthy: 'full',
+          suspect: 'suspect',
+          hunterSummary: 'hunter {count}/{max} this hour · {next} · {last}',
+          hunterNext: 'next {time}',
+          hunterReady: 'ready',
+          hunterProbing: 'probing',
+          recoverySummary: 'recovery {streak}/{target} · {next}',
+          recoveryCooling: 'cooling until {time}',
+          recoveryDone: 'recovered · {time}',
+          hunterGateIdle: 'paused: no traffic',
+          hunterGateHeld: 'degraded pause: hunting a ticket',
+          hunterGateFresh: 'ticket still fresh',
+          hunterNeedsAuto: 'hunter inactive: enable automatic takeover first',
+          // A bare `@` is vue-i18n's linked-message prefix and throws in production builds; use {'@'}.
+          hunterLast: "last {result} {'@'}{proxy} {time}",
+          hunterLastNone: 'no probe yet',
+          hunterResultHit: '{chars}✓',
+          hunterResultMiss: '{chars}',
+          hunterResultError: 'error {status} {error}',
+          hunterDetail: "{time} {model} {'@'}{proxy}{exit}: {result}, headers in {latency}",
+        },
         compactMode: 'Compact mode',
         compactModeDesc:
           'Controls how this account participates in /responses/compact routing. Auto follows probe results, Force On always allows, Force Off always excludes.',
@@ -847,7 +932,7 @@ export default {
         bulkDisableHint: 'Saving will disable header override and clear existing configuration on the selected accounts.',
         bulkReplaceHint: 'Saving will replace the existing header override configuration on all selected accounts with the rows below.',
         bulkEmptyRows: 'Add at least one header row before saving, or turn the toggle off to clear existing configuration.',
-        invalidName: 'Invalid header name (only letters, digits and !#$%&\'*+-.^_`|~ are allowed)',
+        invalidName: "Invalid header name (only letters, digits and !#$%&'*+-.^_`{'|'}~ are allowed)",
         blockedName: 'This header cannot be overridden (auth and connection-control headers are managed by the system)',
         duplicateName: 'Duplicate header name (matching is case-insensitive)',
         invalidValue: 'Invalid header value (control characters are not allowed; max length 8192)',
@@ -1056,6 +1141,24 @@ export default {
         apiKeyHint: 'API Key for the upstream service',
         pleaseEnterBaseUrl: 'Please enter upstream Base URL',
         pleaseEnterApiKey: 'Please enter upstream API Key'
+      },
+      // CPR (codex-proxy-rs) relay
+      cpr: {
+        typeHint: 'codex-proxy-rs relay',
+        baseUrl: 'CPR Gateway URL',
+        baseUrlHint: 'Where codex-proxy-rs listens, e.g. http://127.0.0.1:18081. Required; it never falls back to the official endpoint.',
+        clientKey: 'CPR Client Key',
+        clientKeyHint: 'A key created under "Client Keys" in CPR. It should be bound to a single group containing exactly one CPR account.',
+        accountId: 'CPR Account ID',
+        accountIdHint: 'The account id in CPR (looks like acct_xxx), used to read quota.',
+        adminApiKey: 'CPR Admin API Key',
+        adminApiKeyHint: "CPR's admin API key (starts with admin-), used only to read quota and account status.",
+        adminBaseUrl: 'CPR Admin URL (optional)',
+        adminBaseUrlHint: 'Defaults to the gateway URL when left empty.',
+        baseUrlRequired: 'Please enter the CPR gateway URL',
+        clientKeyRequired: 'Please enter the CPR client key',
+        accountIdRequired: 'Please enter the CPR account ID',
+        adminApiKeyRequired: 'Please enter the CPR admin API key'
       },
       // OAuth flow
       oauth: {

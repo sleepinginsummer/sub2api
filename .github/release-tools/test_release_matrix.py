@@ -32,10 +32,10 @@ class ReleaseMatrixTest(unittest.TestCase):
         Path('backend/cmd/server').mkdir(parents=True)
         release.VERSION_FILE.write_text('9.8.7\n')
 
-    def fixture_artifacts(self, simple=False):
+    def fixture_artifacts(self, simple=False, linux_only=False):
         directory = Path('release-input')
         directory.mkdir()
-        for target in release.targets(simple):
+        for target in release.targets(simple, linux_only):
             name = release.archive_name('9.8.7', target)
             archive = directory / name
             if target['goos'] == 'linux':
@@ -49,14 +49,19 @@ class ReleaseMatrixTest(unittest.TestCase):
             metadata = {'version': '9.8.7', 'sha': 'a' * 40, 'target': target,
                         'archive': name, 'sha256': release.sha256(archive)}
             (directory / f"manifest-{target['goos']}-{target['goarch']}.json").write_text(json.dumps(metadata))
-        return argparse.Namespace(input='release-input', version='9.8.7', sha='a' * 40, simple=simple, output='contexts')
-
-    def test_full_and_simple_matrix_match_existing_targets(self):
+        return argparse.Namespace(input='release-input', version='9.8.7', sha='a' * 40,
+                                  simple=simple, linux_only=linux_only, output='contexts')
+    def test_full_simple_and_linux_only_matrices(self):
         full = release.targets()
         self.assertEqual(len(full), 5)
         self.assertNotIn({'goos': 'windows', 'goarch': 'arm64'}, full)
         self.assertEqual(release.targets(True), [{'goos': 'linux', 'goarch': 'amd64'}])
-
+        self.assertEqual(release.targets(linux_only=True), [
+            {'goos': 'linux', 'goarch': 'amd64'},
+            {'goos': 'linux', 'goarch': 'arm64'},
+        ])
+        with self.assertRaisesRegex(ValueError, 'mutually exclusive'):
+            release.targets(simple=True, linux_only=True)
     def test_leaf_keeps_packaging_and_selects_only_one_target(self):
         original = release.config()
         release.generate_config(argparse.Namespace(mode='build', simple=False, goos='darwin', goarch='arm64', output='leaf.yaml'))
@@ -94,6 +99,15 @@ class ReleaseMatrixTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'checksum mismatch'):
             release.verify(args)
 
+    def test_linux_only_verifies_two_archives(self):
+        args = self.fixture_artifacts(linux_only=True)
+        release.verify(args)
+        names = {path.name for path in Path(args.input).glob('sub2api_*')}
+        self.assertEqual(names, {
+            'sub2api_9.8.7_linux_amd64.tar.gz',
+            'sub2api_9.8.7_linux_arm64.tar.gz',
+        })
+
     def test_missing_extra_and_wrong_commit_artifacts_are_rejected(self):
         args = self.fixture_artifacts(True)
         args.sha = 'b' * 40
@@ -122,7 +136,7 @@ class ReleaseMatrixTest(unittest.TestCase):
             self.assertEqual(binary.stat().st_mode & 0o777, 0o755)
 
     def test_plan_requires_a_tag_for_publication(self):
-        args = argparse.Namespace(ref='main', dry_run=False, simple=False)
+        args = argparse.Namespace(ref='main', dry_run=False, simple=False, linux_only=False)
         with patch.object(subprocess, 'check_output', return_value='a' * 40 + '\n'):
             with self.assertRaisesRegex(ValueError, 'version tag'):
                 release.plan(args)
@@ -133,12 +147,12 @@ class ReleaseMatrixTest(unittest.TestCase):
 
     def test_dry_run_plan_resolves_matrix_without_a_new_tag(self):
         with patch.dict(os.environ, {'GITHUB_OUTPUT': 'outputs', 'GITHUB_REPOSITORY_OWNER': 'ExampleOwner'}), patch.object(subprocess, 'check_output', return_value='a' * 40 + '\n'):
-            release.plan(argparse.Namespace(ref='feature/matrix', dry_run=True, simple=False))
+            release.plan(argparse.Namespace(ref='feature/matrix', dry_run=True, simple=False, linux_only=True))
         output = dict(line.split('=', 1) for line in Path('outputs').read_text().splitlines())
         self.assertEqual(output['dry_run'], 'true')
+        self.assertEqual(output['linux_only'], 'true')
         self.assertEqual(output['owner_lower'], 'exampleowner')
-        self.assertEqual(len(json.loads(output['matrix'])['include']), 5)
-
+        self.assertEqual(len(json.loads(output['matrix'])['include']), 2)
     def test_docker_commands_do_not_publish_during_dry_run(self):
         fake_bin = Path('bin')
         fake_bin.mkdir()

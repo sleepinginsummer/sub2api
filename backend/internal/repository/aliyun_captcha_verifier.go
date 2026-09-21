@@ -65,17 +65,24 @@ func (v *aliyunCaptchaVerifier) VerifyCaptcha(ctx context.Context, cred service.
 func normalizeAliyunCaptchaError(err error) error {
 	var teaErr *tea.SDKError
 	if errors.As(err, &teaErr) {
-		return &service.AliyunCaptchaAPIError{
-			Code:    tea.StringValue(teaErr.Code),
-			Message: tea.StringValue(teaErr.Message),
+		// TeaSDKError 会把网络错误的空 code 序列化成 "<nil>"，不能当作上游业务错误。
+		if code := tea.StringValue(teaErr.Code); code != "" && code != "<nil>" {
+			return &service.AliyunCaptchaAPIError{
+				Code:    code,
+				Message: tea.StringValue(teaErr.Message),
+			}
 		}
+		return err
 	}
 	var daraErr *dara.SDKError
 	if errors.As(err, &daraErr) {
-		return &service.AliyunCaptchaAPIError{
-			Code:    dara.StringValue(daraErr.Code),
-			Message: dara.StringValue(daraErr.Message),
+		if code := dara.StringValue(daraErr.Code); code != "" && code != "<nil>" {
+			return &service.AliyunCaptchaAPIError{
+				Code:    code,
+				Message: dara.StringValue(daraErr.Message),
+			}
 		}
+		return err
 	}
 	return err
 }

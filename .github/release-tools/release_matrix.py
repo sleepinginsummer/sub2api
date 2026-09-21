@@ -24,15 +24,20 @@ def config(simple=False):
     return yaml.safe_load((SIMPLE_CONFIG if simple else FULL_CONFIG).read_text())
 
 
-def targets(simple=False):
+def targets(simple=False, linux_only=False):
+    if simple and linux_only:
+        raise ValueError('simple and linux-only release modes are mutually exclusive')
     build = config()['builds'][0]
     result = []
     for goos, goarch in itertools.product(build['goos'], build['goarch']):
         item = {'goos': goos, 'goarch': goarch}
         if any(all(item.get(k) == v for k, v in rule.items()) for rule in build.get('ignore', [])):
             continue
-        if not simple or item == {'goos': 'linux', 'goarch': 'amd64'}:
-            result.append(item)
+        if simple and item != {'goos': 'linux', 'goarch': 'amd64'}:
+            continue
+        if linux_only and goos != 'linux':
+            continue
+        result.append(item)
     if not result:
         raise ValueError('empty release target matrix')
     return result
@@ -68,9 +73,10 @@ def plan(args):
     VERSION_FILE.write_text(version + '\n')
     result = {'sha': sha, 'tag': tag, 'version': version,
               'owner_lower': os.environ.get('GITHUB_REPOSITORY_OWNER', '').lower(),
-              'simple': str(args.simple).lower(), 'dry_run': str(args.dry_run).lower(),
+              'simple': str(args.simple).lower(), 'linux_only': str(args.linux_only).lower(),
+              'dry_run': str(args.dry_run).lower(),
               'date': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
-              'matrix': json.dumps({'include': targets(args.simple)}, separators=(',', ':'))}
+              'matrix': json.dumps({'include': targets(args.simple, args.linux_only)}, separators=(',', ':'))}
     with Path(os.environ['GITHUB_OUTPUT']).open('a') as output:
         for key, value in result.items():
             output.write(f'{key}={value}\n')
@@ -122,7 +128,7 @@ def collect(args):
 def verify(args):
     directory = Path(args.input)
     expected = set()
-    for target in targets(args.simple):
+    for target in targets(args.simple, args.linux_only):
         name = archive_name(args.version, target)
         manifest_name = f"manifest-{target['goos']}-{target['goarch']}.json"
         expected.update((name, manifest_name))
@@ -136,7 +142,7 @@ def verify(args):
 
 def contexts(args):
     verify(args)
-    for target in targets(args.simple):
+    for target in targets(args.simple, args.linux_only):
         if target['goos'] != 'linux':
             continue
         dest = Path(args.output) / target['goarch']
@@ -160,6 +166,7 @@ def main():
     p = commands.add_parser('plan')
     p.add_argument('--ref', required=True)
     p.add_argument('--simple', action='store_true')
+    p.add_argument('--linux-only', action='store_true')
     p.add_argument('--dry-run', action='store_true')
     p.set_defaults(run=plan)
     p = commands.add_parser('config')
@@ -178,6 +185,7 @@ def main():
         for arg in ('version', 'sha', 'input'):
             p.add_argument('--' + arg, required=True)
         p.add_argument('--simple', action='store_true')
+        p.add_argument('--linux-only', action='store_true')
         if command == 'contexts':
             p.add_argument('--output', required=True)
         p.set_defaults(run=handler)

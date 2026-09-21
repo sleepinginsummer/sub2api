@@ -15,6 +15,11 @@ on:
         required: false
         type: boolean
         default: false
+      linux_only:
+        description: 'Linux release: amd64/arm64 archives and GHCR images'
+        required: false
+        type: boolean
+        default: false
       dry_run:
         description: 'Build and verify all selected artifacts without publishing'
         required: false
@@ -30,6 +35,7 @@ permissions:
 
 env:
   SIMPLE_RELEASE: ${{ inputs.simple_release == true || vars.SIMPLE_RELEASE == 'true' }}
+  LINUX_ONLY_RELEASE: ${{ inputs.linux_only == true || startsWith(github.ref_name, 'v') && contains(github.ref_name, '-sleepinsum.') }}
   DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run == true }}
 
 jobs:
@@ -67,6 +73,7 @@ jobs:
         run: |
           args=(--ref "$REQUESTED_REF")
           if [[ "$SIMPLE_RELEASE" == true ]]; then args+=(--simple); fi
+          if [[ "$LINUX_ONLY_RELEASE" == true ]]; then args+=(--linux-only); fi
           if [[ "$DRY_RUN" == true ]]; then args+=(--dry-run); fi
           python "$RUNNER_TEMP/release-tools/release_matrix.py" plan "${args[@]}"
       - uses: actions/upload-artifact@v7
@@ -224,6 +231,7 @@ jobs:
         run: |
           args=(--version "$RELEASE_VERSION" --sha "$RELEASE_SHA" --input release-input --output .release-context)
           if [[ "$SIMPLE_RELEASE" == true ]]; then args+=(--simple); fi
+          if [[ "$LINUX_ONLY_RELEASE" == true ]]; then args+=(--linux-only); fi
           python "$RUNNER_TEMP/release-tools/release_matrix.py" contexts "${args[@]}"
       - uses: actions/setup-go@v6
         with:
