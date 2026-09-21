@@ -387,7 +387,7 @@ jobs:
 
   sync-version-file:
     needs: [prepare, release]
-    if: ${{ needs.release.result == 'success' && needs.prepare.outputs.dry_run != 'true' }}
+    if: ${{ needs.release.result == 'success' && needs.prepare.outputs.dry_run != 'true' && !contains(needs.prepare.outputs.tag, '-sleepinsum.') }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
