@@ -49,6 +49,7 @@ jobs:
       date: ${{ steps.plan.outputs.date }}
       matrix: ${{ steps.plan.outputs.matrix }}
       simple: ${{ steps.plan.outputs.simple }}
+      linux_only: ${{ steps.plan.outputs.linux_only }}
       dry_run: ${{ steps.plan.outputs.dry_run }}
     steps:
       - name: Checkout workflow tooling
@@ -205,6 +206,7 @@ jobs:
       packages: write
     env:
       SIMPLE_RELEASE: ${{ needs.prepare.outputs.simple }}
+      LINUX_ONLY_RELEASE: ${{ needs.prepare.outputs.linux_only }}
       DRY_RUN: ${{ needs.prepare.outputs.dry_run }}
       RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
       RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
