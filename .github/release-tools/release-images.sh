@@ -30,9 +30,11 @@ if [[ ${DRY_RUN:-false} != true && ${SIMPLE_RELEASE:-false} != true ]]; then
   major=${RELEASE_VERSION%%.*}
   minor=${RELEASE_VERSION#*.}; minor=${minor%%.*}
   for registry in "${registries[@]}"; do
-    docker buildx imagetools create \
-      --tag "$registry:$RELEASE_VERSION" --tag "$registry:latest" \
-      --tag "$registry:$major.$minor" --tag "$registry:$major" \
+    manifest_tags=(--tag "$registry:$RELEASE_VERSION")
+    if [[ ${FORK_RELEASE:-false} != true ]]; then
+      manifest_tags+=(--tag "$registry:latest" --tag "$registry:$major.$minor" --tag "$registry:$major")
+    fi
+    docker buildx imagetools create "${manifest_tags[@]}" \
       "$registry:$RELEASE_VERSION-amd64" "$registry:$RELEASE_VERSION-arm64"
   done
 fi
