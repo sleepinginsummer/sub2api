@@ -31,7 +31,7 @@ CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 
 # Configuration
-GITHUB_REPO="${GITHUB_REPO:-KlN-4096/sub2api}"  # klno fork; override with env for upstream
+GITHUB_REPO="${GITHUB_REPO:-sleepinginsummer/sub2api}"  # 本地 fork；可通过环境变量覆盖
 INSTALL_DIR="/opt/sub2api"
 SERVICE_NAME="sub2api"
 SERVICE_USER="sub2api"

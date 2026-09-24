@@ -6,6 +6,7 @@ FRONTEND_CRITICAL_VITEST := \
 	src/components/account/__tests__/AccountTurnStateCell.spec.ts \
 	src/components/account/__tests__/AccountStatusIndicator.spec.ts \
 	src/components/account/__tests__/EditAccountModal.spec.ts \
+	src/components/common/__tests__/VersionBadge.spec.ts \
 	src/api/__tests__/client.spec.ts \
 	src/api/__tests__/tokenRefresh.spec.ts \
 	src/api/__tests__/keys.bulkUpdate.spec.ts \
@@ -13,6 +14,7 @@ FRONTEND_CRITICAL_VITEST := \
 	src/components/account/__tests__/OpenAIReferralCell.transport.spec.ts \
 	src/components/account/__tests__/OpenAIQuotaResetCell.spark_shadow.spec.ts \
 	src/components/keys/__tests__/BulkEditKeysModal.spec.ts \
+	src/components/admin/user/__tests__/UserPlatformQuotaModal.spec.ts \
 	src/views/user/__tests__/KeysView.spec.ts \
 	src/api/__tests__/channelMonitorV2.spec.ts \
 	src/views/auth/__tests__/LinuxDoCallbackView.spec.ts \

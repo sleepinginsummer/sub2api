@@ -25,18 +25,12 @@ var ErrSparkShadowResetNotSupported = infraerrors.New(http.StatusConflict, "SPAR
 
 // Endpoints used by the OpenAI/ChatGPT/Codex quota query and reset feature.
 const (
-	chatGPTUsageURL             = "https://chatgpt.com/backend-api/wham/usage"
-	chatGPTRateLimitCreditsURL  = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits"
-	chatGPTRateLimitResetURL    = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume"
-	openaiQuotaUpstreamTimeout  = 20 * time.Second
-	openaiQuotaCodexBeta        = "codex-1"
-	openaiQuotaCodexOriginator  = "Codex Desktop"
-	openaiQuotaCodexLanguageTag = "zh-CN"
-	openaiQuotaSecFetchSite     = "none"
-	openaiQuotaSecFetchMode     = "no-cors"
-	openaiQuotaSecFetchDest     = "empty"
-	openaiQuotaResetCreditsKey  = "codex_reset_credit_snapshot"
-	openaiQuotaCreditsKey       = "codex_credits_snapshot"
+	chatGPTUsageURL            = "https://chatgpt.com/backend-api/wham/usage"
+	chatGPTRateLimitCreditsURL = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits"
+	chatGPTRateLimitResetURL   = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume"
+	openaiQuotaUpstreamTimeout = 20 * time.Second
+	openaiQuotaResetCreditsKey = "codex_reset_credit_snapshot"
+	openaiQuotaCreditsKey      = "codex_credits_snapshot"
 )
 
 // OpenAIRateLimitWindow describes a single rate-limit window returned by
@@ -450,10 +444,24 @@ func (s *OpenAIQuotaService) resetCredit(ctx context.Context, accountID int64, c
 	return &payload, nil
 }
 
-// prepareUpstreamCall loads the account, validates it, obtains a fresh access
-// token via the shared TokenProvider, and resolves the chatgpt-account-id and
-// proxy URL. Centralized so QueryUsage / ResetCredit share validation.
+// prepareUpstreamCall is prepareUpstreamCredentials plus the outbound HTTP client
+// that QueryUsage / ResetCredit send with.
 func (s *OpenAIQuotaService) prepareUpstreamCall(ctx context.Context, accountID int64, forReset bool) (*openAIQuotaCall, error) {
+	call, err := s.prepareUpstreamCredentials(ctx, accountID, forReset)
+	if err != nil {
+		return nil, err
+	}
+	call.client, err = s.privacyClientFactory(call.proxyURL)
+	if err != nil {
+		return nil, infraerrors.Newf(http.StatusBadGateway, "OPENAI_QUOTA_CLIENT_ERROR", "failed to build upstream client: %v", err)
+	}
+	return call, nil
+}
+
+// prepareUpstreamCredentials loads the account, validates it, obtains a fresh access
+// token via the shared TokenProvider, and resolves the chatgpt-account-id and
+// proxy URL. Centralized so QueryUsage / ResetCredit / referral share validation.
+func (s *OpenAIQuotaService) prepareUpstreamCredentials(ctx context.Context, accountID int64, forReset bool) (*openAIQuotaCall, error) {
 	call, err := s.loadQuotaCallSnapshot(ctx, accountID, forReset)
 	if err != nil {
 		return nil, err
@@ -480,10 +488,6 @@ func (s *OpenAIQuotaService) prepareUpstreamCall(ctx context.Context, accountID 
 		if strings.TrimSpace(call.accessToken) == "" {
 			return nil, infraerrors.New(http.StatusBadGateway, "OPENAI_QUOTA_TOKEN_UNAVAILABLE", "access token is empty")
 		}
-	}
-	call.client, err = s.privacyClientFactory(call.proxyURL)
-	if err != nil {
-		return nil, infraerrors.Newf(http.StatusBadGateway, "OPENAI_QUOTA_CLIENT_ERROR", "failed to build upstream client: %v", err)
 	}
 	return call, nil
 }

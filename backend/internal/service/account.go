@@ -2107,6 +2107,8 @@ func (a *Account) SupportsOpenAIImageCapability(capability OpenAIImagesCapabilit
 		return false
 	}
 	switch capability {
+	case OpenAIImagesCapabilityAPIKey:
+		return a.Type == AccountTypeAPIKey
 	case OpenAIImagesCapabilityBasic, OpenAIImagesCapabilityNative:
 		// cpr 走 {base_url}/v1/images/*（CPR openai/router.rs 的 images 路由），
 		// 形状与 API key 一路完全相同。

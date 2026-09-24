@@ -209,7 +209,7 @@ func (r *usageErrorAccountRepo) ClearError(ctx context.Context, id int64) error 
 }
 
 func TestAccountUsageService_OpenAIQueriesPreserveRefreshError(t *testing.T) {
-	for _, scenario := range []string{"cached_expired_access", "cached_valid_access_invalid_refresh", "failed_probe_missing_access"} {
+	for _, scenario := range []string{"cached_expired_access", "cached_valid_access_invalid_refresh", "failed_probe_missing_access", "probe_throttled"} {
 		for _, query := range []string{"usage", "usage_batch", "forced_usage_batch", "today", "today_batch"} {
 			t.Run(scenario+"/"+query, func(t *testing.T) {
 				const message = "Token refresh failed (non-retryable): refresh_token_invalidated"
@@ -227,6 +227,10 @@ func TestAccountUsageService_OpenAIQueriesPreserveRefreshError(t *testing.T) {
 					}
 					account.Credentials["expires_at"] = expiresAt.Format(time.RFC3339)
 					account.Extra = map[string]any{"codex_5h_used_percent": 18.0, "codex_7d_used_percent": 34.0}
+				}
+				if scenario == "probe_throttled" {
+					// 本分支的探测节流在额度服务里；快照够新就不探测，效果相同。
+					account.Extra = map[string]any{"codex_usage_updated_at": time.Now().Format(time.RFC3339)}
 				}
 				// Forced requests take the probe path, but fail locally without
 				// credentials; no external network is needed for this regression.

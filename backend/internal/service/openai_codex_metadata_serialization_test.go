@@ -15,13 +15,17 @@ import (
 
 const metadataSerializationUnknown = `"z_extra" : {"z":9007199254740993, "a":1.2300e+04, "text":"\u4e2d\u6587\ud83d\ude00 <>&", "raw":"中文😀", "escape":"\\u003c"}`
 
+// metadataSerializationUnknownWire 是改写后的出站形态：只有裸非 ASCII 按真客户端写成 \uXXXX，
+// 其余字节（键序、空白、数字写法、已有转义）不动。
+const metadataSerializationUnknownWire = `"z_extra" : {"z":9007199254740993, "a":1.2300e+04, "text":"\u4e2d\u6587\ud83d\ude00 <>&", "raw":"\u4e2d\u6587\ud83d\ude00", "escape":"\\u003c"}`
+
 func metadataSerializationFixture() string {
 	return `{ ` + metadataSerializationUnknown + `, ` + convTestTurnMetadata()[1:]
 }
 
 func requireMetadataSerializationPreserved(t *testing.T, raw string) {
 	t.Helper()
-	require.True(t, strings.HasPrefix(raw, `{ `+metadataSerializationUnknown+`, `), raw)
+	require.True(t, strings.HasPrefix(raw, `{ `+metadataSerializationUnknownWire+`, `), raw)
 	require.Less(t, strings.Index(raw, `"installation_id"`), strings.Index(raw, `"session_id"`), raw)
 	require.Less(t, strings.Index(raw, `"window_id"`), strings.Index(raw, `"context_window_id"`), raw)
 }
@@ -31,7 +35,8 @@ func TestCodexMetadataSerializationNamespace(t *testing.T) {
 		t.Run(fmt.Sprint(enabled), func(t *testing.T) {
 			account := convTestAccount(enabled)
 			raw := `  { "session_id" : "old", ` + metadataSerializationUnknown + `, "session\u005fid":"last", "turn_id":"turn", "root_turn_id":"turn" }  `
-			want := strings.ReplaceAll(raw, `"old"`, `"`+scopeCodexAccountIdentityValue(account, 77, "session", "last")+`"`)
+			want := strings.Replace(raw, metadataSerializationUnknown, metadataSerializationUnknownWire, 1)
+			want = strings.ReplaceAll(want, `"old"`, `"`+scopeCodexAccountIdentityValue(account, 77, "session", "last")+`"`)
 			want = strings.ReplaceAll(want, `"last"`, `"`+scopeCodexAccountIdentityValue(account, 77, "session", "last")+`"`)
 			want = strings.Replace(want, `"turn_id":"turn"`, `"turn_id":"`+scopeCodexAccountIdentityValue(account, 77, "turn", "turn")+`"`, 1)
 			if enabled {
@@ -58,7 +63,8 @@ func TestCodexMetadataSerializationFingerprint(t *testing.T) {
 					windowNumber: 2, turnStartedAtUnixMs: 1234,
 				}
 				raw := `  { ` + metadataSerializationUnknown + `, "installation_id":"old-install", "session_id":"old-session", "thread_id":"old-thread", "turn_id":"old-turn", "root_turn_id":"` + root + `", "window_id":"old-window", "window_number":1, "turn_started_at_unix_ms":12 }  `
-				want := strings.Replace(raw, `"old-install"`, `"new-install"`, 1)
+				want := strings.Replace(raw, metadataSerializationUnknown, metadataSerializationUnknownWire, 1)
+				want = strings.Replace(want, `"old-install"`, `"new-install"`, 1)
 				if mode != codexFingerprintDevice {
 					want = strings.NewReplacer(`"old-session"`, `"new-session"`, `"old-thread"`, `"new-thread"`,
 						`"old-turn"`, `"new-turn"`, `"old-window"`, `"new-thread:2"`,

@@ -69,27 +69,40 @@ func rewriteCodexTurnMetadataJSON(raw string, rebuildInvalid bool, updates func(
 			return original
 		}
 	}
-	return next
+	return codexTurnMetadataASCII(next)
 }
 
 // New scalar values follow Codex's ASCII JSON spelling, without HTML escaping.
-// Existing metadata text is deliberately not normalized through this encoder.
 func marshalCodexTurnMetadataValue(value any) (string, error) {
 	raw, err := marshalOpenAIUpstreamJSON(value)
 	if err != nil {
 		return "", err
 	}
-	out := make([]byte, 0, len(raw))
-	for _, r := range string(raw) {
-		switch {
-		case r < 0x80:
-			out = append(out, byte(r))
-		case r <= 0xffff:
-			out = fmt.Appendf(out, `\u%04x`, r)
-		default:
-			high, low := utf16.EncodeRune(r)
-			out = fmt.Appendf(out, `\u%04x\u%04x`, high, low)
+	return codexTurnMetadataASCII(string(raw)), nil
+}
+
+// codexTurnMetadataASCII escapes non-ASCII as \uXXXX, like the real client's
+// to_ascii_json_string (codex-rs utils/string/src/json.rs): turn metadata is also an
+// HTTP header. Client text that is already ASCII stays byte-identical, and non-ASCII
+// can only appear inside JSON strings, so decoded values do not change.
+func codexTurnMetadataASCII(raw string) string {
+	for i := 0; i < len(raw); i++ {
+		if raw[i] < 0x80 {
+			continue
 		}
+		out := []byte(raw[:i])
+		for _, r := range raw[i:] {
+			switch {
+			case r < 0x80:
+				out = append(out, byte(r))
+			case r <= 0xffff:
+				out = fmt.Appendf(out, `\u%04x`, r)
+			default:
+				high, low := utf16.EncodeRune(r)
+				out = fmt.Appendf(out, `\u%04x\u%04x`, high, low)
+			}
+		}
+		return string(out)
 	}
-	return string(out), nil
+	return raw
 }

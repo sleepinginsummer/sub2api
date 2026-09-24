@@ -254,6 +254,8 @@ func (s *OpenAIGatewayService) sweepOpenAICodexTurnStateOrigins() {
 	})
 }
 
+// 已废弃（2026-09-23）：手填覆写同样依赖「注入 292 能换回正常服务」，已失效，后续版本移除。
+//
 // openAITurnStateOverrideExtraKey 是账号级 turn-state 覆写开关。空值=功能不存在，
 // 出站行为与改动前逐字节一致。
 //
@@ -304,8 +306,9 @@ func readOpenAITurnStateOverrides(a *Account) map[string]string {
 }
 
 // OpenAICodexTurnStateOverride 返回本次模型对应的手填覆写值；未配置、模型对不上、
-// 过期或账号类型不适用时返回空串。只对最终落到 ChatGPT Codex 后端的账号生效
-// （oauth / setup-token / cpr）——其余上游根本不认这个头，写进去是纯污染。
+// 过期或账号类型不适用时返回空串。只对本地持有 token 的 Codex 账号生效
+// （oauth / setup-token）。cpr 自 2026-09-23 起走原样中继，turn-state 由客户端与 CPR
+// 自己往返，sub2api 不再替换；其余上游根本不认这个头，写进去是纯污染。
 //
 // 为什么按模型存：turn-state 绑死在铸它的那个模型上，换个模型那张票就不认了。blob
 // 本身是密文（信封里只有铸造时间戳），系统无从得知它来自哪个模型，只能由管理员在
@@ -319,7 +322,7 @@ func readOpenAITurnStateOverrides(a *Account) map[string]string {
 // 要求自动接管开着。所以一条过期的手填票会对每个请求注入、每次换回一个 400
 // invalid_encrypted_content，而且永远不会被任何机制发现。
 func (a *Account) OpenAICodexTurnStateOverride(model string) string {
-	if a == nil || !a.TargetsChatGPTCodexUpstream() {
+	if a == nil || !a.IsOpenAIOAuthLike() {
 		return ""
 	}
 	if model = strings.TrimSpace(model); model == "" {
@@ -502,6 +505,7 @@ func validateOpenAITurnStateBlob(label, value string) error {
 
 // usageCodexTurnStatePtr 从上游响应头取本次新铸的 turn-state，写进使用记录。
 // 与 usageUpstreamRequestIDPtr 同型：取不到返回 nil（列保持 NULL）。
+// 保留：用量表「Turn-State」入站列的数据源，292 功能（手填覆写等）移除时不删。
 func usageCodexTurnStatePtr(h http.Header) *string {
 	return truncateUsageTurnState(extractOpenAICodexTurnState(h))
 }

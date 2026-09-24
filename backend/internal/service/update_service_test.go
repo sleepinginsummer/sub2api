@@ -185,3 +185,110 @@ func TestUpdateServiceRollbackToVersionAcceptsVPrefix(t *testing.T) {
 	require.NotErrorIs(t, err, ErrRollbackVersionNotAllowed)
 	require.Contains(t, err.Error(), "no compatible release found")
 }
+
+// updateServiceRepoStub 按仓库分别返回 release，并记录被查询的仓库。
+type updateServiceRepoStub struct {
+	updateServiceGitHubClientStub
+	latestByRepo map[string]*GitHubRelease
+	recentByRepo map[string][]*GitHubRelease
+	calls        []string
+}
+
+func (s *updateServiceRepoStub) FetchLatestRelease(_ context.Context, repo string) (*GitHubRelease, error) {
+	s.calls = append(s.calls, "latest:"+repo)
+	if r, ok := s.latestByRepo[repo]; ok {
+		return r, nil
+	}
+	return nil, errors.New("unexpected repo " + repo)
+}
+
+func (s *updateServiceRepoStub) FetchRecentReleases(_ context.Context, repo string, _ int) ([]*GitHubRelease, error) {
+	s.calls = append(s.calls, "recent:"+repo)
+	return s.recentByRepo[repo], nil
+}
+
+func TestUpdateServiceForkPatchReleaseIsAnUpdate(t *testing.T) {
+	gh := &updateServiceRepoStub{latestByRepo: map[string]*GitHubRelease{
+		"sleepinginsummer/sub2api": {TagName: "v0.2.7-sleepinsum.5", HTMLURL: "https://github.com/sleepinginsummer/sub2api/releases/tag/v0.2.7-sleepinsum.5"},
+		"Wei-Shaw/sub2api":         {TagName: "v0.2.7", HTMLURL: "https://github.com/Wei-Shaw/sub2api/releases/tag/v0.2.7"},
+	}}
+	svc := NewUpdateService(&updateServiceCacheStub{}, gh, "0.2.7-sleepinsum.4", "release")
+	info, err := svc.CheckUpdate(context.Background(), true)
+	require.NoError(t, err)
+	require.True(t, info.HasUpdate)
+	require.Equal(t, "0.2.7-sleepinsum.5", info.LatestVersion)
+	require.NotNil(t, info.Upstream)
+	require.Equal(t, "0.2.7", info.Upstream.CurrentVersion)
+	require.False(t, info.Upstream.HasUpdate)
+	require.ElementsMatch(t, []string{"latest:sleepinginsummer/sub2api", "latest:Wei-Shaw/sub2api"}, gh.calls)
+	cached, err := svc.CheckUpdate(context.Background(), false)
+	require.NoError(t, err)
+	require.True(t, cached.Cached)
+	require.Equal(t, "https://github.com/Wei-Shaw/sub2api/releases/tag/v0.2.7", cached.Upstream.HTMLURL)
+}
+
+func TestUpdateServiceNeverUpdatesFromUpstream(t *testing.T) {
+	gh := &updateServiceRepoStub{latestByRepo: map[string]*GitHubRelease{
+		"sleepinginsummer/sub2api": {TagName: "v0.2.7-sleepinsum.4"},
+		"Wei-Shaw/sub2api":         {TagName: "v0.2.8", Assets: []GitHubAsset{{Name: "sub2api_0.2.8_linux_amd64.tar.gz"}}},
+	}}
+	svc := NewUpdateService(&updateServiceCacheStub{}, gh, "0.2.7-sleepinsum.4", "release")
+	info, err := svc.CheckUpdate(context.Background(), true)
+	require.NoError(t, err)
+	require.False(t, info.HasUpdate)
+	require.True(t, info.Upstream.HasUpdate)
+	require.Equal(t, "0.2.8", info.Upstream.LatestVersion)
+	require.ErrorIs(t, svc.PerformUpdate(context.Background()), ErrNoUpdateAvailable)
+}
+
+func TestUpdateServiceUpstreamFailureKeepsForkResult(t *testing.T) {
+	gh := &updateServiceRepoStub{latestByRepo: map[string]*GitHubRelease{
+		"sleepinginsummer/sub2api": {TagName: "v0.2.7-sleepinsum.5"},
+	}}
+	svc := NewUpdateService(&updateServiceCacheStub{}, gh, "0.2.7-sleepinsum.4", "release")
+	info, err := svc.CheckUpdate(context.Background(), true)
+	require.NoError(t, err)
+	require.True(t, info.HasUpdate)
+	require.NotNil(t, info.Upstream)
+	require.False(t, info.Upstream.HasUpdate)
+	require.NotEmpty(t, info.Upstream.Warning)
+}
+
+func TestUpdateServiceRollbackUsesForkReleasesInSleepinsumOrder(t *testing.T) {
+	gh := &updateServiceRepoStub{recentByRepo: map[string][]*GitHubRelease{
+		"sleepinginsummer/sub2api": {
+			{TagName: "v0.2.7-sleepinsum.5"},
+			{TagName: "v0.2.7-sleepinsum.4"},
+			{TagName: "v0.2.5-sleepinsum.13"},
+			{TagName: "v0.2.7-sleepinsum.1"},
+			{TagName: "v0.2.5-sleepinsum.9"},
+			{TagName: "v0.2.7-sleepinsum.3"},
+			{TagName: "v0.2.7-sleepinsum.2"},
+		},
+	}}
+	svc := NewUpdateService(&updateServiceCacheStub{}, gh, "0.2.7-sleepinsum.4", "release")
+	versions, err := svc.ListRollbackVersions(context.Background())
+	require.NoError(t, err)
+	require.Len(t, versions, 3)
+	require.Equal(t, "0.2.7-sleepinsum.3", versions[0].Version)
+	require.Equal(t, "0.2.7-sleepinsum.2", versions[1].Version)
+	require.Equal(t, "0.2.7-sleepinsum.1", versions[2].Version)
+	require.Equal(t, []string{"recent:sleepinginsummer/sub2api"}, gh.calls)
+}
+
+func TestCompareVersionsSleepinsumSuffix(t *testing.T) {
+	cases := []struct {
+		a, b string
+		want int
+	}{
+		{"0.2.7-sleepinsum.4", "0.2.7-sleepinsum.5", -1},
+		{"0.2.7-sleepinsum.13", "0.2.7-sleepinsum.9", 1},
+		{"0.2.7", "0.2.7-sleepinsum.1", -1},
+		{"0.2.8", "0.2.7-sleepinsum.13", 1},
+		{"v0.2.7-sleepinsum.4", "0.2.7-sleepinsum.4", 0},
+		{"0.1.146-rc1", "0.1.146", 0},
+	}
+	for _, tc := range cases {
+		require.Equal(t, tc.want, compareVersions(tc.a, tc.b), "%s vs %s", tc.a, tc.b)
+	}
+}

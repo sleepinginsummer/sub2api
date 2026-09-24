@@ -62,17 +62,26 @@ func compressCodexRequestBody(c *gin.Context, account *Account, targetURL string
 	if len(body) == 0 || !codexRequestBodyCompressionEnabled(c, account, targetURL) {
 		return body, "", nil // 空体不压：编码器对空输入返回零字节，真 /responses 也不存在空体
 	}
+	wire, err := encodeCodexZstdRequestBody(body)
+	if err != nil {
+		return nil, "", err
+	}
+	return wire, codexRequestZstdContentEncoding, nil
+}
+
+// encodeCodexZstdRequestBody 按真客户端的 zstd 帧形态压缩请求体。
+func encodeCodexZstdRequestBody(body []byte) ([]byte, error) {
 	enc, ok := codexRequestZstdEncoders.Get().(*zstd.Encoder)
 	if !ok {
-		return nil, "", errors.New("codex request zstd encoder pool returned unexpected type")
+		return nil, errors.New("codex request zstd encoder pool returned unexpected type")
 	}
 	defer codexRequestZstdEncoders.Put(enc)
 	frame := enc.EncodeAll(body, make([]byte, 0, len(body)/3+64))
 	wire, err := normalizeCodexZstdFrameHeader(frame)
 	if err != nil {
-		return nil, "", fmt.Errorf("zstd compress codex request body: %w", err)
+		return nil, fmt.Errorf("zstd compress codex request body: %w", err)
 	}
-	return wire, codexRequestZstdContentEncoding, nil
+	return wire, nil
 }
 
 var (

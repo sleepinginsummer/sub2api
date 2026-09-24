@@ -360,10 +360,12 @@ func (s *AccountUsageService) getUsageForAccount(ctx context.Context, account *A
 	}
 
 	if account.Platform == PlatformOpenAI && account.Type == AccountTypeOAuth {
-		// 用量可能来自缓存快照；查询成功不能证明此前失败的 refresh token 已恢复。
+		// Usage can come from a stored snapshot even when a probe fails. Neither
+		// that nor a working access token proves a rejected refresh token recovered.
 		return s.getOpenAIUsage(ctx, account, forceProbe)
 	}
-	// CPR 与 OAuth 共用展示口径，但数据来自 CPR admin API，成功后可以清理可恢复错误。
+	// CPR 中继与 OAuth 共用 getOpenAIUsage：展示口径（codex_5h_* / codex_7d_*）相同，
+	// 数据源是 CPR 的 admin API。CPR 没有 refresh token，查到用量即可清可恢复错误。
 	if account.Platform == PlatformOpenAI && account.IsCPR() {
 		usage, err := s.getOpenAIUsage(ctx, account, forceProbe)
 		if err == nil {
