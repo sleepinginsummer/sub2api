@@ -51,6 +51,19 @@ DROP INDEX CONCURRENTLY IF EXISTS idx_b;
 	})
 }
 
+func TestPrepareAffiliateWithdrawIndexRetry(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	defer func() { _ = db.Close() }()
+
+	mock.ExpectQuery("SELECT EXISTS").WithArgs(affiliateWithdrawOperationIDIndex).
+		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
+	mock.ExpectExec("DROP INDEX CONCURRENTLY IF EXISTS idx_user_affiliate_ledger_operation_id").
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	require.NoError(t, prepareNonTransactionalMigration(context.Background(), db, affiliateWithdrawOperationIDIndexMigration))
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
 func TestApplyMigrationsFS_NonTransactionalMigration(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	require.NoError(t, err)

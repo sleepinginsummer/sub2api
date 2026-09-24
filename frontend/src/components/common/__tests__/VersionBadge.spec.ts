@@ -81,7 +81,9 @@ describe('VersionBadge', () => {
     vm.selectedRollbackVersion = '0.2.7-sleepinsum.3'
     await wrapper.vm.$nextTick()
 
-    expect(vm.scriptRollbackCommand).toContain('raw.githubusercontent.com/sleepinginsummer/sub2api/v0.2.7-sleepinsum.3/')
+    expect(vm.scriptRollbackCommand).toBe(
+      'curl -sSL https://raw.githubusercontent.com/sleepinginsummer/sub2api/v0.2.7-sleepinsum.3/deploy/install.sh | sudo env GITHUB_REPO=sleepinginsummer/sub2api bash -s -- rollback v0.2.7-sleepinsum.3'
+    )
     expect(vm.dockerRollbackCommand).toContain('image: ghcr.io/sleepinginsummer/sub2api:0.2.7-sleepinsum.3')
   })
 })

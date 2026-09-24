@@ -43,6 +43,13 @@ func TestIsMigrationChecksumCompatible(t *testing.T) {
 		require.True(t, ok)
 	})
 
+	t.Run("240旧索引迁移checksum兼容新加列迁移", func(t *testing.T) {
+		const oldChecksum = "3823bfea5f64feb58f5fcebc341c6877eaefc97834b4cd652c8e83ad08ed78da"
+		const newChecksum = "2d378e2750fe88af7c250b6990817b1d351e88bc5cd5211c49fa759abee28728"
+		require.True(t, isMigrationChecksumCompatible("240_affiliate_ledger_operation_id.sql", oldChecksum, newChecksum))
+		require.False(t, isMigrationChecksumCompatible("240_affiliate_ledger_operation_id.sql", "unknown", newChecksum))
+	})
+
 	t.Run("244已发布checksum兼容热表安全版本", func(t *testing.T) {
 		ok := isMigrationChecksumCompatible(
 			"244_allow_probe_usage_request_type.sql",

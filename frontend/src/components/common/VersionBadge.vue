@@ -743,7 +743,7 @@ const manualTabs = computed(() => [
 const scriptRollbackCommand = computed(() => {
   if (!selectedRollbackVersion.value) return ''
   const tag = `v${selectedRollbackVersion.value}`
-  return `curl -sSL https://raw.githubusercontent.com/${GITHUB_REPO}/${tag}/deploy/install.sh | sudo bash -s -- rollback ${tag}`
+  return `curl -sSL https://raw.githubusercontent.com/${GITHUB_REPO}/${tag}/deploy/install.sh | sudo env GITHUB_REPO=${GITHUB_REPO} bash -s -- rollback ${tag}`
 })
 
 const dockerRollbackCommand = computed(() => {

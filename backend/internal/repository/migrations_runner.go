@@ -64,6 +64,8 @@ const usageLogsEffectiveRequestedModelIndex = "idx_usage_logs_effective_requeste
 const usageLogsEffectiveUpstreamModelIndex = "idx_usage_logs_effective_upstream_model_created"
 const usageLogsUpstreamRequestIDIndexMigration = "233_add_usage_log_upstream_request_id_index_notx.sql"
 const usageLogsUpstreamRequestIDIndex = "idx_usage_logs_upstream_request_id"
+const affiliateWithdrawOperationIDIndexMigration = "240_affiliate_ledger_operation_id_index_notx.sql"
+const affiliateWithdrawOperationIDIndex = "idx_user_affiliate_ledger_operation_id"
 
 type migrationChecksumCompatibilityRule struct {
 	fileChecksum       string
@@ -96,6 +98,8 @@ var migrationChecksumCompatibilityRules = map[string]migrationChecksumCompatibil
 	"220_clear_non_grok_video_generation_config.sql": newMigrationChecksumCompatibilityRule("85e320b9ec64f2d3fcd8cf705b2b4e76a7b49f7a57140c14bff97f32691c818b", "3da48c8fdffe6390325f43d08b8e353e0a365df43d44a78dbbe655d0deb18402"),
 	"219_group_search_price_per_1k.sql":              newMigrationChecksumCompatibilityRule("e86786ebcc3b14206fd2d321380a4e50e80cdadbfcf4962c639255e6a14008db", "df6ffd71b97e30ec2c8fe7b95e15783042dea58c553e32701ee7c42a5619af80"),
 	"218_group_audio_voice_pricing.sql":              newMigrationChecksumCompatibilityRule("40ee9f3a2af0e0a5e99dabc878fd0fe98be1011f26bcfcefcac7197f7081f0e7", "c2a5e5b4ffd6968ad1c10593289fbc11192cdea19fec3ed9bce3a84eff9a8351"),
+	// 240 原始版本在事务内建索引；已应用的数据库仅需补跑并发索引迁移。
+	"240_affiliate_ledger_operation_id.sql": newMigrationChecksumCompatibilityRule("2d378e2750fe88af7c250b6990817b1d351e88bc5cd5211c49fa759abee28728", "3823bfea5f64feb58f5fcebc341c6877eaefc97834b4cd652c8e83ad08ed78da"),
 	// 244 已随 v0.2.7-sleepinsum.1 发布；兼容旧 checksum，让未执行实例采用热表安全版本。
 	"244_allow_probe_usage_request_type.sql": newMigrationChecksumCompatibilityRule("7b543936a7f7cb256274d468e81d01c4f0785942e8ee7163846ca518712cadea", "13a8cd295d5b1105d735e4040d99d0b175934ffe2a800f5a264486d1b26fefce"),
 }
@@ -311,6 +315,8 @@ func prepareNonTransactionalMigration(ctx context.Context, db migrationConnectio
 		return nil
 	case usageLogsUpstreamRequestIDIndexMigration:
 		return dropInvalidIndexIfPresent(ctx, db, usageLogsUpstreamRequestIDIndex)
+	case affiliateWithdrawOperationIDIndexMigration:
+		return dropInvalidIndexIfPresent(ctx, db, affiliateWithdrawOperationIDIndex)
 	default:
 		return nil
 	}
