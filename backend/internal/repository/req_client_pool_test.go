@@ -162,6 +162,37 @@ func TestCreateOpenAIReqClientHasNoCookieJar(t *testing.T) {
 	require.Nil(t, client.GetClient().Jar)
 }
 
+// 隐私接口按代理复用客户端；即使上游返回会话 cookie，下一位账号也不得带出。
+func TestCreatePrivacyReqClientDoesNotShareCookies(t *testing.T) {
+	sharedReqClients = sync.Map{}
+	var receivedCookies, receivedAuth []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedCookies = append(receivedCookies, r.Header.Get("Cookie"))
+		receivedAuth = append(receivedAuth, r.Header.Get("Authorization"))
+		w.Header().Set("Set-Cookie", "session=first-account; Path=/")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	first, err := CreatePrivacyReqClient("")
+	require.NoError(t, err)
+	second, err := CreatePrivacyReqClient("")
+	require.NoError(t, err)
+	require.Same(t, first, second)
+	require.Nil(t, first.GetClient().Jar)
+	ordinary, err := getSharedReqClient(reqClientOptions{Timeout: 30 * time.Second, Impersonate: true})
+	require.NoError(t, err)
+	require.NotSame(t, first, ordinary)
+
+	for _, token := range []string{"first-account", "second-account"} {
+		resp, err := first.R().SetHeader("Authorization", "Bearer "+token).Get(server.URL)
+		require.NoError(t, err)
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+	}
+	require.Equal(t, []string{"Bearer first-account", "Bearer second-account"}, receivedAuth)
+	require.Equal(t, []string{"", ""}, receivedCookies)
+}
+
 // Codex 客户端面照真实 Codex（http-client/src/chatgpt_cloudflare_cookies.rs）：只在 https 的
 // ChatGPT 主机上存取 Cloudflare 类 cookie；oai-did、会话 cookie 之类一律不存，免得跨账号串味。
 func TestCodexBackendReqClientKeepsOnlyChatGPTCloudflareCookies(t *testing.T) {

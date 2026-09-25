@@ -166,14 +166,14 @@ func isCloudflareCookieName(name string) bool {
 	}
 }
 
-// CreatePrivacyReqClient creates an HTTP client for OpenAI privacy settings API
-// This is exported for use by OpenAIPrivacyService
-// Uses Chrome TLS fingerprint impersonation to bypass Cloudflare checks
+// CreatePrivacyReqClient creates an HTTP client for OpenAI privacy settings API.
+// 隐私请求只用 Bearer 鉴权；按代理共享连接时不能复用不同账号的 cookie。
 func CreatePrivacyReqClient(proxyURL string) (*req.Client, error) {
 	return getSharedReqClient(reqClientOptions{
 		ProxyURL:    proxyURL,
 		Timeout:     30 * time.Second,
-		Impersonate: true, // Enable browser TLS fingerprint impersonation (Firefox, see getSharedReqClient)
+		Impersonate: true, // chatgpt.com 的 Cloudflare 对旧 Chrome 指纹会质询
+		Cookies:     reqCookiesNone,
 	})
 }
 
