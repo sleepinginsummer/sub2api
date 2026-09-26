@@ -87,6 +87,8 @@
                 {{ isLikelyModelVariant(row) ? t('usage.modelVariant') : t('usage.modelMismatch') }}
               </span>
             </div>
+            <!-- safety_buffering_enabled / _faster_model 只落库不展示（用户 2026-09-25 定）：
+                 faster-model 是客户端「换更快模型重试」的备选，不是路由结果，摆在模型下面会被读成错误路由。 -->
           </div>
         </template>
 

@@ -162,35 +162,39 @@ func TestCreateOpenAIReqClientHasNoCookieJar(t *testing.T) {
 	require.Nil(t, client.GetClient().Jar)
 }
 
-// 隐私接口按代理复用客户端；即使上游返回会话 cookie，下一位账号也不得带出。
-func TestCreatePrivacyReqClientDoesNotShareCookies(t *testing.T) {
+// 隐私接口（accounts/check、subscriptions、训练开关）与额度面共用按代理缓存的客户端，jar 因
+// 此是同一代理下所有账号共用的。上游下发的登录态 cookie 一律不落罐（否则 A 账号的会话会随
+// B 账号出站），要留住的是 ChatGPT 的 Cloudflare cookie——backend-api 的放行靠它。
+func TestCreatePrivacyReqClientKeepsOnlyCloudflareCookiesAcrossAccounts(t *testing.T) {
 	sharedReqClients = sync.Map{}
-	var receivedCookies, receivedAuth []string
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		receivedCookies = append(receivedCookies, r.Header.Get("Cookie"))
-		receivedAuth = append(receivedAuth, r.Header.Get("Authorization"))
-		w.Header().Set("Set-Cookie", "session=first-account; Path=/")
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer server.Close()
-
 	first, err := CreatePrivacyReqClient("")
 	require.NoError(t, err)
 	second, err := CreatePrivacyReqClient("")
 	require.NoError(t, err)
-	require.Same(t, first, second)
-	require.Nil(t, first.GetClient().Jar)
+	require.Same(t, first, second, "同一代理下复用同一实例，罐因此是跨账号共享的")
 	ordinary, err := getSharedReqClient(reqClientOptions{Timeout: 30 * time.Second, Impersonate: true})
 	require.NoError(t, err)
-	require.NotSame(t, first, ordinary)
+	require.NotSame(t, first, ordinary, "cookie 策略必须进缓存键，否则会与默认罐的客户端共用一个实例")
 
-	for _, token := range []string{"first-account", "second-account"} {
-		resp, err := first.R().SetHeader("Authorization", "Bearer "+token).Get(server.URL)
-		require.NoError(t, err)
-		require.Equal(t, http.StatusOK, resp.StatusCode)
+	jar := first.GetClient().Jar
+	require.NotNil(t, jar)
+	u, err := url.Parse("https://chatgpt.com/backend-api/accounts/check")
+	require.NoError(t, err)
+	// 模拟 A 账号那一次响应：登录态与 Cloudflare cookie 一起下发。
+	jar.SetCookies(u, []*http.Cookie{
+		{Name: "__Secure-next-auth.session-token", Value: "account-a"},
+		{Name: "oai-did", Value: "account-a"},
+		{Name: "session", Value: "account-a"},
+		{Name: "__cf_bm", Value: "cf"},
+		{Name: "cf_clearance", Value: "clearance"},
+	})
+	// B 账号请求同一主机时只能看到 Cloudflare 类 cookie。
+	var got []string
+	for _, cookie := range jar.Cookies(u) {
+		got = append(got, cookie.Name)
 	}
-	require.Equal(t, []string{"Bearer first-account", "Bearer second-account"}, receivedAuth)
-	require.Equal(t, []string{"", ""}, receivedCookies)
+	sort.Strings(got)
+	require.Equal(t, []string{"__cf_bm", "cf_clearance"}, got)
 }
 
 // Codex 客户端面照真实 Codex（http-client/src/chatgpt_cloudflare_cookies.rs）：只在 https 的
