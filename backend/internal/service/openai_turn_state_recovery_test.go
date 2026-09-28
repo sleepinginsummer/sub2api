@@ -328,7 +328,7 @@ func TestOpenAITurnStateRecoveryEmptyAnswerIsDescribed(t *testing.T) {
 	answer, healthy, usage, ok := openAITurnStateRecoveryAnswer([]byte(recoverySSE("")))
 	require.True(t, ok)
 	require.False(t, healthy)
-	require.Equal(t, "∅ status=completed output=[reasoning,message]", answer)
+	require.Equal(t, "∅ output=[reasoning,message]", answer)
 	require.NotNil(t, usage)
 
 	refused := strings.Join([]string{
@@ -342,7 +342,7 @@ func TestOpenAITurnStateRecoveryEmptyAnswerIsDescribed(t *testing.T) {
 	answer, healthy, _, ok = openAITurnStateRecoveryAnswer([]byte(refused))
 	require.True(t, ok)
 	require.False(t, healthy)
-	require.Equal(t, "∅ status=completed refusal=I can't help with that. output=[message]", answer)
+	require.Equal(t, "∅ refusal=I can't help with that. output=[message]", answer)
 
 	// 走完整探测链路：白卷要落进 attempt.answer 与 results=false。
 	now := time.Now().UTC()
@@ -352,7 +352,7 @@ func TestOpenAITurnStateRecoveryEmptyAnswerIsDescribed(t *testing.T) {
 	h.run(t)
 	st := recoveryState(h.account)
 	require.False(t, st.Last[0].Healthy)
-	require.Equal(t, "∅ status=completed output=[reasoning,message]", st.Last[0].Answer)
+	require.Equal(t, "∅ output=[reasoning,message]", st.Last[0].Answer)
 	require.Empty(t, st.Last[0].Error, "白卷是答错，不是探测出错")
 	raw := h.account.Extra[openAITurnStateRecoveryStateExtraKey].(map[string]any)
 	require.Contains(t, raw["last"].([]any)[0].(map[string]any), "answer", "落库里要有 answer 键，页面才能显示")
@@ -442,7 +442,74 @@ func TestOpenAITurnStateRecoveryTruncatedStreamIsFailure(t *testing.T) {
 	st := recoveryState(h.account)
 	require.Equal(t, []bool{false}, st.Results)
 	require.Equal(t, 1, st.FailStreak)
-	require.Equal(t, "no completed response", st.LastError)
+	require.Equal(t, "no completed; last=response.created", st.LastError)
+}
+
+// TestOpenAITurnStateRecoveryNoTerminalIsDiagnosed 钉住 2026-09-26 01:26 那种现场：200 却没有 completed，
+// 错误里要写出流里有什么——事件序列、failed/incomplete 的原因与错误、error 事件、已吐出的部分正文。
+func TestOpenAITurnStateRecoveryNoTerminalIsDiagnosed(t *testing.T) {
+	failed := strings.Join([]string{
+		`event: response.created`,
+		`data: {"type":"response.created","response":{"id":"resp_probe","status":"in_progress","output":[]}}`,
+		``,
+		`event: response.in_progress`,
+		`data: {"type":"response.in_progress","response":{"id":"resp_probe","status":"in_progress"}}`,
+		``,
+		`event: response.output_text.delta`,
+		`data: {"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"29"}`,
+		``,
+		`event: response.failed`,
+		`data: {"type":"response.failed","response":{"id":"resp_probe","status":"failed","output":[],"error":{"code":"server_error","message":"Something went wrong"}}}`,
+		``, ``,
+	}, "\n")
+	require.Equal(t, "last=response.failed error=Something went wrong partial=29", openAITurnStateRecoveryStreamDiagnostic(failed))
+
+	incomplete := strings.Join([]string{
+		`event: response.incomplete`,
+		`data: {"type":"response.incomplete","response":{"id":"resp_probe","status":"incomplete","output":[],"incomplete_details":{"reason":"max_output_tokens"}}}`,
+		``, ``,
+	}, "\n")
+	require.Equal(t, "last=response.incomplete reason=max_output_tokens", openAITurnStateRecoveryStreamDiagnostic(incomplete))
+
+	errored := "event: error\ndata: {\"type\":\"error\",\"message\":\"The server had an error while processing your request\"}\n\n"
+	require.Equal(t, "last=error error=The server had an error while processing your request", openAITurnStateRecoveryStreamDiagnostic(errored))
+
+	// tooltip 要短（用户要求）：长错误信息截 60 字节，整串不超过 120 字节。
+	longErr := "event: error\ndata: {\"type\":\"error\",\"message\":\"" + strings.Repeat("x", 300) + "\"}\n\n"
+	diag := openAITurnStateRecoveryStreamDiagnostic(longErr)
+	require.LessOrEqual(t, len(diag), 120)
+	require.Equal(t, "last=error error="+strings.Repeat("x", 60), diag)
+
+	// 各段都到上限时整串仍不超过 120 字节（外层截断不是摆设）。
+	crowded := strings.Join([]string{
+		`event: response.output_text.delta`,
+		`data: {"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"` + strings.Repeat("7", 100) + `"}`,
+		``,
+		`event: response.failed`,
+		`data: {"type":"response.failed","response":{"id":"resp_probe","status":"failed","output":[],"incomplete_details":{"reason":"max_output_tokens"},"error":{"message":"` + strings.Repeat("y", 300) + `"}}}`,
+		``, ``,
+	}, "\n")
+	diag = openAITurnStateRecoveryStreamDiagnostic(crowded)
+	require.Len(t, diag, 120)
+	require.True(t, strings.HasPrefix(diag, "last=response.failed reason=max_output_tokens error="+strings.Repeat("y", 60)), diag)
+
+	require.Equal(t, "no sse frames", openAITurnStateRecoveryStreamDiagnostic(""))
+	require.Equal(t, "no sse frames", openAITurnStateRecoveryStreamDiagnostic("garbage without frames"))
+
+	// 走完整探测链路：错误串带着现场落进 attempt.error（页面 tooltip「出错 200 …」就读它）。
+	now := time.Now().UTC()
+	h := newHunterHarness(recoveryAccount(recoveryConfig(nil)), hunterCoxProxy)
+	h.svc.now = func() time.Time { return now }
+	resp, _ := hunterResp(http.StatusOK, turnStateFernetBlob(now, openAIHealthyTurnStateBlocks), failed)
+	h.up.queue = append(h.up.queue, resp)
+
+	h.run(t)
+
+	st := recoveryState(h.account)
+	require.Equal(t, []bool{false}, st.Results)
+	require.Equal(t, http.StatusOK, st.Last[0].Status)
+	require.Equal(t, "no completed; last=response.failed error=Something went wrong partial=29", st.Last[0].Error)
+	require.Empty(t, st.Last[0].Answer)
 }
 
 // TestOpenAITurnStateRecoveryResetOnNatural312 钉住标记的失效：真实流量又自然铸出 312 →

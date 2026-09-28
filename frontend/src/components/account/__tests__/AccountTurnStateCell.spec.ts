@@ -604,6 +604,70 @@ describe('AccountTurnStateCell', () => {
   })
   // cpr 走原样中继（2026-09-23）：只观测不替换。extra 里残留的手填、候选池、猎手、恢复探测
   // 配置一律不展示，也不报「裸奔」。
+  // pair 模式（实验性）：票带自己的短有效期 + 铸票那次的路由 cookie，注入后上游重铸只记读数。
+  describe('pair 模式的候选与探测', () => {
+    it('按票自己的有效期算到期，不按账号级的 1 小时', () => {
+      // 5 分钟前铸的 pair 票，有效期 240 秒 → 已经过期，整行不展示。
+      const stale = render(account([cand('gpt-6-astra', 300, 33, { ttl_seconds: 240 })]))
+      expect(stale.find('.bar').exists()).toBe(false)
+      // 同一条票不带 ttl_seconds（老候选）时按账号级 1 小时算，仍然在用。
+      const legacy = render(account([cand('gpt-6-astra', 300, 33)]))
+      expect(legacy.find('.bar').exists()).toBe(true)
+    })
+
+    it('进度条与 tooltip 用票自己的有效期，并写出 pair 与重铸读数', () => {
+      const w = render(
+        account([
+          cand('gpt-6-astra', 120, 33, {
+            ttl_seconds: 240,
+            cookies: ['__cflb=lb', '__oailb=jwt'],
+            reminted: 2
+          })
+        ])
+      )
+      // 240 秒的票用掉 120 秒 → 还剩约一半；按账号级 1 小时算会是 96%。
+      const remaining = Number(w.get('.bar').text())
+      expect(remaining).toBeGreaterThan(40)
+      expect(remaining).toBeLessThan(60)
+      const title = w.get('[data-testid="account-turn-state-summary"]').attributes('title') ?? ''
+      expect(title).toContain('detailPair')
+      expect(title).toContain('detailReminted')
+      expect(title).toContain('"n":2')
+    })
+
+    it('猎手行写出模型的回答：答对入池与答错丢掉的票一样长', () => {
+      const hunt = (answer: string, healthy: boolean) => ({
+        openai_turn_state_hunter: { enabled: true, max_per_hour: 30, pair_mode: true },
+        openai_turn_state_hunt: {
+          hour_start: isoAgo(600),
+          hour_count: 1,
+          last: [{ at: isoAgo(60), model: 'gpt-6-astra', proxy: 'webshare', status: 200, chars: 780, healthy, answer, cookies: 2 }]
+        }
+      })
+      const hit = render(account([], hunt('21', true))).get('[data-testid="account-turn-state-hunter"]')
+      expect(hit.text()).toContain('hunterResultAnswerHit')
+      expect(hit.text()).toContain('21')
+      // 随票收到几个 pair cookie 也要能看见：0 个说明那张票只能裸回放。
+      expect(hit.attributes('title') ?? '').toContain('detailPair')
+      const miss = render(account([], hunt('29', false))).get('[data-testid="account-turn-state-hunter"]')
+      expect(miss.text()).toContain('hunterResultAnswerMiss')
+      expect(miss.text()).toContain('29')
+      // 没有回答的探测（老路径头到手即断）仍按票长显示。
+      const legacy = render(
+        account([], {
+          openai_turn_state_hunter: { enabled: true, max_per_hour: 30 },
+          openai_turn_state_hunt: {
+            hour_start: isoAgo(600),
+            hour_count: 1,
+            last: [{ at: isoAgo(60), model: 'gpt-6-astra', proxy: 'webshare', status: 200, chars: 292, healthy: true }]
+          }
+        })
+      ).get('[data-testid="account-turn-state-hunter"]')
+      expect(legacy.text()).toContain('hunterResultHit')
+      expect(legacy.text()).not.toContain('hunterResultAnswerHit')
+    })
+  })
+
   describe('cpr 只显示形态观测', () => {
     const cpr = (extra: Record<string, unknown>): Account =>
       ({ id: 2, platform: 'openai', type: 'cpr', extra }) as unknown as Account

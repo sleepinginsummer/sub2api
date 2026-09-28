@@ -1,9 +1,16 @@
 package service
 
-// Turn-state 292 猎手。
+// Turn-state 猎手。
 //
-// 已失效、已废弃（2026-09-23）：2026-09-21 起把 292 注入请求已经换不来正常服务，猎手的前提
-// 不存在了。只保留、不再扩展，计划在后续几个版本移除（连同 hold / recovery / 自动接管 / 手填覆写）。
+// **状态：实验性·未完善（2026-09-26 重启）。**
+//
+//   - 原来的 292 路径已失效、已废弃（2026-09-23）：2026-09-21 起把 292 注入请求换不来正常
+//     服务，2026-09-23 起上游把票一律铸成 780 字符、按长度判健康彻底失效。那条路径只保留、
+//     不再扩展（连同 hold / 自动接管 / 手填覆写），780 时代它永远铸不出票。
+//   - 新开的 **pair 模式**（pair_mode，见 openai_turn_state_pair.go）是 SUCK_MY_ASTRA 那套的
+//     二开：新鲜出口直接做糖果题铸票，答对才入池，票与铸票响应的 __cflb / __oailb 一起回放到
+//     业务流量。本机 2026-09-26 在 pro1 上实测过「不重铸就答对」（2/2），但那只是读数，**不是
+//     解除降智的手段**；有效期与实际收益都要用户自己量。所以标实验性，别当它已经能用。
 //
 // 背景（memory turn-state-block-count-cause / turn-state-remint-rules）：Codex 上游在每个
 // 新会话第一回合按「账号权重 × 当时出口 IP」铸一张 X-Codex-Turn-State，292 字符是正常
@@ -95,6 +102,13 @@ const (
 	defaultOpenAITurnStateHuntIdleMinutes     = 60
 	defaultOpenAITurnStateHuntGapSeconds      = 20
 	defaultOpenAITurnStateHuntReasoningEffort = "high"
+	// defaultOpenAITurnStateHuntTicketTTL 是 pair 候选的默认有效期（秒）。2026-09-26 在线路机
+	// 实测（pro1，铸票走轮换出口、回放走账号常驻出口，每隔一个点插一次裸发对照确认上游当时
+	// 一直在铸票）：答对糖果题的票在 130s 仍被接受，167s / 180s 已被重铸；答错的票 100s 就被
+	// 重铸。取 120s 让默认值落在实测接受区间内，上限仍留到 3600s 供手动放宽。
+	defaultOpenAITurnStateHuntTicketTTL = 120
+	openAITurnStateHunterMinTicketTTL   = 30
+	openAITurnStateHunterMaxTicketTTL   = 3600
 
 	// ctxKeyTurnStateProbe 标记合成的探测上下文：观测入口据此不把探测算作真实流量。
 	ctxKeyTurnStateProbe = "openai_turn_state_probe_ctx"
@@ -138,6 +152,15 @@ type openAITurnStateHunterConfig struct {
 	// UsageAPIKeyID >0 时每次 200 探测按标准用量路径落一行、挂在这把 key 下计费
 	//（request_type=probe；输入 token 本地估算，输出 0）。0 = 不记。
 	UsageAPIKeyID int64 `json:"usage_api_key_id,omitempty"`
+	// PairMode 开 pair 模式（**实验性·未完善**，见 openai_turn_state_pair.go）：探测直接发
+	// 糖果题并读完回答，答案含 "21" 才把票入池，连带存下铸票响应的 __cflb / __oailb，注入时
+	// 票与 pair 一起回放。开着时**不看票长**（780 时代长度判据已死）。
+	// 代价：每次探测是一次完整回答（约 10–60 秒、几百 token），不再是头到手即断。
+	PairMode bool `json:"pair_mode,omitempty"`
+	// TicketTTLSeconds 是 pair 候选自己的有效期（默认 120 秒），盖过账号级的
+	// openai_turn_state_stale_after_minutes：pair 的可用窗口比票的 1 小时寿命短，具体多短
+	// 由用户实测。只在 pair 模式下有意义。
+	TicketTTLSeconds int `json:"ticket_ttl_seconds,omitempty"`
 }
 
 // applyDefaults 补默认值并压上限。运行侧不能信任 extra 里的数字：数据导入
@@ -173,6 +196,18 @@ func (cfg *openAITurnStateHunterConfig) applyDefaults() {
 		effort = defaultOpenAITurnStateHuntReasoningEffort
 	}
 	cfg.ReasoningEffort = effort
+	cfg.TicketTTLSeconds = openAITurnStateHuntBound(cfg.TicketTTLSeconds, defaultOpenAITurnStateHuntTicketTTL, openAITurnStateHunterMaxTicketTTL)
+	if cfg.TicketTTLSeconds < openAITurnStateHunterMinTicketTTL {
+		cfg.TicketTTLSeconds = openAITurnStateHunterMinTicketTTL
+	}
+	if cfg.PairMode {
+		// pair 票只活 ticket_ttl_seconds（默认 2 分钟），开窗提前量必须比它小，否则「任何票
+		// 都永远不够用」，猎手每小时打满上限也停不下来。handler 会当场拒掉这种配置，这里是
+		// 给绕过校验落库的行（数据导入）兜底：削到票寿命以内，0 = 到期后才开窗。
+		if int(cfg.lead().Seconds()) >= cfg.TicketTTLSeconds {
+			cfg.LeadMinutes = (cfg.TicketTTLSeconds - 1) / 60
+		}
+	}
 }
 
 // openAITurnStateHuntBound：≤0 取默认，超上限取上限。
@@ -277,9 +312,13 @@ type openAITurnStateHuntAttempt struct {
 	LatencyMs int64 `json:"latency_ms"`
 	// Exit 是探测前解析到的出口 IP，只有固定出口有；轮换端点由供应商按连接选出口，为空。
 	Exit string `json:"exit,omitempty"`
-	// Answer 是恢复探测读到的模型回答（糖果题，期望 "21"）；猎手探测头到手即断，没有。
+	// Answer 是读到的模型回答（糖果题，期望 "21"）：恢复探测与 pair 模式的猎手探测都有；
+	// 非 pair 的猎手探测头到手即断，没有。
 	Answer string `json:"answer,omitempty"`
-	Error  string `json:"error,omitempty"`
+	// Cookies 是 pair 模式下从铸票响应里收到的路由 cookie 条数（__cflb / __oailb）；0 表示
+	// 上游没给，那张票只能裸回放。
+	Cookies int    `json:"cookies,omitempty"`
+	Error   string `json:"error,omitempty"`
 	// transport 标记错误发生在代理/传输层（请求已发出但没拿到响应）：请求多半没到上游，
 	// 不计小时额度。不落库。
 	transport bool
@@ -331,6 +370,13 @@ func (st *openAITurnStateHuntState) waiting(cfg openAITurnStateHunterConfig, now
 // 代理各换一次 IP）。两个代理共用一个出口时各留一条，这样下一轮两个代理都能不回声就跳过。
 func (st *openAITurnStateHuntState) noteExit(attempt openAITurnStateHuntAttempt) {
 	if attempt.Exit == "" || attempt.Error != "" {
+		return
+	}
+	// pair 模式（有 Answer 就是按做题判的）不记出口结论：冷却 7 天的理由是「铸什么由出口权重定，
+	// 权重不会几小时就变」，那是对**票长**这个稳定读数说的。单次答案是噪声（恢复探测为此才用
+	// 滑窗 4/5），一次答错就把一条固定出口封一周——几条出口第一轮各答错一次，猎手能整周什么都
+	// 不做，页面上只写着「待命」。宁可偶尔重探同一个出口，也不要这种静默死锁。
+	if attempt.Answer != "" {
 		return
 	}
 	st.recordExit(openAITurnStateHuntExit{IP: attempt.Exit, ProxyID: attempt.ProxyID, At: attempt.At, Healthy: attempt.Healthy})
@@ -786,7 +832,9 @@ func openAITurnStateNewestUsableExpiry(pool []openAITurnStateCandidate, model st
 		if c.MintedAt.IsZero() || !c.usable(model, ttl, now) {
 			continue
 		}
-		expiresAt := c.MintedAt.Add(ttl)
+		// 按这条候选实际的有效期算：pair 候选自己带一份短 TTL，拿账号级的 1 小时算会让
+		// 开窗判定以为票还够用，而它 4 分钟后就过期了。
+		expiresAt := c.MintedAt.Add(c.ttlOr(ttl))
 		if !found || expiresAt.After(newest) {
 			newest = expiresAt
 			found = true
@@ -867,7 +915,8 @@ func (s *OpenAITurnStateHunterService) huntStep(ctx context.Context, sess *openA
 		slog.Info("openai_turn_state_hunt_attempt",
 			"account_id", account.ID, "model", model, "proxy_id", proxy.ID, "proxy", proxy.Name, "exit", exit,
 			"status", attempt.Status, "chars", attempt.Chars, "healthy", attempt.Healthy, "error", attempt.Error,
-			"latency_ms", attempt.LatencyMs, "hour_count", st.HourCount)
+			"latency_ms", attempt.LatencyMs, "hour_count", st.HourCount,
+			"answer", attempt.Answer, "cookies", attempt.Cookies)
 		if attempt.preflight {
 			// 请求没发出去：不是出口的问题，换代理重试只会把同一条错误抄 N 遍。
 			st.NextAt = s.now().Add(cfg.retry())
@@ -1067,7 +1116,15 @@ func (s *OpenAITurnStateHunterService) probe(ctx context.Context, account *Accou
 	// HTTP/2 隧道，不关连接就一直从同一个出口发。closeConn 让 http2 把这条连接标成
 	// doNotReuse（用完即关、下一条重新 CONNECT），HTTP/1.1 则响应后直接关；H2 上不会多发
 	// 任何头。固定出口也这么做，探测不留长连接。
-	s.doProbe(ctx, account, &egress, proxyURL, true, model, cfg, openAITurnStateHuntProbeText, false, &attempt)
+	//
+	// pair 模式直接发糖果题、读完回答：一次请求同时拿到票、cookie pair 和判据（答案含 21），
+	// 比「先发 hi 铸票、再发题验票」省一半请求（用户 2026-09-26 定）。其余仍是 "hi" + 头到
+	// 手即断、按票长判。
+	text, readAnswer := openAITurnStateHuntProbeText, false
+	if cfg.PairMode {
+		text, readAnswer = openAITurnStateRecoveryPrompt, true
+	}
+	s.doProbe(ctx, account, &egress, proxyURL, true, model, cfg, text, readAnswer, &attempt)
 	return attempt
 }
 
@@ -1109,6 +1166,13 @@ func (s *OpenAITurnStateHunterService) doProbe(ctx context.Context, account, egr
 		}
 		return
 	}
+	// pair 模式要的 cookie 就在响应头上，读体之前先收下（收不到也照样往下走：票能不能裸回放
+	// 是用户要量的事情之一，所以只记条数，不当失败）。
+	var pairCookies []string
+	if cfg.PairMode {
+		pairCookies = openAITurnStatePairCookies(resp.Header)
+		attempt.Cookies = len(pairCookies)
+	}
 	var usage *OpenAIUsage
 	if readAnswer {
 		// 恢复探测要的是回答本身：读完整个流（有上限），耗时算到读完为止。
@@ -1118,7 +1182,8 @@ func (s *OpenAITurnStateHunterService) doProbe(ctx context.Context, account, egr
 		if readErr != nil {
 			attempt.Error = "read answer: " + sanitizeUpstreamErrorMessage(readErr.Error())
 		} else if answer, healthy, got, ok := openAITurnStateRecoveryAnswer(raw); !ok {
-			attempt.Error = "no completed response"
+			// 200 却没有终态：把流里有什么写进错误，页面与日志上能看出是被拒、被截还是掐断。
+			attempt.Error = "no completed; " + openAITurnStateRecoveryStreamDiagnostic(string(raw))
 		} else {
 			attempt.Answer = answer
 			attempt.Healthy = healthy
@@ -1139,7 +1204,8 @@ func (s *OpenAITurnStateHunterService) doProbe(ctx context.Context, account, egr
 	defer s.recordProbeUsage(billCtx, account, cfg, c, req, resp.Header, attempt, usage, text)
 	blob := extractOpenAICodexTurnState(resp.Header)
 	if blob == "" {
-		if !readAnswer {
+		// 恢复探测只要回答，没票无所谓；猎手（含 pair 模式）没票就等于这次探测白跑。
+		if !readAnswer || cfg.PairMode {
 			attempt.Error = "no turn-state in response"
 		}
 		return
@@ -1147,6 +1213,14 @@ func (s *OpenAITurnStateHunterService) doProbe(ctx context.Context, account, egr
 	attempt.Chars = len(blob)
 	if !readAnswer {
 		attempt.Healthy = openAITurnStateHealthy(blob)
+	}
+	// pair 模式自己入池：判据是这次做题的答案，而 relay 那条路按票长判（780 时代恒 false），
+	// 指望它入池就永远入不了。同一条 blob 两条路都推时靠 push 里的按 blob 去重挡住，先推的
+	// 带着 pair。
+	if cfg.PairMode && attempt.Healthy {
+		s.gateway.pushOpenAITurnStateCandidate(c, account, blob, &openAITurnStatePair{
+			Cookies: pairCookies, TTLSeconds: cfg.TicketTTLSeconds,
+		})
 	}
 	// 与真实响应同一个入口：记铸造者、写形态观测、健康则入池。传原账号而不是出口副本，
 	// 池子按账号 ID 读写，两者本来相同，这里只是不让副本流出去。
@@ -1549,8 +1623,8 @@ func ValidateOpenAITurnStateHunterExtra(extra map[string]any) error {
 		}
 		enabled = b
 	}
-	autoModels := false
-	for _, key := range []string{"hold_when_degraded", "auto_models"} {
+	autoModels, pairMode := false, false
+	for _, key := range []string{"hold_when_degraded", "auto_models", "pair_mode"} {
 		v, ok := table[key]
 		if !ok || v == nil {
 			continue
@@ -1559,8 +1633,11 @@ func ValidateOpenAITurnStateHunterExtra(extra map[string]any) error {
 		if !ok {
 			return fmt.Errorf("%s.%s must be a boolean", openAITurnStateHunterExtraKey, key)
 		}
-		if key == "auto_models" {
+		switch key {
+		case "auto_models":
 			autoModels = b
+		case "pair_mode":
+			pairMode = b
 		}
 	}
 	models, err := openAITurnStateHunterStringList(table, "models", openAITurnStateHunterMaxModels)
@@ -1588,6 +1665,14 @@ func ValidateOpenAITurnStateHunterExtra(extra map[string]any) error {
 	if err := openAITurnStateHunterIntField(table, "usage_api_key_id", 0, math.MaxInt32); err != nil {
 		return err
 	}
+	if err := openAITurnStateHunterIntField(table, "ticket_ttl_seconds", 0, openAITurnStateHunterMaxTicketTTL); err != nil {
+		return err
+	}
+	// 0 = 取默认，但显式填一个比下限还小的值是配错，别静默顶上去。
+	if v, ok := openAITurnStateHunterNumber(table["ticket_ttl_seconds"]); ok && v > 0 && int(v) < openAITurnStateHunterMinTicketTTL {
+		return fmt.Errorf("%s.ticket_ttl_seconds must be at least %d seconds",
+			openAITurnStateHunterExtraKey, openAITurnStateHunterMinTicketTTL)
+	}
 	if v, ok := table["reasoning_effort"]; ok && v != nil {
 		effort, ok := v.(string)
 		if !ok {
@@ -1612,6 +1697,23 @@ func ValidateOpenAITurnStateHunterExtra(extra map[string]any) error {
 	// 小数截断。口径不一致这条交叉校验就会被 "5" 静默跳过、被 10.5 绕过。
 	if stale := float64(int(parseExtraFloat64(extra[openAITurnStateStaleMinExtraKey]))); stale > 0 && lead >= stale {
 		return fmt.Errorf("%s.lead_minutes (%d) must be smaller than %s (%d)", openAITurnStateHunterExtraKey, int(lead), openAITurnStateStaleMinExtraKey, int(stale))
+	}
+	// pair 模式下票的寿命是 ticket_ttl_seconds（默认 120 = 2 分钟），同一条约束要按它再比一次。
+	//
+	// 只在**显式填了** lead_minutes 时拒：没填就是「按默认来」，而默认的 10 分钟比默认票寿命长，
+	// 拒掉的话在编辑弹窗里勾一下 pair 模式就存不进去（那个输入框留空时前端根本不写这个键），
+	// 而同一份配置从数据导入落库时 applyDefaults 又会静默削到票寿命以内——一条路拒一条路收，
+	// 是自相矛盾。填了才比，没填交给 applyDefaults 削（见那里的注释）。
+	if pairMode {
+		ttl := float64(defaultOpenAITurnStateHuntTicketTTL)
+		if v, ok := openAITurnStateHunterNumber(table["ticket_ttl_seconds"]); ok && v > 0 {
+			ttl = v
+		}
+		explicitLead, hasLead := openAITurnStateHunterNumber(table["lead_minutes"])
+		if hasLead && explicitLead > 0 && explicitLead*60 >= ttl {
+			return fmt.Errorf("%s.lead_minutes (%d) must be smaller than ticket_ttl_seconds (%d) when pair_mode is on",
+				openAITurnStateHunterExtraKey, int(explicitLead), int(ttl))
+		}
 	}
 	return nil
 }

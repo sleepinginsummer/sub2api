@@ -2673,6 +2673,32 @@
               </div>
               <div class="flex items-center justify-between gap-4 sm:col-span-2">
                 <div class="min-w-0">
+                  <label class="input-label mb-0 text-xs">{{ t('admin.accounts.openai.turnStateHunterPair') }}</label>
+                  <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">
+                    {{ t('admin.accounts.openai.turnStateHunterPairDesc') }}
+                  </p>
+                </div>
+                <input
+                  v-model="openAITurnStateHunter.pair_mode"
+                  data-testid="edit-openai-turn-state-hunter-pair"
+                  type="checkbox"
+                  class="h-4 w-4 flex-shrink-0 rounded border-gray-300 text-primary-600 focus:ring-primary-500"
+                />
+              </div>
+              <div v-if="openAITurnStateHunter.pair_mode">
+                <label class="input-label text-xs">{{ t('admin.accounts.openai.turnStateHunterTicketTtl') }}</label>
+                <input
+                  v-model.number="openAITurnStateHunter.ticket_ttl_seconds"
+                  type="number"
+                  min="30"
+                  max="3600"
+                  placeholder="240"
+                  class="input text-xs"
+                  data-testid="edit-openai-turn-state-hunter-ticket-ttl"
+                />
+              </div>
+              <div class="flex items-center justify-between gap-4 sm:col-span-2">
+                <div class="min-w-0">
                   <label class="input-label mb-0 text-xs">{{ t('admin.accounts.openai.turnStateHunterHold') }}</label>
                   <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">
                     {{ t('admin.accounts.openai.turnStateHunterHoldDesc') }}
@@ -4190,6 +4216,10 @@ interface TurnStateHunterConfig {
   auto_models: boolean
   /** 探测记账用的 API Key ID：每次 200 探测按标准用量路径落一行；空 = 不记。 */
   usage_api_key_id: number | null
+  /** pair 模式（实验性）：探测直接做糖果题，答对才入池，票与 __cflb/__oailb 一起回放。 */
+  pair_mode: boolean
+  /** pair 票自己的有效期（秒，30–3600，默认 240）；必须比「到期前开窗」长。 */
+  ticket_ttl_seconds: number | null
 }
 // 降智恢复探测（extra.openai_turn_state_recovery）：走账号**自己的出口**、间隔随机，每次出一道
 // 糖果题，最近 streak_target 次里答对 success_target 次判定恢复并打标记；连续 streak_target 次
@@ -4273,7 +4303,9 @@ const emptyTurnStateHunter = (): TurnStateHunterConfig => ({
   reasoning_effort: '',
   hold_when_degraded: false,
   auto_models: false,
-  usage_api_key_id: null
+  usage_api_key_id: null,
+  pair_mode: false,
+  ticket_ttl_seconds: null
 })
 const readOpenAITurnStateHunter = (extra: unknown): TurnStateHunterConfig => {
   const cfg = emptyTurnStateHunter()
@@ -4300,6 +4332,8 @@ const readOpenAITurnStateHunter = (extra: unknown): TurnStateHunterConfig => {
   cfg.reasoning_effort = typeof table.reasoning_effort === 'string' ? table.reasoning_effort : ''
   cfg.hold_when_degraded = table.hold_when_degraded === true
   cfg.auto_models = table.auto_models === true
+  cfg.pair_mode = table.pair_mode === true
+  cfg.ticket_ttl_seconds = int('ticket_ttl_seconds')
   return cfg
 }
 // 归一成要写进 extra 的对象；全空（关着、没选、没填）返回 null = 删键。
@@ -4316,13 +4350,15 @@ const normalizeTurnStateHunter = (cfg: TurnStateHunterConfig): Record<string, un
     ['lead_minutes', cfg.lead_minutes],
     ['idle_minutes', cfg.idle_minutes],
     ['retry_minutes', cfg.retry_minutes],
-    ['usage_api_key_id', cfg.usage_api_key_id]
+    ['usage_api_key_id', cfg.usage_api_key_id],
+    ['ticket_ttl_seconds', cfg.ticket_ttl_seconds]
   ]
   for (const [key, value] of numeric) {
     if (typeof value === 'number' && Number.isFinite(value) && value !== 0) out[key] = value
   }
   if (cfg.reasoning_effort) out.reasoning_effort = cfg.reasoning_effort
   if (cfg.hold_when_degraded) out.hold_when_degraded = true
+  if (cfg.pair_mode) out.pair_mode = true
   if (cfg.auto_models) out.auto_models = true
   const blank = !cfg.enabled && !models.length && !proxyIds.length && Object.keys(out).length === 3
   return blank ? null : out

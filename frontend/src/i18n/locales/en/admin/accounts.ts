@@ -738,9 +738,9 @@ export default {
         turnStateAutoTakeover: 'Managed automatically',
         turnStateModelsEmpty: '(model list unavailable)',
         turnStateOverrideConfigured: 'Models with a ticket: {models}',
-        turnStateHunter: '292 hunter (no longer works, deprecated)',
+        turnStateHunter: 'Turn-state hunter (experimental, incomplete)',
         turnStateHunterDesc:
-          'Shortly before the live ticket expires, open fresh sessions through the selected proxies until a 292 is minted, then pool it for automatic takeover. Probes hang up as soon as the response headers arrive; the main cost is the input tokens of each probe (including the model base prompt). While the hunter is on, every session gets the pooled ticket. Hourly cap applies; models without real traffic inside the idle window are not hunted. Every probe opens a new proxy connection, so webshare -rotate endpoints change exit per probe; other proxies are treated as fixed exits: the exit IP is resolved before probing, each exit is probed once, and an exit that minted 312 is left alone for 7 days.',
+          'Shortly before the live ticket expires, open fresh sessions through the selected proxies until a usable ticket is minted, then pool it for automatic takeover. While the hunter is on, every session gets the pooled ticket; an hourly cap applies and models without real traffic inside the idle window are not hunted. Every probe opens a new proxy connection, so webshare -rotate endpoints change exit per probe; other proxies are treated as fixed exits, whose exit IP is resolved before probing and which are probed once per round. Two criteria, pick one: **without pair mode** the ticket length decides (292/332 gets pooled, probes hang up on the response headers, so the cost is just input tokens) - upstream has minted nothing but 780 since 2026-09-23, so that path no longer yields tickets; **with pair mode** the puzzle decides, see below.',
         turnStateHunterNeedsAuto: 'Enable automatic takeover first, otherwise the hunter does not run',
         turnStateHunterInvalid: 'With the hunter enabled, pick 1–8 models (or tick auto) and 1–64 proxies',
         turnStateHunterAutoModels: 'Pick models from real traffic automatically (every model with real requests inside the idle window that upstream has minted a turn-state for is hunted; image models are excluded; manual picks above are ignored)',
@@ -756,6 +756,10 @@ export default {
         turnStateHunterUsageKey: 'Usage API key ID (blank = no usage log)',
         turnStateHunterUsageKeyDesc:
           'When set, every 200 probe is recorded under this key through the standard usage path (type "Hunter probe", billed normally, bumps last-used); input tokens are estimated locally (base prompt included), output is always 0. Use a dedicated key: probes consume its quota/rate limits, and subscription groups need an active subscription.',
+        turnStateHunterPair: 'Pair mode (experimental, incomplete)',
+        turnStateHunterPairDesc:
+          'Probes ask the candy puzzle and read the whole answer; only a correct one (21) pools the ticket, together with the __cflb / __oailb cookies from that same response, which are then replayed alongside the ticket. Judging health by ticket length died when upstream moved to 780 characters, so the puzzle is the only criterion left. Cost: every probe is a full answer (roughly 10-60s) instead of hanging up on the headers, and the hunted model itself has to get the puzzle right (it was only calibrated on gpt-5.6-sol). Set the probe reasoning effort above to medium (the puzzle was calibrated on gpt-5.6-sol at medium effort). Local testing showed that replaying the ticket with its pair does stop upstream from re-minting, but no re-mint only means the ticket was accepted, not that the model is at full strength; measure the lifetime and the benefit yourself.',
+        turnStateHunterTicketTtl: 'Pair ticket lifetime (s, 30-3600, default 120)',
         turnStateHunterHold: 'Pause scheduling while degraded',
         turnStateHunterHoldDesc:
           'When a hunted model has no injectable 292, pause that model on this account for one idle window (idle_minutes) and fail the request over (503 if no other account); after expiry the next request re-pauses it if still no ticket, and a new ticket resumes it immediately. Other models are unaffected; a model nobody requests anymore simply expires.',
@@ -778,10 +782,12 @@ export default {
           summary: '{n} model(s) with a live turn-state',
           summaryObservedOnly: 'no live ticket, {n} reading(s) only',
           detail: '{model}: {shape} {health}, minted {minted}, expires {expires}',
+          detailPair: ', pair {n}',
+          detailReminted: ', upstream re-minted {n}x',
           healthy: 'full',
           degraded: 'suspect',
           unknown: 'unknown shape',
-          hunterSummary: 'hunter (deprecated) {count}/{max} this hour · {next} · {last}',
+          hunterSummary: 'hunter (experimental) {count}/{max} this hour · {next} · {last}',
           hunterNext: 'next {time}',
           hunterReady: 'ready',
           hunterProbing: 'probing',
@@ -800,8 +806,10 @@ export default {
           hunterLastNone: 'no probe yet',
           hunterResultHit: '{chars}✓',
           hunterResultMiss: '{chars}',
+          hunterResultAnswerHit: '{chars}·answered {answer}✓',
+          hunterResultAnswerMiss: '{chars}·answered {answer}✗',
           hunterResultError: 'error {status} {error}',
-          hunterDetail: "{time} {model} {'@'}{proxy}{exit}: {result}, headers in {latency}",
+          hunterDetail: "{time} {model} {'@'}{proxy}{exit}: {result}, took {latency}",
         },
         compactMode: 'Compact mode',
         compactModeDesc:

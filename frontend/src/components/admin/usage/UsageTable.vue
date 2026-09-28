@@ -354,6 +354,27 @@
           <span v-else class="text-sm text-gray-400 dark:text-gray-500">-</span>
         </template>
 
+        <!-- 路由对：显示 __oailb 里解出的后端网关，复制拿到的是整组 __cflb/__oailb（可原样复现）。
+             这是走哪条路由的观测读数，不代表满血与否。 -->
+        <template #cell-route_gateway="{ row }">
+          <div v-if="row.route_gateway" class="flex max-w-[200px] items-center gap-1.5">
+            <span class="truncate font-mono text-xs text-gray-600 dark:text-gray-400" :title="row.route_pair || row.route_gateway">
+              {{ row.route_gateway }}
+            </span>
+            <button
+              v-if="row.route_pair"
+              type="button"
+              class="shrink-0 rounded p-0.5 text-gray-400 transition-colors hover:bg-gray-100 hover:text-gray-600 dark:hover:bg-dark-700 dark:hover:text-gray-300"
+              :class="copiedRequestId === row.route_pair ? 'text-green-500 hover:text-green-500' : ''"
+              :title="copiedRequestId === row.route_pair ? t('keys.copied') : t('admin.usage.routePairCopy')"
+              @click="copyTurnState(row.route_pair)"
+            >
+              <Icon :name="copiedRequestId === row.route_pair ? 'check' : 'copy'" size="sm" class="h-3.5 w-3.5" />
+            </button>
+          </div>
+          <span v-else class="text-sm text-gray-400 dark:text-gray-500">-</span>
+        </template>
+
         <template #cell-user_agent="{ row }">
           <span v-if="row.user_agent" class="text-sm text-gray-600 dark:text-gray-400 block max-w-[320px] truncate" :title="row.user_agent">{{ formatUserAgent(row.user_agent) }}</span>
           <span v-else class="text-sm text-gray-400 dark:text-gray-500">-</span>

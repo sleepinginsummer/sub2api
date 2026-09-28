@@ -324,10 +324,12 @@ func (s *OpenAIGatewayService) RecordUsage(ctx context.Context, input *OpenAIRec
 			longContextBillingGate,
 			pricingAt,
 		)
-		if standardErr != nil {
+		if standardErr != nil && !isUsagePricingUnavailableError(standardErr) {
 			return standardErr
 		}
-		if cost != nil && standardCost != nil {
+		// Missing pricing already fell back to a zero-cost log above; keep that
+		// usage row instead of dropping it on the Standard re-evaluation.
+		if standardErr == nil && cost != nil && standardCost != nil {
 			cost.ActualCost = standardCost.ActualCost
 		}
 	}
@@ -423,6 +425,11 @@ func (s *OpenAIGatewayService) RecordUsage(ctx context.Context, input *OpenAIRec
 	// UpstreamHeaders 为空（response.metadata 事件里的 headers 暂不取），保持 NULL；cpr 原样中继的 WS 轮次会落值。
 	usageLog.SafetyBufferingEnabled = usageCodexSafetyBufferingEnabledPtr(result.UpstreamHeaders)
 	usageLog.SafetyBufferingFasterModel = usageCodexSafetyBufferingFasterModelPtr(result.UpstreamHeaders)
+	// 路由对读数（openai_codex_route_cookies.go）：上游新下发就记新的，否则回读罐里当前那一组。
+	// 纯观测，不参与任何判定。
+	routePair := s.routePairInUse(account, result.UpstreamHeaders)
+	usageLog.RoutePair = usageCodexRoutePairPtr(routePair)
+	usageLog.RouteGateway = usageCodexRouteGatewayPtr(routePair)
 	isVideoUsage := isGrokVideoUsageResult(result, billingModels)
 	if isVideoUsage {
 		usageLog.VideoCount = result.VideoCount
@@ -502,6 +509,7 @@ func (s *OpenAIGatewayService) RecordUsage(ctx context.Context, input *OpenAIRec
 		applyAccountStatsCost(ctx, usageLog, s.channelService, s.billingService,
 			account.ID, *apiKey.GroupID, result.UpstreamModel, result.Model,
 			tokens, cost.TotalCost, pricingAt,
+			accountStatsLongContextPricingEnabled(longContextBillingGate),
 		)
 	}
 

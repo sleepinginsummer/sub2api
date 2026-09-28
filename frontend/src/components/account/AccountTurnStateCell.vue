@@ -155,6 +155,10 @@ interface PoolCandidate {
   minted_at?: string
   failed?: boolean
   fail_streak?: number
+  /** 以下三项只有 pair 模式的候选有（后端 openai_turn_state_pair.go）。 */
+  ttl_seconds?: number
+  cookies?: string[]
+  reminted?: number
 }
 
 /**
@@ -192,6 +196,14 @@ interface PoolTicket {
   verdict: TurnStateVerdict
   mintedAt: Date
   active: boolean
+  /**
+   * 这条票自己的有效期。pair 候选带一份短的（后端 ttl_seconds 盖过账号级的 stale_after），
+   * 拿账号级的 1 小时算会让页面写着「还剩 55 分钟」而后端 4 分钟后就不注了。
+   */
+  ttlMs: number
+  /** pair 读数：随票回放的 cookie 条数、注入后上游重铸的次数。 */
+  pairCookies: number
+  reminted: number
 }
 
 const extra = computed(
@@ -240,7 +252,10 @@ const manualOverrides = computed<PoolTicket[]>(() => {
       chars: trimmed.length,
       verdict: turnStateVerdict(trimmed),
       mintedAt: env.mintedAt,
-      active: true
+      active: true,
+      ttlMs: ttlMs.value,
+      pairCookies: 0,
+      reminted: 0
     })
   }
   return out
@@ -261,12 +276,16 @@ const candidatePool = computed<PoolTicket[]>(() => {
     if (!model || !blob || c?.failed) continue
     const minted = c?.minted_at ? new Date(c.minted_at) : null
     if (!minted || Number.isNaN(minted.getTime())) continue
+    const ttlSeconds = typeof c?.ttl_seconds === 'number' && c.ttl_seconds > 0 ? c.ttl_seconds : 0
     out.push({
       model,
       chars: blob.length,
       verdict: turnStateVerdict(blob),
       mintedAt: minted,
-      active: true
+      active: true,
+      ttlMs: ttlSeconds ? ttlSeconds * 1000 : ttlMs.value,
+      pairCookies: Array.isArray(c?.cookies) ? c.cookies.length : 0,
+      reminted: typeof c?.reminted === 'number' && c.reminted > 0 ? c.reminted : 0
     })
   }
   return out
@@ -296,7 +315,10 @@ const observedShapes = computed<PoolTicket[]>(() => {
       // 走块数而不是 chars：块数是真判据，字符长度受 base64 padding 影响。
       verdict: turnStateVerdictByBlocks(blocks),
       mintedAt: minted,
-      active: false
+      active: false,
+      ttlMs: ttlMs.value,
+      pairCookies: 0,
+      reminted: 0
     }
   ]
 })
@@ -331,6 +353,9 @@ interface PoolEntry {
   mintedAt: Date
   expiresAt: string
   remainingPercent: number
+  /** pair 读数（只有 pair 候选非零）：随票回放的 cookie 条数、上游重铸次数。 */
+  pairCookies: number
+  reminted: number
 }
 
 /**
@@ -349,7 +374,7 @@ const entries = computed<PoolEntry[]>(() => {
     const seen = new Set<string>()
     for (const c of group) {
       if (seen.has(c.model)) continue
-      const expires = c.mintedAt.getTime() + ttlMs.value
+      const expires = c.mintedAt.getTime() + c.ttlMs
       // 票过期就整个不展示：「没有可用票」和「有一张过期票」对运维是同一件事。
       //
       // 观测行不适用这条。它不是票，没有「到期」这回事，后端也永不删这条记录（只按
@@ -374,7 +399,9 @@ const entries = computed<PoolEntry[]>(() => {
         active: c.active,
         mintedAt: c.mintedAt,
         expiresAt: new Date(expires).toISOString(),
-        remainingPercent: Math.round(((expires - now) / ttlMs.value) * 100)
+        remainingPercent: Math.round(((expires - now) / c.ttlMs) * 100),
+        pairCookies: c.pairCookies,
+        reminted: c.reminted
       })
     }
   }
@@ -454,8 +481,10 @@ interface HuntAttempt {
   latency_ms?: number
   exit?: string
   error?: string
-  /** 恢复探测独有：糖果题的回答（归一化后）。 */
+  /** 恢复探测与 pair 模式的猎手探测都有：糖果题的回答（归一化后）。 */
   answer?: string
+  /** pair 模式独有：随票收到的路由 cookie 条数。 */
+  cookies?: number
 }
 interface HuntState {
   next_at?: string
@@ -507,6 +536,16 @@ const hunterErrored = computed(
 
 const hunterAttemptResult = (a: HuntAttempt) => {
   if (a.error) return t('admin.accounts.openai.turnStatePool.hunterResultError', { status: a.status || '-', error: a.error })
+  // pair 模式按做题判，票长只是读数：不写出答案的话，「答对入池」和「答错丢掉」在页面上
+  // 长得一模一样（两次的票都是 780 字符）。
+  if (a.answer) {
+    return t(
+      a.healthy
+        ? 'admin.accounts.openai.turnStatePool.hunterResultAnswerHit'
+        : 'admin.accounts.openai.turnStatePool.hunterResultAnswerMiss',
+      { chars: a.chars ?? 0, answer: a.answer }
+    )
+  }
   return t(
     a.healthy
       ? 'admin.accounts.openai.turnStatePool.hunterResultHit'
@@ -583,7 +622,9 @@ const hunterTitle = computed(() =>
         exit: a.exit ? ` (${a.exit})` : '',
         result: hunterAttemptResult(a),
         latency: typeof a.latency_ms === 'number' ? `${(a.latency_ms / 1000).toFixed(1)}s` : '-'
-      })
+      }) +
+      // pair 模式才有：随票收到几个路由 cookie。0 个说明那张票只能裸回放，是用户要看的读数之一。
+      (a.cookies ? t('admin.accounts.openai.turnStatePool.detailPair', { n: a.cookies }) : '')
     )
     .join('\n')
 )
@@ -708,7 +749,11 @@ const detailTitle = computed(() =>
         health: t(`admin.accounts.openai.turnStatePool.${e.verdict}`),
         minted: formatDateTime(e.mintedAt),
         expires: formatDateTime(new Date(e.expiresAt))
-      })
+      }) +
+      // pair 读数只在 pair 候选上非零：cookie 条数说明这张票有没有伴，重铸次数是用户要看的
+      // 那个数（后端只记不判，见 openai_turn_state_pair.go）。
+      (e.pairCookies ? t('admin.accounts.openai.turnStatePool.detailPair', { n: e.pairCookies }) : '') +
+      (e.reminted ? t('admin.accounts.openai.turnStatePool.detailReminted', { n: e.reminted }) : '')
     )
     .join('\n')
 )

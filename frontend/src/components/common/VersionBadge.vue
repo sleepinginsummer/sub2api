@@ -706,6 +706,7 @@ const releaseInfo = computed(() => appStore.releaseInfo)
 const buildType = computed(() => appStore.buildType)
 const upstreamVersion = computed(() => appStore.upstreamVersion)
 
+// 左上角拆成两处：上游只显示所基于的 X.Y.Z，二开显示本地版本序号；完整版本放进提示。
 // 上游版本从当前版本推出来，不等更新检查返回；检查结果只决定有没有新版提示。
 const upstreamBaseVersion = computed(() => currentVersion.value.replace(/-(?:klno|sleepinsum)\.\d+$/, ''))
 const upstreamHasUpdate = computed(() => upstreamVersion.value?.has_update === true)

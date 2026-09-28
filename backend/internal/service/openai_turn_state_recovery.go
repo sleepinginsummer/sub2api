@@ -50,6 +50,9 @@ const (
 	openAITurnStateRecoveryProbeTimeout = 3 * time.Minute
 	openAITurnStateRecoveryReadLimit    = 2 << 20
 	openAITurnStateRecoveryAnswerKeep   = 200
+	// openAITurnStateRecoveryDiagKeep 是「没有正文 / 没有终态」那两段现场说明的长度上限：
+	// 它们进账号页 tooltip，要短（用户要求）。段内的错误信息与部分正文另有更小的上限。
+	openAITurnStateRecoveryDiagKeep = 120
 	// openAITurnStateRecoveryExpectedAnswer 是糖果题的正确答案；降智账号典型答 29 / 36 / 空。
 	// 判「答对」只看整段回答里是否含它（用户 2026-09-25 定：误判概率极低，别让「答案是 21 颗」被判错）。
 	openAITurnStateRecoveryExpectedAnswer = "21"
@@ -327,6 +330,20 @@ func openAITurnStateRecoveryAnswer(raw []byte) (answer string, healthy bool, usa
 			output = gjson.ParseBytes(rebuilt)
 		}
 	}
+	if got, ok := extractOpenAIUsageFromJSONBytes(final); ok {
+		usage = &got
+	}
+	full := openAITurnStateRecoveryOutputText(output)
+	healthy = strings.Contains(full, openAITurnStateRecoveryExpectedAnswer)
+	answer = normalizeOpenAITurnStateRecoveryAnswer(full)
+	if answer == "" {
+		answer = openAITurnStateRecoveryEmptyAnswer(final, output)
+	}
+	return answer, healthy, usage, true
+}
+
+// openAITurnStateRecoveryOutputText 把 output 里所有 message 项的 output_text 拼成整段回答。
+func openAITurnStateRecoveryOutputText(output gjson.Result) string {
 	var text strings.Builder
 	output.ForEach(func(_, item gjson.Result) bool {
 		if item.Get("type").String() != "message" {
@@ -340,27 +357,58 @@ func openAITurnStateRecoveryAnswer(raw []byte) (answer string, healthy bool, usa
 		})
 		return true
 	})
-	if got, ok := extractOpenAIUsageFromJSONBytes(final); ok {
-		usage = &got
+	return text.String()
+}
+
+// openAITurnStateRecoveryStreamDiagnostic 在流里没有 completed/done 终态时，用一小段写出流里到底有什么：
+// 最后一个事件类型、incomplete 的原因、failed/error 事件的错误信息、已经吐出来的部分正文。
+// 2026-09-26 01:26 pro1 一次探测 200 却没有终态，只留下一句 "no completed response"，是被拒、被截还是
+// 流被掐断全都查不了——这一段就是给那种情况留的现场。它会进页面 tooltip，所以要短（用户要求）：
+// 错误信息截 60 字节、部分正文截 40 字节、整串截 120 字节。
+func openAITurnStateRecoveryStreamDiagnostic(body string) string {
+	last := ""
+	var detail []string
+	forEachOpenAISSEFrame(body, func(eventType string, data []byte) {
+		last = eventType
+		switch eventType {
+		case "response.failed", "response.incomplete":
+			if reason := strings.TrimSpace(gjson.GetBytes(data, "response.incomplete_details.reason").String()); reason != "" {
+				detail = append(detail, "reason="+reason)
+			}
+			if msg := strings.TrimSpace(gjson.GetBytes(data, "response.error.message").String()); msg != "" {
+				detail = append(detail, "error="+truncateUTF8(sanitizeUpstreamErrorMessage(msg), 60))
+			}
+		case "error":
+			msg := gjson.GetBytes(data, "message").String()
+			if msg == "" {
+				msg = gjson.GetBytes(data, "error.message").String()
+			}
+			if msg = strings.TrimSpace(msg); msg != "" {
+				detail = append(detail, "error="+truncateUTF8(sanitizeUpstreamErrorMessage(msg), 60))
+			}
+		}
+	})
+	if last == "" {
+		return "no sse frames"
 	}
-	full := text.String()
-	healthy = strings.Contains(full, openAITurnStateRecoveryExpectedAnswer)
-	answer = normalizeOpenAITurnStateRecoveryAnswer(full)
-	if answer == "" {
-		answer = openAITurnStateRecoveryEmptyAnswer(final, output)
+	parts := append([]string{"last=" + last}, detail...)
+	if rebuilt, ok := reconstructResponseOutputFromSSE(body); ok {
+		if partial := normalizeOpenAITurnStateRecoveryAnswer(openAITurnStateRecoveryOutputText(gjson.ParseBytes(rebuilt))); partial != "" {
+			parts = append(parts, "partial="+truncateUTF8(partial, 40))
+		}
 	}
-	return answer, healthy, usage, true
+	return truncateUTF8(strings.Join(parts, " "), openAITurnStateRecoveryDiagKeep)
 }
 
 // openAITurnStateRecoveryEmptyAnswer 把「没有正文」写成能看懂的形态：终态 status、未完成原因、
 // output 各项类型，message 里若有 refusal 也带上。降智账号确实会交白卷（用户实测 29/36/空三种），
 // 页面和日志上要能区分「答错」与「没答」，也要能看出是被拒还是截断。
 func openAITurnStateRecoveryEmptyAnswer(final []byte, output gjson.Result) string {
-	status := gjson.GetBytes(final, "status").String()
-	if status == "" {
-		status = "?"
+	parts := []string{"∅"}
+	// 终态是 completed 时不必写 status（有 completed 才走到这里是常态），别的状态才值得一提。
+	if status := gjson.GetBytes(final, "status").String(); status != "" && status != "completed" {
+		parts = append(parts, "status="+status)
 	}
-	parts := []string{"∅ status=" + status}
 	if reason := gjson.GetBytes(final, "incomplete_details.reason").String(); reason != "" {
 		parts = append(parts, "reason="+reason)
 	}
@@ -369,14 +417,14 @@ func openAITurnStateRecoveryEmptyAnswer(final []byte, output gjson.Result) strin
 		types = append(types, item.Get("type").String())
 		item.Get("content").ForEach(func(_, part gjson.Result) bool {
 			if part.Get("type").String() == "refusal" {
-				parts = append(parts, "refusal="+strings.TrimSpace(part.Get("refusal").String()))
+				parts = append(parts, "refusal="+truncateUTF8(strings.TrimSpace(part.Get("refusal").String()), 60))
 			}
 			return true
 		})
 		return true
 	})
 	parts = append(parts, "output=["+strings.Join(types, ",")+"]")
-	return truncateUTF8(strings.Join(parts, " "), openAITurnStateRecoveryAnswerKeep)
+	return truncateUTF8(strings.Join(parts, " "), openAITurnStateRecoveryDiagKeep)
 }
 
 // normalizeOpenAITurnStateRecoveryAnswer 去掉首尾的空白、标点与符号：题目要求「只输出一个数字」，

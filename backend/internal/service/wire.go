@@ -193,7 +193,7 @@ func ProvideOpenAIQuotaService(
 	referralClient OpenAIReferralClient,
 	openAIGatewayService *OpenAIGatewayService,
 ) *OpenAIQuotaService {
-	// 额度面使用 Codex 身份，邀请仍走独立客户端。
+	// 额度面走不做浏览器伪装的客户端，与推理面自报同一个 Codex 身份。
 	service := NewOpenAIQuotaService(accountRepo, proxyRepo, tokenProvider, PrivacyClientFactory(codexBackendClientFactory), referralClient)
 	service.agentIdentityWS = openAIGatewayService
 	return service
