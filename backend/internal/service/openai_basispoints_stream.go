@@ -121,6 +121,75 @@ func (e *openAIBasisPointsEmitter) keepalive(every time.Duration) {
 	_ = e.emitLocked("response.in_progress", bpsObject{"response": e.progress})
 }
 
+// 文本补发按消息与 content_index 记账，增量和两处终态快照共用同一状态。
+type openAIBasisPointsTextPartKey struct {
+	item         string
+	contentIndex string
+}
+
+type openAIBasisPointsTextDeltaState struct {
+	seen map[openAIBasisPointsTextPartKey]struct{}
+}
+
+func openAIBasisPointsTextPartIdentity(id string, outputIndex, contentIndex any) openAIBasisPointsTextPartKey {
+	if outputIndex == nil {
+		outputIndex = 0
+	}
+	if contentIndex == nil {
+		contentIndex = 0
+	}
+	item := "id:" + id
+	if id == "" {
+		item = fmt.Sprintf("idx:%v", outputIndex)
+	}
+	return openAIBasisPointsTextPartKey{item: item, contentIndex: fmt.Sprint(contentIndex)}
+}
+
+func (s *openAIBasisPointsTextDeltaState) has(id string, outputIndex, contentIndex any) bool {
+	// 上限满后停止补发，避免未记下的部件在后续快照中被重复发送。
+	if len(s.seen) >= 1024 {
+		return true
+	}
+	_, seen := s.seen[openAIBasisPointsTextPartIdentity(id, outputIndex, contentIndex)]
+	return seen
+}
+
+func (s *openAIBasisPointsTextDeltaState) note(id string, outputIndex, contentIndex any) {
+	if len(s.seen) >= 1024 {
+		return
+	}
+	if s.seen == nil {
+		s.seen = make(map[openAIBasisPointsTextPartKey]struct{})
+	}
+	s.seen[openAIBasisPointsTextPartIdentity(id, outputIndex, contentIndex)] = struct{}{}
+}
+
+func (s *openAIBasisPointsTextDeltaState) backfill(emitter *openAIBasisPointsEmitter, outputIndex any, item bpsObject) error {
+	if bpsText(item["type"]) != "message" {
+		return nil
+	}
+	if outputIndex == nil {
+		outputIndex = 0
+	}
+	id := bpsText(item["id"])
+	content, _ := item["content"].([]any)
+	for i, raw := range content {
+		part, _ := raw.(bpsObject)
+		text := bpsText(part["text"])
+		if bpsText(part["type"]) != "output_text" || text == "" || s.has(id, outputIndex, i) {
+			continue
+		}
+		// 已有增量的部件不补；补过的部件也不能在 done/终态快照里再次发送。
+		s.note(id, outputIndex, i)
+		if err := emitter.emit("response.output_text.delta", bpsObject{
+			"output_index": outputIndex, "item_id": id, "content_index": i, "delta": text,
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (b *openAIBasisPointsBridge) transform(upstream io.ReadCloser, writer io.Writer, keepalive, silence time.Duration) error {
 	emitter := &openAIBasisPointsEmitter{writer: writer, lastAt: time.Now()}
 	var lastUpstream atomic.Int64
@@ -184,78 +253,8 @@ func (b *openAIBasisPointsBridge) transform(upstream io.ReadCloser, writer io.Wr
 		}
 		return emitter.emit("response.output_item.done", bpsObject{"output_index": index, "item": item})
 	}
-	// 见过 text delta 的 item：BPS 偶发只把正文放在终态项里，一条 response.output_text.delta 都不发
-	// （JaxsonWang/cpa-plugin-oai-basispoints#12 的现场，issue 里点名了「把本插件响应转给下游的
-	// sub2api」）。只拼 delta 的客户端会拿到一条 HTTP 200 的**空回答** —— 而「200 但正文为空」不在
-	// 硬报错口径的覆盖范围里，报错收口一条都拦不住，所以只能在这里补。
-	sawTextDelta := map[string]bool{}
-	// 记满 1024 之后不再记，此时一律当「见过」（见下）：宁可退回偶发空回答，也不要在已经有正文
-	// 的流里补出双份。原来到上限只是停止记录，等于后面每一项都被当成「没发过」而全部补一遍。
-	textDeltaAtCap := false
-	// backfillText：output_item.done 的 message 项里有非空 output_text、而这一项一条 delta 都没发过时，
-	// 在 done 之前补发。**只在没发过时补**：两边都发会让同时读 delta 和终态项的客户端看到双份正文。
-	// refusal / reasoning 与空文本不补；content_index 按真实下标，不按补发的条数重编。
-	// 键优先用 item_id；上游的 delta 不带 item_id 时回落到 output_index —— 不回落的话那条 delta
-	// 记不下来，补发就会在上游已经把正文交给客户端之后再补一份（双份正文比偶发空回答更糟，
-	// 而且同样拿不到任何信号）。
-	// nil→0 的归一必须在**键里**做：查、记、出线三处共用一个键函数，否则同一项的 `idx:<nil>` 与
-	// `idx:0` 永不相等 —— 查不到就会在上游已经交出正文之后再补一份（双份正文比偶发空回答更糟）。
-	textDeltaKey := func(id string, outputIndex any) string {
-		if id != "" {
-			return "id:" + id
-		}
-		if outputIndex == nil {
-			return "idx:0"
-		}
-		return fmt.Sprintf("idx:%v", outputIndex)
-	}
-	// noteTextDelta：记一条「这一项已经有 delta 了」。上限**两个写入点共用** —— 只在 delta 侧判上限的话，
-	// 补发能把 map 顶过 1024，随后第一条 delta 就把 textDeltaAtCap 永久置真、补发把自己饿死。
-	noteTextDelta := func(key string) {
-		if len(sawTextDelta) >= 1024 {
-			textDeltaAtCap = true
-			return
-		}
-		sawTextDelta[key] = true
-	}
-	backfillText := func(outputIndex any, item bpsObject) error {
-		id := bpsText(item["id"])
-		if sawTextDelta[textDeltaKey(id, outputIndex)] || bpsText(item["type"]) != "message" {
-			return nil
-		}
-		if textDeltaAtCap {
-			// 上限满了就一律当「见过」：宁可退回偶发空回答，也不要在已经有正文的流里补出双份。
-			return nil
-		}
-		content, _ := item["content"].([]any)
-		if outputIndex == nil {
-			// 上游这个事件不带 output_index 时不能原样搬：会发出 `"output_index": null`，
-			// 而 openai-python / openai-js 把它声明成必填 int，null 直接抛校验错误。
-			outputIndex = 0
-		}
-		for i, raw := range content {
-			part, _ := raw.(bpsObject)
-			if bpsText(part["type"]) != "output_text" {
-				continue
-			}
-			text := bpsText(part["text"])
-			if text == "" {
-				continue
-			}
-			// 补过就记账：否则同一个 item 连发两条 output_item.done（或者 done 之后终态快照里又出现
-			// 同一项）会补出双份正文 —— 正是这段要防的那件事。
-			noteTextDelta(textDeltaKey(id, outputIndex))
-			if err := emitter.emit("response.output_text.delta", bpsObject{
-				"output_index":  outputIndex,
-				"item_id":       id,
-				"content_index": i,
-				"delta":         text,
-			}); err != nil {
-				return err
-			}
-		}
-		return nil
-	}
+	// BPS 偶发只在快照中给正文；只补未发过增量的文本部件，避免漏字或重复。
+	var textDeltas openAIBasisPointsTextDeltaState
 	// 最近一个带 response 对象的事件：合成的失败事件要带上它的 id / model / usage，已消耗的额度才记得上。
 	var lastResponse bpsObject
 	sawBareError := false
@@ -276,10 +275,10 @@ func (b *openAIBasisPointsBridge) transform(upstream io.ReadCloser, writer io.Wr
 		}
 		item, _ := payload["item"].(bpsObject)
 		if kind == "response.output_text.delta" {
-			noteTextDelta(textDeltaKey(bpsText(payload["item_id"]), payload["output_index"]))
+			textDeltas.note(bpsText(payload["item_id"]), payload["output_index"], payload["content_index"])
 		}
 		if kind == "response.output_item.done" && !bpsIsTool(item) {
-			if err := backfillText(payload["output_index"], item); err != nil {
+			if err := textDeltas.backfill(emitter, payload["output_index"], item); err != nil {
 				return err
 			}
 		}
@@ -338,8 +337,8 @@ func (b *openAIBasisPointsBridge) transform(upstream io.ReadCloser, writer io.Wr
 					if !bpsIsTool(item) {
 						// issue #12 的「正文只放在终态项里」有两种形态：output_item.done 里，
 						// 和只出现在终态快照的 output[] 里（上游连 output_item.done 都不发）。
-						// 上面那处只盖住前一种，这里盖后一种；sawTextDelta 保证不双发。
-						if err := backfillText(i, item); err != nil {
+						// 两处共用部件级记账，保证终态快照不重复补发。
+						if err := textDeltas.backfill(emitter, i, item); err != nil {
 							return err
 						}
 						continue

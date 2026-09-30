@@ -503,3 +503,119 @@ func TestOpenAIBasisPointsStreamBackfillSkipsNonTextParts(t *testing.T) {
 	require.NoError(t, err)
 	require.NotContains(t, string(raw), "response.output_text.delta")
 }
+
+func TestOpenAIBasisPointsStreamBackfillsEachMissingTextPart(t *testing.T) {
+	for _, snapshotOnly := range []bool{false, true} {
+		for _, streamedIndex := range []int{0, 1} {
+			t.Run(fmt.Sprintf("snapshot_only=%v/streamed_index=%d", snapshotOnly, streamedIndex), func(t *testing.T) {
+				bridge := newBasisPointsTestBridge(t, "[]")
+				msg := `{"type":"message","id":"msg_1","role":"assistant","status":"completed",` +
+					`"content":[{"type":"output_text","text":"A"},{"type":"output_text","text":"B"}]}`
+				stream := bpsTestEvent("response.created", `,"response":{"id":"r","status":"in_progress","output":[]}`) +
+					bpsTestEvent("response.output_item.added", `,"output_index":0,"item":`+msg) +
+					bpsTestEvent("response.output_text.delta", fmt.Sprintf(`,"output_index":0,"item_id":"msg_1","content_index":%d,"delta":%q`, streamedIndex, []string{"A", "B"}[streamedIndex]))
+				if !snapshotOnly {
+					// 重复 done 与 completed 不得重复补发任何部件。
+					stream += strings.Repeat(bpsTestEvent("response.output_item.done", `,"output_index":0,"item":`+msg), 2)
+				}
+				stream += bpsTestEvent("response.completed", `,"response":{"id":"r","status":"completed","output":[`+msg+`]}`)
+				raw, err := io.ReadAll(bridge.stream(io.NopCloser(strings.NewReader(stream)), 0, 0))
+				require.NoError(t, err)
+				parts := map[int][]string{}
+				err = readOpenAIBasisPointsEvents(strings.NewReader(string(raw)), func(_ string, data []byte) error {
+					if gjson.GetBytes(data, "type").String() == "response.output_text.delta" {
+						index := int(gjson.GetBytes(data, "content_index").Int())
+						parts[index] = append(parts[index], gjson.GetBytes(data, "delta").String())
+					}
+					return nil
+				})
+				require.NoError(t, err)
+				require.Equal(t, map[int][]string{0: {"A"}, 1: {"B"}}, parts)
+			})
+		}
+	}
+}
+
+type basisPointsPeekCountingBody struct {
+	io.Reader
+	bytesRead int
+}
+
+func (b *basisPointsPeekCountingBody) Read(p []byte) (int, error) {
+	n, err := b.Reader.Read(p)
+	b.bytesRead += n
+	return n, err
+}
+
+func (b *basisPointsPeekCountingBody) Close() error { return nil }
+
+func TestOpenAIBasisPointsPeekBoundsReadsAndPreservesBody(t *testing.T) {
+	const limit = 4 << 20
+	for _, tc := range []struct {
+		name   string
+		prefix string
+	}{
+		{"long_comment", ": " + strings.Repeat("x", 2*limit) + "\n\n"},
+		{"long_data", "data: " + strings.Repeat("x", 2*limit) + "\n\n"},
+		{"no_newline", strings.Repeat("x", 2*limit)},
+		{"at_limit", ": " + strings.Repeat("x", limit-3) + "\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			source := tc.prefix
+			if tc.name != "no_newline" {
+				source += bpsTestEvent("response.completed", `,"response":{"id":"r","status":"completed","output":[]}`)
+			}
+			body := &basisPointsPeekCountingBody{Reader: strings.NewReader(source)}
+			rest, failure, err := peekOpenAIBasisPointsFirstOutput(body, time.Minute)
+			require.NoError(t, err)
+			require.NotNil(t, rest)
+			defer func() { _ = rest.Close() }()
+			require.Nil(t, failure)
+			require.LessOrEqual(t, body.bytesRead, limit, "单行未结束时也必须遵守预读上限")
+			raw, err := io.ReadAll(rest)
+			require.NoError(t, err)
+			require.Equal(t, source, string(raw), "交接不能丢字节或重复缓冲区内容")
+		})
+	}
+}
+
+func TestOpenAIBasisPointsStreamTextPartIdentityNormalizesMissingIndices(t *testing.T) {
+	for _, missingID := range []bool{false, true} {
+		t.Run(fmt.Sprintf("missing_id=%v", missingID), func(t *testing.T) {
+			bridge := newBasisPointsTestBridge(t, "[]")
+			idField := `,"id":"msg_1"`
+			deltaID := `,"item_id":"msg_1"`
+			if missingID {
+				idField, deltaID = "", ""
+			}
+			msg := `{"type":"message"` + idField + `,"role":"assistant","status":"completed",` +
+				`"content":[{"type":"output_text","text":"A"},{"type":"output_text","text":"B"}]}`
+			stream := bpsTestEvent("response.output_text.delta", deltaID+`,"delta":"A"`) +
+				bpsTestEvent("response.output_item.done", `,"item":`+msg) +
+				bpsTestEvent("response.completed", `,"response":{"id":"r","status":"completed","output":[`+msg+`]}`)
+			raw, err := io.ReadAll(bridge.stream(io.NopCloser(strings.NewReader(stream)), 0, 0))
+			require.NoError(t, err)
+			require.Equal(t, 2, strings.Count(string(raw), "event: response.output_text.delta"))
+			require.Equal(t, 1, strings.Count(string(raw), `"delta":"A"`))
+			require.Equal(t, 1, strings.Count(string(raw), `"delta":"B"`))
+			require.Contains(t, string(raw), `"content_index":1`)
+			require.Contains(t, string(raw), `"output_index":0`)
+		})
+	}
+}
+
+func TestOpenAIBasisPointsStreamTextPartTrackingRemainsBounded(t *testing.T) {
+	bridge := newBasisPointsTestBridge(t, "[]")
+	parts := make([]string, 1025)
+	for i := range parts {
+		parts[i] = fmt.Sprintf(`{"type":"output_text","text":"part_%d"}`, i)
+	}
+	msg := `{"type":"message","id":"msg_1","role":"assistant","status":"completed","content":[` + strings.Join(parts, ",") + `]}`
+	stream := bpsTestEvent("response.output_item.done", `,"output_index":0,"item":`+msg) +
+		bpsTestEvent("response.completed", `,"response":{"id":"r","status":"completed","output":[`+msg+`]}`)
+	raw, err := io.ReadAll(bridge.stream(io.NopCloser(strings.NewReader(stream)), 0, 0))
+	require.NoError(t, err)
+	require.Equal(t, 1024, strings.Count(string(raw), "event: response.output_text.delta"))
+	require.Contains(t, string(raw), `"delta":"part_1023"`)
+	require.NotContains(t, string(raw), `"delta":"part_1024"`)
+}

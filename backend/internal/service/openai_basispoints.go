@@ -1218,7 +1218,7 @@ var errOpenAIBasisPointsPeekTimeout = errors.New("basispoints upstream sent no e
 // peekOpenAIBasisPointsFirstOutput 读到「处理器会立刻写给客户端的第一个事件」为止，读过的字节原样接回
 // 返回的 body。生命周期事件、原生工具事件都会被处理器暂存 / 被转写扣住，客户端看不见；这段时间客户端
 // 还在等响应头，Codex 的空闲计时没有启动。failure 非空表示上游在此之前就以 error / response.failed 收场。
-// 相邻两个事件之间超过 deadline 就关掉 body 报超时；读过的字节超过 4 MiB 就不再等。
+// 相邻两个事件之间超过 deadline 就关掉 body 报超时；预读最多 4 MiB，达到上限后原样交接。
 func peekOpenAIBasisPointsFirstOutput(body io.ReadCloser, deadline time.Duration) (io.ReadCloser, []byte, error) {
 	const limit = 4 << 20
 	var timedOut atomic.Bool
@@ -1227,11 +1227,14 @@ func peekOpenAIBasisPointsFirstOutput(body io.ReadCloser, deadline time.Duration
 		_ = body.Close()
 	})
 	defer timer.Stop()
-	reader := bufio.NewReaderSize(body, 64<<10)
+	// 限制底层读取，避免 ReadString 在超长或无换行的单行上越过预读预算。
+	limited := &io.LimitedReader{R: body, N: limit}
+	reader := bufio.NewReaderSize(limited, 64<<10)
 	var consumed bytes.Buffer
 	var data []byte
 	rest := func() io.ReadCloser {
-		return openAIBasisPointsPeekedBody{Reader: io.MultiReader(bytes.NewReader(consumed.Bytes()), reader), Closer: body}
+		// 依次回放已消费字节、reader 缓冲及原始流的剩余部分；预算截断不丢数据。
+		return openAIBasisPointsPeekedBody{Reader: io.MultiReader(bytes.NewReader(consumed.Bytes()), reader, body), Closer: body}
 	}
 	for consumed.Len() < limit {
 		line, err := reader.ReadString('\n')
@@ -1239,6 +1242,9 @@ func peekOpenAIBasisPointsFirstOutput(body io.ReadCloser, deadline time.Duration
 		if err != nil {
 			if timedOut.Load() {
 				return nil, nil, errOpenAIBasisPointsPeekTimeout
+			}
+			if limited.N == 0 && errors.Is(err, io.EOF) {
+				return rest(), nil, nil
 			}
 			return nil, nil, io.ErrUnexpectedEOF
 		}
