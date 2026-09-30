@@ -311,30 +311,12 @@ func openAIBasisPointsRouteReason(body []byte) string {
 			case "configuration_update":
 				return "reasoning_configuration"
 			}
-			// **只扫 content / output 真会出站的那几类项。**
-			//
-			// translateHistory 对 reasoning / compaction / compaction_summary 是**整项重建**
-			// （只留 type + 密文，content / summary 一概丢弃），对 compaction_trigger 与
-			// additional_tools 是挪位 / 丢弃 —— 这些项的 content 里有什么根本不会出站。
-			// 原来这里对每个 item 无条件扫，于是一个带 `content:[{type:"reasoning_text",…}]` 的
-			// reasoning 项（本仓库 apicompat 的 fixture 就是这个形状，`/v1/responses` 客户端回放
-			// 历史时的常规形态）会撞上部件白名单、被判成 input_content 硬 502。
-			// 失败在**出站之前**，一个字节都没发 ⇒ bps: lineage 自愈压根不触发 ⇒ 客户端每轮回放
-			// 同一批历史 ⇒ 这个会话在开着开关的账号上**每轮都 502、永不自愈**。与
-			// encrypted_content 部件、compaction 项是同一类的第三个实例。
-			// **字段也要按项分**，不是两个字段都扫：item 级白名单只把 message 的 `content` 和
-			// 工具结果的 `output` 送出站，反过来扫（工具结果的 content / message 的 output）就是
-			// 同一个缺陷降到字段级 —— 那个字段一个字节都不会发，却能把整条请求判死。
-			switch item.Get("type").String() {
-			case "message", "":
-				if reason := bpsContentRoute(item.Get("content")); reason != "" {
-					return reason
-				}
-			case "function_call_output", "custom_tool_call_output":
-				if reason := bpsContentRoute(item.Get("output")); reason != "" {
-					return reason
-				}
-			}
+			// **内容部件不在这里判死。** 原来这里按部件白名单扫 message 的 `content` 与工具结果的
+			// `output`，任何白名单外的部件（未知类型、非字符串正文、形态不对的图片）整条请求判死成
+			// input_content 硬 502 —— 失败在出站之前 ⇒ 客户端每轮回放同一批历史 ⇒ 这个会话在开着
+			// 开关的账号上每轮都 502、永不自愈（09-30 现网撞了一次）。用户 2026-09-30 拍板改成
+			// 占位部件，处置全部收到 rewriteContent 一处（见 openAIBasisPointsDroppedPartNotice），
+			// 这道事前闸门连同 bpsContentRoute 一起删掉。
 		}
 	}
 	for _, path := range []string{"text.format.type", "response_format.type"} {
@@ -383,48 +365,6 @@ func bpsDeclaredToolsRoute(tools gjson.Result) string {
 		case isOpenAIBasisPointsHostedTool(kind):
 			// mcp / file_search / code_interpreter 之类只有原生后端才跑得了，不能静默丢掉。
 			return "hosted_tool"
-		}
-	}
-	return ""
-}
-
-func bpsContentRoute(content gjson.Result) string {
-	if !content.IsArray() {
-		return ""
-	}
-	for _, part := range content.Array() {
-		switch part.Get("type").String() {
-		case "input_text", "output_text", "text":
-			// **正文必须是字符串。** rewriteContent 用 bpsText 重建这三类部件，而 bpsText 对非字符串
-			// 返回 ""：模型看到一个空文本部件，正文一个字节都不出站，客户端侧零信号、日志里零读数 ——
-			// 整个 switch 里只有这一格会静默吞。最现实的生产者是 Assistants API v2 的消息形状
-			// （`{"type":"text","text":{"value":"…","annotations":[]}}`），而 `text` 这个类型本来
-			// 就是为「确实有客户端这么发」才放过的。发请求前判死，与这个文件的口径一致；刻意**不**去
-			// 读 text.value 兜底 —— 那是替客户端猜格式。
-			// 缺 text / 显式 null 都不判死：那种部件本来就没有正文可丢，静默的只有「有正文但不是
-			// 字符串」这一格。gjson 对显式 null 返回 Exists()==true + Type==Null，所以 Null 要单列
-			// —— 少了它，`"text":null`（Jackson / Newtonsoft 的默认序列化）这种零内容的写法会被判死，
-			// 而它在回放历史里 ⇒ 每轮都死，正是这道闸门要避免的那一类。
-			if v := part.Get("text"); v.Exists() && v.Type != gjson.Null && v.Type != gjson.String {
-				return "input_content"
-			}
-		case "refusal":
-			if v := part.Get("refusal"); v.Exists() && v.Type != gjson.Null && v.Type != gjson.String {
-				return "input_content"
-			}
-		// Codex 多智能体 v2 历史里的密文部件：rewriteContent 会换成一句明文说明（保留位置），
-		// 所以这道事前闸门也得放它过 —— 少这一行整条请求在进 bridge 之前就被判死，替换代码是死代码。
-		case "encrypted_content":
-		case "input_image":
-			url := strings.TrimSpace(part.Get("image_url").String())
-			switch {
-			case url == "" && part.Get("file_id").String() != "":
-			case strings.HasPrefix(url, "https://"), strings.HasPrefix(url, "data:"):
-			default:
-				return "image_input"
-			}
-		default:
-			return "input_content"
 		}
 	}
 	return ""
@@ -521,11 +461,15 @@ type openAIBasisPointsAttempt struct {
 	// 第一条），从发请求时刻算的话预算早被吃光，定时器会被设成 1ns 直接判超时 —— 那条路还会
 	// 调 HandleStreamTimeout 改账号状态，而 isOpenAIBasisPointsResponse 的闸门不在那上面。
 	acceptedAt time.Time
-	// requestStart 是出站请求发出的时刻。**TTFT 必须从这里算，不能从 acceptedAt 算**：
-	// peek 一直读到「第一个会到客户端的事件」为止，所以流处理器起跑时那条事件已经在缓冲里，
-	// 以 acceptedAt 为原点量出来的 firstTokenMs 恒等于 ~0 —— 而它有三个消费者
-	// （usage_logs.first_token_ms、ops 的 TTFT 读数、scheduler.ReportResult 的延迟分），
-	// 等于 BPS 账号在延迟维度上永远满分、真慢的号永远不被降权，而面板上 0 ms 看着还很好。
+	// requestStart 是出站请求发出的时刻。**TTFT 必须从这里算，不能从 acceptedAt 算**：peek 一直读到
+	// 「第一个会到客户端的事件」为止，那一段（发请求 → 首个可见事件，含上游排队与思考的前半段）在以
+	// acceptedAt 为原点时**整段丢掉**，而 firstTokenMs 有三个消费者（usage_logs.first_token_ms、
+	// ops 的 TTFT 读数、scheduler.ReportResult 的延迟分）—— 少算等于真慢的号在延迟维度上被系统性
+	// 高估，而面板上完全看不出来。
+	//
+	// 丢的**不是全部**：peek 的放行判据是「非元数据事件」，response.created / in_progress 不算，
+	// 所以它常常停在第一个推理摘要事件上，而 firstTokenMs 量的是第一个**文本** token —— 两者之间的
+	// 思考时间原来就在读数里。09-30 现网旧行（修复前）是 5463 ms 而不是 0，别把这条读成「原来恒 0」。
 	// 预算仍然用 acceptedAt（见上），两件事解耦。
 	requestStart time.Time
 }
@@ -679,6 +623,13 @@ func (s *OpenAIGatewayService) beginOpenAIBasisPoints(ctx context.Context, c *gi
 	scope := fmt.Sprintf("%d|%d", account.ID, apiKeyID)
 	bridge := newOpenAIBasisPointsBridge(scope, openAIBasisPointsReplay, s.openAIBasisPointsUploader(ctx, c, account, proxyURL, headers, token, accountID))
 	outBody, err := bridge.prepare(body, upstreamModel)
+	// **翻译警告在这里打，不等 2xx。** prepare 收集的读数（换掉的托管工具声明、换成占位符的
+	// 内容类型）最需要被看见的场景恰恰是「这一发被上游拒了」，而原来这行在 `resp.Body = rest`
+	// 之后，从这里到那里的每一条错误出口都跳过它 —— 于是现场只看到 status_400，完全不知道
+	// 这一发透传了什么、占位了什么。prepare 自己失败时同理（它已经 append 过 warning 才判死）。
+	if len(bridge.warnings) > 0 {
+		logger.LegacyPrintf("service.openai_gateway", "[Basispoints] account=%d %s", account.ID, strings.Join(bridge.warnings, "; "))
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -757,9 +708,6 @@ func (s *OpenAIGatewayService) beginOpenAIBasisPoints(ctx context.Context, c *gi
 	}
 	resp.Body = rest
 	SetOpsLatencyMs(c, OpsUpstreamLatencyMsKey, time.Since(upstreamStart).Milliseconds())
-	if len(bridge.warnings) > 0 {
-		logger.LegacyPrintf("service.openai_gateway", "[Basispoints] account=%d %s", account.ID, strings.Join(bridge.warnings, "; "))
-	}
 	resp.Body = bridge.stream(resp.Body, s.openAIBasisPointsKeepaliveInterval(), s.openAIBasisPointsUpstreamSilenceBudget())
 	resp.ContentLength = -1
 	resp.Header.Del("Content-Length")
@@ -830,8 +778,8 @@ func (s *OpenAIGatewayService) forwardOpenAIBasisPoints(ctx context.Context, c *
 		streamResult, err := s.handleStreamingResponseWithReasoning(ctx, resp, c, account, attempt.acceptedAt, attempt.requestedModel, attempt.upstreamModel, effortValue)
 		if streamResult != nil {
 			usage, firstTokenMs, responseID = streamResult.usage, streamResult.firstTokenMs, strings.TrimSpace(streamResult.responseID)
-			// 把 peek 吃掉的那段补回 TTFT：处理器是以 acceptedAt 为原点量的，而首输出事件在
-			// acceptedAt 时已经躺在缓冲里，它量出来的恒等于 ~0。理由见 attempt.requestStart。
+			// 把 peek 吃掉的那段补回 TTFT：处理器以 acceptedAt 为原点，而「发请求 → 首个客户端可见
+			// 事件」整段在它之前，原来整段不计入。理由与幅度见 attempt.requestStart。
 			firstTokenMs = offsetOpenAIBasisPointsFirstTokenMs(firstTokenMs, attempt.acceptedAt.Sub(attempt.requestStart))
 		}
 		if err != nil {
