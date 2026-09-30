@@ -667,6 +667,9 @@ func (b *openAIBasisPointsBridge) translateHistory(input []any) ([]any, error) {
 			} else if strings.TrimSpace(bpsText(item["output"])) == "" {
 				// 空输出会被当成失败而反复重试；把成功说明白。
 				item["output"] = openAIBasisPointsEmptyOutput
+			} else {
+				// 只统计实际保留的正文，空输出补出的成功说明不能掩盖正文全丢失。
+				b.liveText++
 			}
 			// item 级字段白名单，理由见下面 message 那条。`name` / `namespace` **留着**：
 			// 2026-09-29 直连实测它们在这个 item 上是合法字段（带着也 200），删掉才是改行为。
@@ -678,6 +681,9 @@ func (b *openAIBasisPointsBridge) translateHistory(input []any) ([]any, error) {
 					return nil, err
 				}
 				item["content"] = rewritten
+			} else if strings.TrimSpace(bpsText(item["content"])) != "" {
+				// Responses 也允许字符串 content，它没有经过 rewriteContent，但正文仍然保留。
+				b.liveText++
 			}
 			// **item 级字段也是白名单。** 上游对未知 item 字段是整单 400（实测
 			// "Unknown parameter: 'input[1].zzz_unknown_field'"），而客户端每轮回放同一批历史 ⇒
@@ -898,21 +904,29 @@ func (spec openAIBasisPointsPassThroughSpec) matches(item bpsObject) bool {
 			return false
 		}
 	}
-	if !openAIBasisPointsValueInSet(bpsText(item["status"]), spec.statuses) {
-		return false
+	// 必须先区分缺字段与类型错误，不能把对象/null 经 bpsText 变成空串后当作缺字段放过。
+	if raw, exists := item["status"]; exists {
+		status, ok := raw.(string)
+		if !ok || !openAIBasisPointsValueInSet(status, spec.statuses) {
+			return false
+		}
 	}
 	if len(spec.actionTypes) > 0 {
 		action, ok := item["action"].(bpsObject)
-		if !ok || !openAIBasisPointsValueInSet(bpsText(action["type"]), spec.actionTypes) {
+		if !ok {
+			return false
+		}
+		kind, ok := action["type"].(string)
+		if !ok || !openAIBasisPointsValueInSet(kind, spec.actionTypes) || !openAIBasisPointsSearchActionMatches(action) {
 			return false
 		}
 	}
 	return true
 }
 
-// openAIBasisPointsValueInSet：空集合 = 不约束；缺字段（空串）放过。
+// openAIBasisPointsValueInSet：空集合不约束取值；字段缺失由调用方单独处理。
 func openAIBasisPointsValueInSet(value string, allowed []string) bool {
-	if len(allowed) == 0 || value == "" {
+	if len(allowed) == 0 {
 		return true
 	}
 	for _, candidate := range allowed {
@@ -921,6 +935,56 @@ func openAIBasisPointsValueInSet(value string, allowed []string) bool {
 		}
 	}
 	return false
+}
+
+// 搜索 action 按官方 Responses schema 校验到数组元素，未知键不删减，整项交给占位处理。
+// 这里只收窄已有透传形状，不扩大 BPS 已实测的 action.type 集合。
+func openAIBasisPointsSearchActionMatches(action bpsObject) bool {
+	for key, value := range action {
+		switch key {
+		case "type":
+			continue
+		case "query":
+			if value != nil {
+				if _, ok := value.(string); !ok {
+					return false
+				}
+			}
+		case "queries":
+			if value == nil {
+				continue
+			}
+			queries, ok := value.([]any)
+			if !ok {
+				return false
+			}
+			for _, query := range queries {
+				if _, ok := query.(string); !ok {
+					return false
+				}
+			}
+		case "sources":
+			if value == nil {
+				continue
+			}
+			sources, ok := value.([]any)
+			if !ok {
+				return false
+			}
+			for _, raw := range sources {
+				source, ok := raw.(bpsObject)
+				if !ok || len(source) != 2 || source["type"] != "url" {
+					return false
+				}
+				if _, ok := source["url"].(string); !ok {
+					return false
+				}
+			}
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // 下面这批「类型上游认、但字段 schema 和 Codex 不一样」的读数**没有**进上面那张透传表：抬上来

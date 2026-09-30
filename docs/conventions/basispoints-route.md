@@ -81,7 +81,9 @@ Assistants API v2 的消息形状 `{"type":"text","text":{"value":…,"annotatio
    published 的内容形状，也正是那一格注释里点名的生产者）；数字 / 布尔 stringify（`"text":123`
    丢掉的就是「123」）；缺字段 / `null` 出空文本；只有数组和没有 `value` 的对象才占位。
 2. 兜底：`droppedText > 0 && liveText == 0` ⇒ 判死 `input_content`。判据刻意收窄成
-   「**丢过**正文且一个都没活下来」，纯图片请求（0 丢 0 活）不受影响。
+   「**丢过**正文且一个都没活下来」，纯图片请求（0 丢 0 活）不受影响。`liveText` 统计保留的非空白
+   文本部件、字符串 `message.content` 和字符串工具结果 `output`；不计客户端 `instructions`、占位符、
+   空白字符串及本层为工具空输出补出的成功说明，避免漏算合法正文或用合成文本掩盖正文全丢失。
 
 ### 实测透传表：上游自己的 "Supported values" 名单**不可信**
 
@@ -112,11 +114,13 @@ Assistants API v2 的消息形状 `{"type":"text","text":{"value":…,"annotatio
 `mcp_approval_*` / `tool_search_output` 共 32 种），却照样拒 ⇒ **上游有两套 enum，报错打的是宽的
 那份**。所以白名单只能来自「我亲手打出 200 的那几个」，这是唯一没说谎的来源。
 
-**透传必须校验到实测过的形状**（`openAIBasisPointsPassThroughSpec.matches`）：`openAIBasisPointsKeepItemKeys`
-是**浅**的，`action` 里客户端塞什么就发什么 —— 实测只覆盖了 `action.type == "search"`，而
-`open_page` / `find_in_page` 以及 action 内部的未知键都是深一层的永久 400。所以键、`status`、
-`action.type` 三项任一越界就降级成占位消息。**取值也要管**：`local_shell_call` 那条已经证明上游
-校验器比它自己宣称的 enum 严，这条链路上「值不对」和「键不对」的后果一样。
+**透传必须校验到实测过的形状**（`openAIBasisPointsPassThroughSpec.matches`）：原生类型及
+`action.type` 的实测白名单不扩大。`status` 可缺省；给出时必须是字符串且命中实测取值，不把
+对象或 `null` 经 `bpsText` 转成空串后当作缺字段放过。搜索 `action.type` 必须是 `search`；
+嵌套字段按 [官方 Responses schema](https://github.com/openai/openai-python/blob/main/src/openai/types/responses/response_function_web_search.py)
+收窄到 `type`、可空字符串 `query`、可空字符串数组 `queries`、可空 `sources` 数组；每个 source
+只含必需的 `type: url` 与字符串 `url`。未知键、错误类型或未实测取值任一越界，整项转占位消息，
+不靠删除字段来猜测剩余内容是否可用。官方 schema 仅用于收窄已有形状，不作为新增 BPS 类型的实测证据。
 
 **下一步（未做）**：`local_shell_call`→`shell_call`、`mcp_tool_call`→`mcp_call`、`tool_search_*`
 都只差一层字段级翻译（改名 + id 前缀 + 字段形状），每种配一发实测就能从占位符抬成真透传。
@@ -151,7 +155,7 @@ Assistants API v2 的消息形状 `{"type":"text","text":{"value":…,"annotatio
 
 **没有变成占位符的**：请求级能力闸门（`web_search` / `image_generation` / `hosted_tool` / `tool_choice` / `prompt_template` / `history_reference` / `reasoning_configuration` / `context_management` / `output_format` / legacy compact 路径）照旧判死 —— 那些讲的是**这一轮要什么**，不是历史里躺着什么，改成占位符等于静默阉掉客户端明确要求的能力。
 - **部件级字段也是白名单**（不只 item 级）。文本三类（`input_text` / `output_text` / `text`）重建成 `{type, text}`、`refusal` 重建成 `{type, refusal}`，`"text"` 顺带归一成按位置算出的那个 kind。依据：上游对部件上多出来的字段同样是拒 —— `{"type":"input_image","file_id":…,"detail":"auto"}` 稳定 422、去掉 `detail` 就 200，而 `detail` 是完全合法的 Responses 字段。而 `output_text` 部件天生带 `annotations`（新版还带 `logprobs`），把 `response.output` 的 assistant 消息原样回放进下一轮 `input` 是官方的多轮写法；顶层 `messages` 那条 legacy 入站路径还会产出带 `prompt_cache_breakpoint` 的 `input_text`。都是常规形态，而后果同上：上游 400 + 每轮回放 ⇒ 永久失败。
-  - **重建的前提是正文真的是字符串。** `bpsText` 对非字符串返回 `""`，于是 `text` 是对象/数组时模型看到一个空文本部件、正文一个字节都不出站，客户端侧零信号、日志里零读数 —— 整个 switch 里只有这一格会静默吞。最现实的生产者是 **Assistants API v2 的消息形状** `{"type":"text","text":{"value":…,"annotations":[]}}`，而 `text` 这个类型本来就是为「确实有客户端这么发」才放过的。**有值但不是字符串 ⇒ 占位部件**（`refusal` 同理）；**缺字段 / 显式 null ⇒ 出空文本**（那种部件本来就没有正文可丢）。刻意**不**去读 `text.value` 兜底 —— 那是替客户端猜格式。用例 `…NonStringTextBecomesAPlaceholderNotAnEmptyPart`。
+  - **先提取可识别的正文，再决定是否占位。** `bpsPartText` 保留字符串、Assistants API v2 的嵌套 `text.value` 字符串，以及数字/布尔标量；缺字段或显式 `null` 出空文本，数组或无法识别的对象转占位部件（`refusal` 同理）。不再用 `bpsText` 把非字符串静默变成空文本。回归见 `…TextPartSalvageBeforePlaceholder`；正文全丢失的判断见前文。
 
 - **这一类缺陷的通用形状，改代码前先按它自检**：客户端每一轮都原样回放同一批历史，所以任何「在出站**之前**判死某个形态」的分支 = 那个会话在开着开关的账号上每轮都硬报错，且 `bps:` lineage 自愈**压根不触发**（它只对上游拒绝生效）。第九到十三轮一共抓到 5 个实例，09-30 现网第 6 个（`web_search_call`）—— 单点补白名单补不完，所以那一轮改成了上面那套通用占位符处置。**新增任何 `bpsNative(...)` 出口都要先问**：这个形态会不会出现在**历史**里？会 ⇒ 占位符，不是判死。出口之外还要问第二句：这个形态被**上游**拒了之后，下一轮靠什么不再发它？**密文值一个字节都不出站**：它对 BPS 是垃圾 token，本层也无从判断里面是什么。用例 `TestOpenAIBasisPoints_EncryptedContentPartBecomesAPlainNotice` / `…NoticeUsesOutputTextForAssistant` / `…NativeToolCallItemsBecomePlaceholders`。
 - 档位：max/ultra→xhigh，none/minimal→low，未知→medium。**不按模型钳档**：原来对 gpt-6-astra 把 low 钳到 medium（引「ghcp_proxy 实测」），2026-09-29 直连实测 astra@low 是 200，四家参考实现也都不钳 —— 钳掉等于白吃掉客户端更快更便宜的低档，已移除。

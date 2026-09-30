@@ -2365,12 +2365,35 @@ func TestOpenAIBasisPoints_MeasuredNativeItemsPassThroughWithinTheMeasuredShape(
 		require.Equal(t, "echo", item.Get("name").String())
 	})
 
-	// 越界的四种都必须降级 —— 这是整套改动的核心性质：永远不产生永久 400。
+	t.Run("合法搜索嵌套字段原样保留", func(t *testing.T) {
+		for _, action := range []string{
+			`{"type":"search","queries":["weather"],"sources":[{"type":"url","url":"https://x"}]}`,
+			`{"type":"search","query":null,"queries":null,"sources":null}`,
+		} {
+			item := gjson.GetBytes(run(t, `{"type":"web_search_call","action":`+action+`}`), "input.2")
+			require.Equal(t, "web_search_call", item.Get("type").String())
+			require.JSONEq(t, action, item.Get("action").Raw)
+		}
+	})
+
+	// 未知字段、未实测取值和错误类型都转占位符，嵌套数组同样校验。
 	for name, item := range map[string]string{
-		"未知键":            `{"type":"web_search_call","id":"ws_1","status":"completed","action":{"type":"search"},"zzz_unknown":1}`,
-		"action 里的未知子类型": `{"type":"web_search_call","id":"ws_1","status":"completed","action":{"type":"open_page","url":"https://x"}}`,
-		"未实测的 status":    `{"type":"web_search_call","id":"ws_1","status":"in_progress","action":{"type":"search"}}`,
-		"action 不是对象":    `{"type":"web_search_call","id":"ws_1","status":"completed","action":"search"}`,
+		"未知键":              `{"type":"web_search_call","id":"ws_1","status":"completed","action":{"type":"search"},"zzz_unknown":1}`,
+		"action 里的未知子类型":   `{"type":"web_search_call","id":"ws_1","status":"completed","action":{"type":"open_page","url":"https://x"}}`,
+		"未实测的 status":      `{"type":"web_search_call","id":"ws_1","status":"in_progress","action":{"type":"search"}}`,
+		"action 不是对象":      `{"type":"web_search_call","id":"ws_1","status":"completed","action":"search"}`,
+		"action 未知字段":      `{"type":"web_search_call","action":{"type":"search","query":"weather","zzz_unknown":true}}`,
+		"status 错误类型":      `{"type":"web_search_call","status":{"bad":true},"action":{"type":"search"}}`,
+		"status 显式 null":   `{"type":"web_search_call","status":null,"action":{"type":"search"}}`,
+		"action.type 错误类型": `{"type":"web_search_call","action":{"type":true}}`,
+		"action.type 缺失":   `{"type":"web_search_call","action":{"query":"weather"}}`,
+		"query 错误类型":       `{"type":"web_search_call","action":{"type":"search","query":[]}}`,
+		"queries 元素错误类型":   `{"type":"web_search_call","action":{"type":"search","queries":[1]}}`,
+		"sources 未知字段":     `{"type":"web_search_call","action":{"type":"search","sources":[{"type":"url","url":"https://x","extra":1}]}}`,
+		"sources 错误类型":     `{"type":"web_search_call","action":{"type":"search","sources":{}}}`,
+		"source 非对象":       `{"type":"web_search_call","action":{"type":"search","sources":["https://x"]}}`,
+		"source.type 错误取值": `{"type":"web_search_call","action":{"type":"search","sources":[{"type":"file","url":"https://x"}]}}`,
+		"source.url 错误类型":  `{"type":"web_search_call","action":{"type":"search","sources":[{"type":"url","url":true}]}}`,
 	} {
 		t.Run("降级："+name, func(t *testing.T) {
 			out := run(t, item)
@@ -2380,6 +2403,35 @@ func TestOpenAIBasisPoints_MeasuredNativeItemsPassThroughWithinTheMeasuredShape(
 			require.Equal(t, openAIBasisPointsDroppedItemNotice("web_search_call"),
 				got.Get("content.0.text").String())
 			require.NotContains(t, string(out), `"web_search_call"`, "原项不许出站")
+		})
+	}
+}
+
+// 字符串正文原样保留，也必须参与全丢失判断；空白正文和本层补出的工具成功说明不算。
+func TestOpenAIBasisPoints_StringHistoryTextCountsAsLiveText(t *testing.T) {
+	for name, live := range map[string]string{
+		"消息字符串":  `{"type":"message","role":"user","content":"What is 2+2?"}`,
+		"省略消息类型": `{"role":"user","content":"What is 2+2?"}`,
+		"工具字符串":  `{"type":"function_call","call_id":"c_1","name":"exec_command","arguments":"{}"},{"type":"function_call_output","call_id":"c_1","output":"result"}`,
+		"空白消息":   `{"type":"message","role":"user","content":"   "}`,
+		"空白工具结果": `{"type":"function_call","call_id":"c_1","name":"exec_command","arguments":"{}"},{"type":"function_call_output","call_id":"c_1","output":"   "}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			bridge := newOpenAIBasisPointsBridge("review", newOpenAIBasisPointsReplayCache(), nil)
+			body := `{"input":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":{"nope":1}}]},` + live + `]}`
+			out, err := bridge.prepare([]byte(body), "gpt-6-astra")
+			if strings.HasPrefix(name, "空白") {
+				require.Error(t, err)
+				require.Contains(t, err.Error(), "input_content")
+				return
+			}
+			require.NoError(t, err)
+			require.Positive(t, bridge.liveText)
+			if strings.Contains(name, "工具") {
+				require.Equal(t, "result", gjson.GetBytes(out, "input.4.output").String())
+			} else {
+				require.Equal(t, "What is 2+2?", gjson.GetBytes(out, "input.3.content").String())
+			}
 		})
 	}
 }
