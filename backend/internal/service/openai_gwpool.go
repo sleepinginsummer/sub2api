@@ -17,8 +17,7 @@ package service
 //     提前被拿去烧。「这张票坏了」这个信息由取 pair 时的 force=1 承载，不需要另一条回报。
 //
 // 配置**全在账号 extra 上**：池子发的 consumer key 是按账号发的，放实例级等于一个 sub2api 实例
-// 里所有账号共用同一个池子身份。开关关着（或缺地址）时整条链路与接入前逐字节一致（走原来的
-// Attach）。
+// 里所有账号共用同一个池子身份。只有开关关闭时走原来的 Attach；启用但配置缺失时拒绝出站。
 //
 // 池子没有满血槽位时回 503 ⇒ 这里把错误原样抛给调用方走既有失败路径，**绝不退回 cookie 回放**
 // （用户原则：宁可 503 也不放降智）。
@@ -30,6 +29,7 @@ package service
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -93,6 +93,14 @@ func (s *openAICodexCookieStore) poolClient(account *Account) (*gwpool.Client, e
 			gwpool.ErrPool, account.ID, openAIGatewayPoolExtraKey, openAIGatewayPoolBaseURLExtraKey)
 	}
 	consumerKey := account.gatewayPoolConsumerKey()
+	if consumerKey == "" {
+		return nil, fmt.Errorf("%w: account %d enables %s without %s",
+			gwpool.ErrPool, account.ID, openAIGatewayPoolExtraKey, OpenAIGatewayPoolConsumerKeyExtraKey)
+	}
+	if err := config.ValidateAbsoluteHTTPURL(baseURL); err != nil {
+		return nil, fmt.Errorf("%w: account %d has an unusable %s: %v",
+			gwpool.ErrPool, account.ID, openAIGatewayPoolBaseURLExtraKey, err)
+	}
 	// \x00 当分隔符：base_url 过了 URL 校验，不可能含 NUL，拼不出歧义键。
 	cacheKey := baseURL + "\x00" + consumerKey
 	if cached, ok := s.poolClients.Load(cacheKey); ok {
@@ -259,27 +267,36 @@ func (s *openAICodexCookieStore) gatewayPoolIdentity(ctx context.Context, accoun
 	return openAIGatewayPoolAccountKey(account), nil
 }
 
+// openAIGatewayPoolCacheKey 同时隔离凭证域身份和池配置，避免换地址/凭据后复用旧路由。
+// 配置使用指纹，缓存与 singleflight 的键不包含明文消费凭据。
+func openAIGatewayPoolCacheKey(account *Account, identity string) string {
+	configHash := sha256.Sum256([]byte(account.gatewayPoolBaseURL() + "\x00" + account.gatewayPoolConsumerKey()))
+	return fmt.Sprintf("%s\x00%x", identity, configHash)
+}
+
 // gatewayPoolPair 取该身份当前可用的 pair：窗口内复用缓存，否则向池子要一张。
 //
-// 同一身份的并发请求用 singleflight 收口成一次 /cookie：池子一个网关一周期只出一张 pair，
+// 同一身份与池配置的并发请求用 singleflight 收口成一次 /cookie，
 // 并发各要一张就是白烧供给。共享的那次取用自己的 ctx（WithoutCancel + 独立超时）——否则第一名
 // 的客户端一断开，排在它后面的同账号请求会被连坐成 502。
 func (s *openAICodexCookieStore) gatewayPoolPair(ctx context.Context, account *Account, identity string) (openAIGatewayPoolPair, error) {
-	pair, state := s.cachedPoolPair(identity)
-	if state == openAIGatewayPoolPairLive {
-		return pair, nil
-	}
+	// 配置检查必须先于缓存命中；缺失凭据的账号不能借同身份已有路由继续出站。
 	pool, err := s.poolClient(account)
 	if err != nil {
 		return openAIGatewayPoolPair{}, err
+	}
+	cacheKey := openAIGatewayPoolCacheKey(account, identity)
+	pair, state := s.cachedPoolPair(cacheKey)
+	if state == openAIGatewayPoolPairLive {
+		return pair, nil
 	}
 	// 租着的那张过了建议窗口 ⇒ 要一张**不同的**网关（force=1）。池子的 valid_for_s 只是建议值
 	// （ttl_is_advisory），换不换由这边判；不带 force 的话池子可能把同一张再发回来。
 	force := state == openAIGatewayPoolPairStale
 	fetchCtx := context.WithoutCancel(ctx)
-	fetched, err, _ := s.poolFetch.Do(identity, func() (any, error) {
+	fetched, err, _ := s.poolFetch.Do(cacheKey, func() (any, error) {
 		// 排在后面的请求醒来时第一名可能已经取到了。
-		if pair, cached := s.cachedPoolPair(identity); cached == openAIGatewayPoolPairLive {
+		if pair, cached := s.cachedPoolPair(cacheKey); cached == openAIGatewayPoolPairLive {
 			return pair, nil
 		}
 		callCtx, cancel := context.WithTimeout(fetchCtx, openAIGatewayPoolFetchTimeout)
@@ -307,7 +324,7 @@ func (s *openAICodexCookieStore) gatewayPoolPair(ctx context.Context, account *A
 			gateway: gateway,
 			until:   time.Now().Add(got.ValidFor),
 		}
-		s.poolPairs.Store(identity, pair)
+		s.poolPairs.Store(cacheKey, pair)
 		slog.Info("gwpool_pair_taken", "account_id", account.ID, "gateway", pair.gateway,
 			"valid_for_s", int(got.ValidFor.Seconds()), "verified_full", got.VerifiedFull,
 			"ttl_is_advisory", got.TTLIsAdvisory, "forced", force)

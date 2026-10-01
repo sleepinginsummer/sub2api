@@ -611,7 +611,7 @@ func TestGatewayPoolForcesRotationAfterWindow(t *testing.T) {
 	require.Empty(t, fake.nextQuery(t), "正常路径不带 force")
 
 	// 把窗口拨到过去，模拟 valid_for_s 到点。
-	store.poolPairs.Store(gwpoolTestIdentity, openAIGatewayPoolPair{
+	store.poolPairs.Store(openAIGatewayPoolCacheKey(acct, gwpoolTestIdentity), openAIGatewayPoolPair{
 		cookie: first, gateway: "unified-142", until: time.Now().Add(-time.Second)})
 
 	rotated := http.Header{}
@@ -631,7 +631,7 @@ func TestGatewayPoolForceNoSlotFailsClosed(t *testing.T) {
 	acct := fake.account(1)
 	// 罐里有一张能回放的：也不许用。
 	store.Store(acct, gwpoolTestURL, codexCookieUpstreamResponse())
-	store.poolPairs.Store(gwpoolTestIdentity, openAIGatewayPoolPair{
+	store.poolPairs.Store(openAIGatewayPoolCacheKey(acct, gwpoolTestIdentity), openAIGatewayPoolPair{
 		cookie: stale, gateway: "unified-142", until: time.Now().Add(-time.Second)})
 
 	for range 2 {
@@ -837,9 +837,9 @@ func TestMergeOpenAIGatewayPoolConsumerKeyPreservesStoredValue(t *testing.T) {
 
 	for name, submitted := range map[string]any{
 		"脱敏回显的 bool": true,
-		"空串":          "",
-		"只有空白":        "   ",
-		"类型不对":        42,
+		"空串":         "",
+		"只有空白":       "   ",
+		"类型不对":       42,
 	} {
 		incoming := map[string]any{OpenAIGatewayPoolConsumerKeyExtraKey: submitted}
 		mergeOpenAIGatewayPoolConsumerKey(existing, incoming)

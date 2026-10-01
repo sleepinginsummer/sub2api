@@ -55,13 +55,14 @@ func TestGatewayPoolRouteSnapshotSurvivesCacheChanges(t *testing.T) {
 			require.NotNil(t, snapshot)
 			require.Equal(t, first, *snapshot)
 			result := &OpenAIForwardResult{Model: "gpt-6-astra", UpstreamHeaders: resp.Header, GatewayPoolRoutePair: snapshot}
-			svc.codexCookies.poolPairs.Store(gwpoolTestIdentity, openAIGatewayPoolPair{cookie: first, gateway: "unified-142", until: time.Now().Add(-time.Second)})
+			cacheKey := openAIGatewayPoolCacheKey(account, gwpoolTestIdentity)
+			svc.codexCookies.poolPairs.Store(cacheKey, openAIGatewayPoolPair{cookie: first, gateway: "unified-142", until: time.Now().Add(-time.Second)})
 			switch state {
 			case "rotated":
 				rotated := send()
 				require.Equal(t, "unified-84", openAICodexRouteGateway(*openAIGatewayPoolRoutePairFromResponse(rotated)))
 			case "removed":
-				svc.codexCookies.poolPairs.Delete(gwpoolTestIdentity)
+				svc.codexCookies.poolPairs.Delete(cacheKey)
 			}
 			require.Equal(t, first, svc.routePairInUse(account, result))
 			// 校验最终 UsageLog，而非只验证快照取值函数。

@@ -27,10 +27,10 @@ type openAICodexCookieStore struct {
 	// 网关池接管（openai_gwpool.go）。配置全在账号 extra 上，客户端按 (base_url, consumer key)
 	// 缓存——每请求新建 gwpool.New 会各带一个 http.Transport，连接池永不复用。
 	poolClients sync.Map // base_url + "\x00" + consumer key → *gwpool.Client
-	// identity 解析凭证域身份（影子行按母账号算），是 pair 缓存键。
+	// identity 解析凭证域身份（影子行按母账号算），与池配置指纹共同组成 pair 缓存键。
 	// 由构造器注入；裸结构体（单元测试）里为 nil，退回按本地行算。
 	identity  openAICodexCredentialIdentity
-	poolPairs sync.Map // 凭证域身份 → openAIGatewayPoolPair
+	poolPairs sync.Map // 凭证域身份 + 池配置指纹 → openAIGatewayPoolPair
 	poolFetch singleflight.Group
 }
 

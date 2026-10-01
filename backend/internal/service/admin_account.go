@@ -759,10 +759,6 @@ func (s *adminServiceImpl) UpdateAccount(ctx context.Context, id int64, input *U
 			delete(account.Extra, modelRateLimitsKey)
 			delete(account.Extra, "antigravity_credits_overages") // 清理旧版 overages 运行态
 		}
-		// 网关池与 WS 上游互斥（openai_gwpool.go）：按合并后的最终 extra 判，否则改一半就绕过去了。
-		if err := validateOpenAIGatewayPoolAccountExtra(account, account.Extra); err != nil {
-			return nil, err
-		}
 		// 校验并预计算固定时间重置的下次重置时间
 		if err := ValidateQuotaResetConfig(account.Extra); err != nil {
 			return nil, err
@@ -772,6 +768,12 @@ func (s *adminServiceImpl) UpdateAccount(ctx context.Context, id int64, input *U
 	}
 	if input.Extra == nil {
 		account.Extra = prepareCodexFingerprintExtraForUpdate(account, account.Extra)
+	}
+	// 类型变更也可能激活已有网关池设置，必须在类型和 extra 都处理后校验最终配置。
+	if input.Extra != nil || input.Type != "" {
+		if err := validateOpenAIGatewayPoolAccountExtra(account, account.Extra); err != nil {
+			return nil, err
+		}
 	}
 	if requestedRateSyncEnabledUpdate != nil && *requestedRateSyncEnabledUpdate {
 		if requestedProbeEnabledUpdate != nil && !*requestedProbeEnabledUpdate {
