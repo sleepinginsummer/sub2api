@@ -699,8 +699,6 @@ export default {
         codexFingerprintModeDesc: 'When multiple users share the same OAuth account, converge device/session identifiers to account-level stable values to reduce upstream-visible device and session count. Off by default (client identifiers pass through as-is); opt in explicitly when needed. Some accounts reported quota shrinkage after enabling convergence, so choose based on your own measurements.',
         codexFingerprintConvergence: 'Experimental fingerprint convergence (klno)',
         codexFingerprintConvergenceDesc: "Make this account's outbound identity match a real Codex client on HTTP and WS: forward session-id / thread-id headers, x-client-request-id equals thread-id, drop session_id / conversation_id aliases, derive root_turn_id and related fields consistently, keep UUIDv7. Off means upstream behaviour; enabling rotates the account's session identifiers once.",
-        basisPoints: 'Basis Points passthrough (experimental)',
-        basisPointsDesc: "Send this account's /v1/responses to the backend of OpenAI's Excel product, bps.openai.com (same login, same account), bypassing the Codex backend; model names are sent unchanged. Tools are described in the prompt and relayed through run_officejs; pictures in user messages are uploaded as BPS attachments first. There is no Codex fallback: requests BPS cannot serve (explicit web search, image generation, structured output, forced tool choice, unrecoverable tool history) and requests BPS rejects all return a client-visible error (error.type=basispoints_unavailable; the upstream's own status code is passed through, and 502 is used for rejections this proxy decides itself), so one API key never mixes full-strength and degraded answers. When the upstream blocks this account's BPS channel under its usage policy, the account is disabled (a 403 has a cooldown, so retrying is pointless) and an administrator must restore it; otherwise account state is not changed. /v1/responses only (WebSocket clients use the HTTP bridge); Codex's automatic compaction turns also go to BPS (measured supported), while the legacy /v1/responses/compact compaction turn fails with a visible error instead (a summary written by the Codex backend would become part of the history of every later turn = mixing). Usage records show the upstream endpoint /basispoints/api/responses. The upstream bans this account's BPS channel for concurrency, so set the account concurrency to 1.",
         codexFingerprintOff: 'Off (passthrough, default)',
         codexFingerprintDevice: 'Device only',
         codexFingerprintSession: 'Device + Session',
@@ -1044,7 +1042,33 @@ export default {
 	    expiresAtFull: 'Reset credit expires at: {time}',
 	    clears: 'Clears windows: {windows}',
 	    notUsableNow: 'Not usable now',
-	    requiresLimit: 'Usable only after hitting a limit'
+	    requiresLimit: 'Usable only after hitting a limit',
+	    reset: 'Reset',
+	    resetTooltipNeedQuery: 'Check the count first; reset is available once a usable credit is found',
+	    resetTooltipNone: 'No reset can be used right now',
+	    resetTooltipReady: 'Consume 1 reset to clear limit windows (asks for confirmation)',
+	    confirmTitle: 'Confirm Claude Reset',
+	    confirmMessage: 'This will consume 1 reset credit to immediately restore the {windows} window(s) ({count} remaining). This action cannot be undone. Continue?',
+	    windows: {
+	      fiveHour: '5h',
+	      sevenDay: '7d',
+	      sevenDayOverage: '7d overage'
+	    },
+	    outcome: {
+	      reset: 'Reset applied; cleared: {windows}',
+	      alreadyUsed: 'This reset was already used; refreshing to confirm',
+	      cooldown: 'Resets are cooling down; try again later',
+	      cooldownUntil: 'Resets are cooling down until {time}',
+	      notLimited: 'Not at a limit, so nothing was reset and no credit was used',
+	      ineligible: 'This account cannot use resets right now',
+	      unknown: 'Result unconfirmed; further redemption is blocked for now. Check again later',
+	      unavailable: 'Reset service is temporarily unavailable; retry after a while',
+	      inProgress: 'This reset request is still processing; check again shortly',
+	      retryBackoff: 'This reset request just failed; retry after a moment',
+	      busy: 'Another reset is in progress; try again later',
+	      notAvailable: 'No reset can be used right now; no credit was used',
+	      failed: 'Reset request failed'
+	    }
 	  },
       autoResetCredit: {
 	    title: 'Automatically use reset credits',

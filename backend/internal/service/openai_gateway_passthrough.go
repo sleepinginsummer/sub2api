@@ -1705,10 +1705,6 @@ func (s *OpenAIGatewayService) handleOpenAIStreamTerminalAccountSideEffects(
 	canonicalModel ...string,
 ) (int, bool) {
 	statusCode := openAIStreamFailureStatus(payload, message)
-	if isOpenAIBasisPointsResponse(c) {
-		// BPS 的限流 / 鉴权失败不是 Codex 账号的状态。
-		return statusCode, false
-	}
 	switch statusCode {
 	case http.StatusForbidden:
 		if !openAIStream403AccountFailure(payload, message) {
@@ -2444,10 +2440,6 @@ func (s *OpenAIGatewayService) handleNonStreamingResponsePassthrough(
 // response for the passthrough path. It mirrors handleSSEToJSON while
 // preserving passthrough payloads, except compact-only model remapping may
 // rewrite model fields back to the original requested model.
-// 与 handleSSEToJSON 的一处**刻意**不同构：那边的终态失败出口会把已解出的 usage 带出来
-// （BPS 非流分支要用它记账，那条路失败即终态、不换号），这里三条终态出口仍然 `return nil, err`。
-// BPS 到不了这条路（Forward 的 BPS 分派排在 passthrough 之前就 return 了），而透传的调用方在
-// err != nil 时一律丢弃 result，带出来没有消费者。要改就两侧一起改，别只改一边。
 func (s *OpenAIGatewayService) handlePassthroughSSEToJSON(resp *http.Response, c *gin.Context, account *Account, body []byte, originalModel string, mappedModel string) (*openaiNonStreamingResultPassthrough, error) {
 	bodyText := string(body)
 	terminalType, terminalPayload, terminalOK := extractOpenAISSETerminalEvent(bodyText)
