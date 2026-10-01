@@ -87,6 +87,8 @@ func (f APIKeyUpdateFields) IsEmpty() bool {
 
 type APIKeyRepository interface {
 	Create(ctx context.Context, key *APIKey) error
+	// CreateWithLimit 在同一事务中按用户加锁、复查有效数量并创建；maxActive <= 0 表示不限量。
+	CreateWithLimit(ctx context.Context, key *APIKey, maxActive int) error
 	GetByID(ctx context.Context, id int64) (*APIKey, error)
 	// GetKeyAndOwnerID 仅获取 API Key 的 key 与所有者 ID，用于删除等轻量场景
 	GetKeyAndOwnerID(ctx context.Context, id int64) (string, int64, error)
@@ -587,7 +589,12 @@ func (s *APIKeyService) Create(ctx context.Context, userID int64, req CreateAPIK
 		apiKey.ExpiresAt = &expiresAt
 	}
 
-	if err := s.apiKeyRepo.Create(ctx, apiKey); err != nil {
+	maxActive := 0
+	if s.cfg != nil {
+		maxActive = s.cfg.APIKeyCreate.MaxActivePerUser
+	}
+	// 前置检查只用于快速拒绝；最终数量上限必须与创建在仓储事务中原子执行。
+	if err := s.apiKeyRepo.CreateWithLimit(ctx, apiKey, maxActive); err != nil {
 		return nil, fmt.Errorf("create api key: %w", err)
 	}
 

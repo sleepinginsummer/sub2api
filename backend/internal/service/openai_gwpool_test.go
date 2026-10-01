@@ -211,7 +211,7 @@ func TestRoutePairInUseFallsBackToJarWhenDisabled(t *testing.T) {
 	svc := &OpenAIGatewayService{}
 	acct := gwpoolTestAccount(1)
 	svc.codexCookies.Store(acct, openAITurnStatePairCookieURL, codexCookieUpstreamResponse())
-	require.Equal(t, "__cflb=lb-1; __oailb=jwt-1", svc.routePairInUse(context.Background(), acct, http.Header{}))
+	require.Equal(t, "__cflb=lb-1; __oailb=jwt-1", svc.routePairInUse(acct, &OpenAIForwardResult{}))
 }
 
 // ---------------------------------------------------------------------------
@@ -649,8 +649,7 @@ func TestDoOpenAIUpstreamGatewayPoolNoSlotFailsClosed(t *testing.T) {
 	require.Empty(t, req.Header.Get("Cookie"), "失败时不许留下降级的回放 cookie")
 }
 
-// 池子接管时路由对读数取池子那张（罐已不参与出站，回读罐会记成别的网关）；
-// 上游新下发时仍以新下发的为准——那是改派后的真实落点。
+// 池子接管时取本次请求的快照，而非罐；上游新下发时仍以改派后的路由为准。
 func TestRoutePairInUsePrefersGatewayPoolPair(t *testing.T) {
 	poolCookie := gwpoolTestPairCookie(t, "unified-142")
 	fake := newGwpoolFakePool(t, poolCookie, 150)
@@ -663,7 +662,9 @@ func TestRoutePairInUsePrefersGatewayPoolPair(t *testing.T) {
 	headers := http.Header{}
 	require.NoError(t, svc.codexCookies.AttachRoute(context.Background(), acct, gwpoolTestURL, headers))
 
-	pair := svc.routePairInUse(context.Background(), acct, http.Header{})
+	snapshot := openAICodexRoutePairFromCookie(headers)
+	result := &OpenAIForwardResult{GatewayPoolRoutePair: &snapshot}
+	pair := svc.routePairInUse(acct, result)
 	require.Equal(t, poolCookie, pair)
 	require.Equal(t, "unified-142", openAICodexRouteGateway(pair))
 
@@ -671,7 +672,8 @@ func TestRoutePairInUsePrefersGatewayPoolPair(t *testing.T) {
 		"__cflb=new-lb; Path=/",
 		"__oailb=" + routeCookieTestOailb(t, "chat.gateway.unified-84.api.openai.com") + "; Path=/",
 	}}
-	require.Equal(t, "unified-84", openAICodexRouteGateway(svc.routePairInUse(context.Background(), acct, fresh)))
+	result.UpstreamHeaders = fresh
+	require.Equal(t, "unified-84", openAICodexRouteGateway(svc.routePairInUse(acct, result)))
 }
 
 // 同身份并发只向池子要一张 pair：池子一个网关一周期只出一张，并发各要一张就是白烧供给。

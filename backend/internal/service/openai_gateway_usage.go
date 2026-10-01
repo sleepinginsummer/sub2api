@@ -425,9 +425,9 @@ func (s *OpenAIGatewayService) RecordUsage(ctx context.Context, input *OpenAIRec
 	// UpstreamHeaders 为空（response.metadata 事件里的 headers 暂不取），保持 NULL；cpr 原样中继的 WS 轮次会落值。
 	usageLog.SafetyBufferingEnabled = usageCodexSafetyBufferingEnabledPtr(result.UpstreamHeaders)
 	usageLog.SafetyBufferingFasterModel = usageCodexSafetyBufferingFasterModelPtr(result.UpstreamHeaders)
-	// 路由对读数（openai_codex_route_cookies.go）：上游新下发就记新的，否则回读罐里当前那一组。
+	// 路由对读数：响应改派优先，否则使用本次池快照；未接管时保留 Cookie 罐读数。
 	// 纯观测，不参与任何判定。
-	routePair := s.routePairInUse(ctx, account, result.UpstreamHeaders)
+	routePair := s.routePairInUse(account, result)
 	usageLog.RoutePair = usageCodexRoutePairPtr(routePair)
 	usageLog.RouteGateway = usageCodexRouteGatewayPtr(routePair)
 	isVideoUsage := isGrokVideoUsageResult(result, billingModels)

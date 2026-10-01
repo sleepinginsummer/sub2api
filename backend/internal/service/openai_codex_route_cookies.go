@@ -1,7 +1,6 @@
 package service
 
 import (
-	"context"
 	"encoding/base64"
 	"encoding/json"
 	"net/http"
@@ -70,18 +69,17 @@ func openAICodexRoutePairFromCookie(h http.Header) string {
 	return routePairOf(candidates)
 }
 
-// routePairInUse 取这一发实际生效的路由对：上游在响应里新下发就用新的（那是改派后的路由），
-// 否则回读罐里当前的那一组（Attach 到一个临时头上再读回来，不写罐、不改任何状态）。
-func (s *OpenAIGatewayService) routePairInUse(ctx context.Context, account *Account, upstream http.Header) string {
-	if fresh := openAICodexRoutePairFromSetCookie(upstream); fresh != "" {
+// routePairInUse 优先使用响应明确改派的路由，其次使用请求发送时的池快照。
+// 仅未被网关池接管的请求保留原有 Cookie 罐读数。
+func (s *OpenAIGatewayService) routePairInUse(account *Account, result *OpenAIForwardResult) string {
+	if fresh := openAICodexRoutePairFromSetCookie(result.UpstreamHeaders); fresh != "" {
 		return fresh
 	}
-	if account == nil || !openAICodexCookiesApply(account) {
-		return ""
+	if result.GatewayPoolRoutePair != nil {
+		return *result.GatewayPoolRoutePair
 	}
-	// 网关池接管时罐不参与出站，这一发带的是池子那张 pair（openai_gwpool.go）。
-	if pair, ok := s.codexCookies.gatewayPoolPairInUse(ctx, account); ok {
-		return pair
+	if account == nil || !openAICodexCookiesApply(account) || s.codexCookies.gatewayPoolTakeover(account) {
+		return ""
 	}
 	probe := http.Header{}
 	s.codexCookies.Attach(account, openAITurnStatePairCookieURL, probe)

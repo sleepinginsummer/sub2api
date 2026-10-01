@@ -1,6 +1,9 @@
 package service
 
-import "net/http"
+import (
+	"context"
+	"net/http"
+)
 
 func (s *OpenAIGatewayService) SetPluginManager(manager *PluginManager) {
 	s.pluginManager = manager
@@ -20,11 +23,24 @@ func (s *OpenAIGatewayService) doOpenAIUpstream(request *http.Request, proxyURL 
 	if request != nil && request.URL != nil {
 		rawURL = request.URL.String()
 	}
-	if err := s.codexCookies.AttachRoute(request.Context(), account, rawURL, request.Header); err != nil {
+	poolPair, err := s.codexCookies.attachRoute(request.Context(), account, rawURL, request.Header)
+	if err != nil {
 		return nil, err
+	}
+	// 发送前冻结实际注入的路由；后续缓存轮换和长响应不能改变这次请求的归属。
+	if poolPair != nil {
+		request = request.WithContext(context.WithValue(request.Context(), openAIGatewayPoolRoutePairContextKey{}, *poolPair))
 	}
 	resp, err := s.doOpenAIUpstreamRoundTrip(request, proxyURL, account)
 	if err == nil && resp != nil {
+		// 插件可能不返回 Request，也可能返回重定向后的 Request；仅补入本次快照，保持其它响应属性。
+		if pair, ok := request.Context().Value(openAIGatewayPoolRoutePairContextKey{}).(string); ok {
+			if resp.Request == nil {
+				resp.Request = request
+			} else {
+				resp.Request = resp.Request.WithContext(context.WithValue(resp.Request.Context(), openAIGatewayPoolRoutePairContextKey{}, pair))
+			}
+		}
 		s.codexCookies.Store(account, rawURL, resp.Header)
 	}
 	return resp, err

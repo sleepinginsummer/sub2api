@@ -1343,6 +1343,7 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 		forwardResult := &OpenAIForwardResult{
 			RequestID:                     resp.Header.Get("x-request-id"),
 			UpstreamHeaders:               resp.Header,
+			GatewayPoolRoutePair:          openAIGatewayPoolRoutePairFromResponse(resp),
 			ResponseID:                    responseID,
 			Usage:                         *usage,
 			Model:                         originalModel,

@@ -385,6 +385,7 @@ func (s *OpenAIGatewayService) streamRawChatCompletions(
 		return &OpenAIForwardResult{
 			RequestID:                     requestID,
 			UpstreamHeaders:               resp.Header,
+			GatewayPoolRoutePair:          openAIGatewayPoolRoutePairFromResponse(resp),
 			Usage:                         usage,
 			Model:                         originalModel,
 			BillingModel:                  billingModel,
@@ -555,6 +556,7 @@ func (s *OpenAIGatewayService) bufferRawChatCompletions(
 	return &OpenAIForwardResult{
 		RequestID:                     requestID,
 		UpstreamHeaders:               resp.Header,
+		GatewayPoolRoutePair:          openAIGatewayPoolRoutePairFromResponse(resp),
 		Usage:                         usage,
 		Model:                         originalModel,
 		BillingModel:                  billingModel,

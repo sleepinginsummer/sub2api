@@ -2338,6 +2338,19 @@ func (r *stubApiKeyRepo) MustSeed(key *service.APIKey) {
 	r.byKey[clone.Key] = &clone
 }
 
+func (r *stubApiKeyRepo) CreateWithLimit(ctx context.Context, key *service.APIKey, maxActive int) error {
+	if maxActive > 0 {
+		count, err := r.CountByUserID(ctx, key.UserID)
+		if err != nil {
+			return err
+		}
+		if count >= int64(maxActive) {
+			return service.ErrAPIKeyCountExceeded
+		}
+	}
+	return r.Create(ctx, key)
+}
+
 func (r *stubApiKeyRepo) Create(ctx context.Context, key *service.APIKey) error {
 	if key == nil {
 		return errors.New("nil key")

@@ -23,6 +23,10 @@ type authRepoStub struct {
 	listKeysByGroupID func(ctx context.Context, groupID int64) ([]string, error)
 }
 
+func (s *authRepoStub) CreateWithLimit(ctx context.Context, key *APIKey, _ int) error {
+	return s.Create(ctx, key)
+}
+
 func (s *authRepoStub) Create(ctx context.Context, key *APIKey) error {
 	panic("unexpected Create call")
 }

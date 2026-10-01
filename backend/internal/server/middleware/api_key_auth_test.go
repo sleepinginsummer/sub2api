@@ -1527,6 +1527,10 @@ type stubApiKeyRepo struct {
 	updateLastUsed func(ctx context.Context, id int64, usedAt time.Time) error
 }
 
+func (r *stubApiKeyRepo) CreateWithLimit(ctx context.Context, key *service.APIKey, _ int) error {
+	return r.Create(ctx, key)
+}
+
 func (r *stubApiKeyRepo) Create(ctx context.Context, key *service.APIKey) error {
 	return errors.New("not implemented")
 }

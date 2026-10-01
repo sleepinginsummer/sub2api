@@ -709,6 +709,7 @@ func (s *OpenAIGatewayService) handleAnthropicBufferedStreamingResponse(
 	result := &OpenAIForwardResult{
 		RequestID:                     requestID,
 		UpstreamHeaders:               resp.Header,
+		GatewayPoolRoutePair:          openAIGatewayPoolRoutePairFromResponse(resp),
 		ResponseID:                    finalResponse.ID,
 		Usage:                         usage,
 		Model:                         originalModel,
@@ -1016,6 +1017,7 @@ func (s *OpenAIGatewayService) handleAnthropicStreamingResponse(
 		out := &OpenAIForwardResult{
 			RequestID:                     requestID,
 			UpstreamHeaders:               resp.Header,
+			GatewayPoolRoutePair:          openAIGatewayPoolRoutePairFromResponse(resp),
 			ResponseID:                    responseID,
 			Usage:                         usage,
 			Model:                         originalModel,

@@ -88,6 +88,10 @@ type fakeGoogleSubscriptionRepo struct {
 	resetMonthly   func(ctx context.Context, id int64, start time.Time) error
 }
 
+func (f fakeAPIKeyRepo) CreateWithLimit(ctx context.Context, key *service.APIKey, _ int) error {
+	return f.Create(ctx, key)
+}
+
 func (f fakeAPIKeyRepo) Create(ctx context.Context, key *service.APIKey) error {
 	return errors.New("not implemented")
 }

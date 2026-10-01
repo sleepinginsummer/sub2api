@@ -49,6 +49,10 @@ type apiKeyRepoStub struct {
 
 // 以下方法在本测试中不应被调用，使用 panic 确保测试失败时能快速定位问题
 
+func (s *apiKeyRepoStub) CreateWithLimit(ctx context.Context, key *APIKey, _ int) error {
+	return s.Create(ctx, key)
+}
+
 func (s *apiKeyRepoStub) Create(ctx context.Context, key *APIKey) error {
 	panic("unexpected Create call")
 }

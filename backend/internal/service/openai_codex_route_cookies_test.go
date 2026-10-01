@@ -1,7 +1,6 @@
 package service
 
 import (
-	"context"
 	"encoding/base64"
 	"encoding/json"
 	"net/http"
@@ -99,9 +98,9 @@ func TestRoutePairInUsePrefersUpstream(t *testing.T) {
 	upstream := http.Header{}
 	upstream.Add("Set-Cookie", "__cflb=new; Path=/")
 	upstream.Add("Set-Cookie", "__oailb="+fresh+"; Path=/")
-	require.Equal(t, "unified-165", openAICodexRouteGateway(s.routePairInUse(context.Background(), account, upstream)))
+	require.Equal(t, "unified-165", openAICodexRouteGateway(s.routePairInUse(account, &OpenAIForwardResult{UpstreamHeaders: upstream})))
 
 	// 上游没下发时回读罐；罐是空的就给空串，不能崩。
-	require.Empty(t, s.routePairInUse(context.Background(), account, http.Header{}))
-	require.Empty(t, s.routePairInUse(context.Background(), nil, http.Header{}))
+	require.Empty(t, s.routePairInUse(account, &OpenAIForwardResult{}))
+	require.Empty(t, s.routePairInUse(nil, &OpenAIForwardResult{}))
 }

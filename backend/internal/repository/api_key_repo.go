@@ -43,7 +43,58 @@ func (r *apiKeyRepository) activeQuery() *dbent.APIKeyQuery {
 }
 
 func (r *apiKeyRepository) Create(ctx context.Context, key *service.APIKey) error {
-	builder := r.client.APIKey.Create().
+	return r.createWithClient(ctx, clientFromContext(ctx, r.client), key)
+}
+
+// CreateWithLimit 将数量复查与写入放在同一事务中；事务级锁保证多实例共享同一用户的名额。
+func (r *apiKeyRepository) CreateWithLimit(ctx context.Context, key *service.APIKey, maxActive int) error {
+	if maxActive <= 0 {
+		return r.Create(ctx, key)
+	}
+	tx := dbent.TxFromContext(ctx)
+	owned := tx == nil
+	if owned {
+		var err error
+		tx, err = r.client.Tx(ctx)
+		if err != nil {
+			return err
+		}
+		ctx = dbent.NewTxContext(ctx, tx)
+	}
+	client := tx.Client()
+	var release func()
+	defer func() {
+		if owned {
+			_ = tx.Rollback()
+		}
+		if release != nil {
+			release()
+		}
+	}()
+	var err error
+	release, err = lockRepositoryScopedKeys(ctx, client, client,
+		fmt.Sprintf("api-key-create:user:%d", key.UserID))
+	if err != nil {
+		return err
+	}
+	count, err := client.APIKey.Query().Where(apikey.UserIDEQ(key.UserID), apikey.DeletedAtIsNil()).Count(ctx)
+	if err != nil {
+		return err
+	}
+	if count >= maxActive {
+		return service.ErrAPIKeyCountExceeded
+	}
+	if err := r.createWithClient(ctx, client, key); err != nil {
+		return err
+	}
+	if owned {
+		return tx.Commit()
+	}
+	return nil
+}
+
+func (r *apiKeyRepository) createWithClient(ctx context.Context, client *dbent.Client, key *service.APIKey) error {
+	builder := client.APIKey.Create().
 		SetUserID(key.UserID).
 		SetKey(key.Key).
 		SetName(key.Name).

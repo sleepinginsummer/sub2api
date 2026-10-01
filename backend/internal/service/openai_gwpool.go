@@ -278,27 +278,18 @@ func (s *openAICodexCookieStore) cachedPoolPair(identity string) (openAIGatewayP
 	return pair, openAIGatewayPoolPairLive
 }
 
-// livePoolPair 读缓存里还在满血窗口内的那张。
-func (s *openAICodexCookieStore) livePoolPair(identity string) (openAIGatewayPoolPair, bool) {
-	pair, state := s.cachedPoolPair(identity)
-	return pair, state == openAIGatewayPoolPairLive
-}
+type openAIGatewayPoolRoutePairContextKey struct{}
 
-// gatewayPoolPairInUse 回读这一发出站实际带的那张 pair，给 usage_logs 的路由对读数用
-// （池子接管时罐不再参与出站，回读罐会记成别的网关）。
-func (s *openAICodexCookieStore) gatewayPoolPairInUse(ctx context.Context, account *Account) (string, bool) {
-	if !s.gatewayPoolTakeover(account) {
-		return "", false
+// openAIGatewayPoolRoutePairFromResponse 只读取该次出站快照，不回读可能已轮换或过期的共享缓存。
+func openAIGatewayPoolRoutePairFromResponse(resp *http.Response) *string {
+	if resp == nil || resp.Request == nil {
+		return nil
 	}
-	identity, err := s.gatewayPoolIdentity(ctx, account)
-	if err != nil {
-		return "", false
-	}
-	pair, ok := s.livePoolPair(identity)
+	pair, ok := resp.Request.Context().Value(openAIGatewayPoolRoutePairContextKey{}).(string)
 	if !ok {
-		return "", false
+		return nil
 	}
-	return pair.cookie, true
+	return &pair
 }
 
 // reportGatewayPoolTouch 回报一次触碰：取到 pair ⇒ 这一发必然碰到那个网关。
@@ -331,39 +322,45 @@ func (s *openAICodexCookieStore) reportGatewayPoolTouch(ctx context.Context, acc
 // AttachRoute 是出站挂 Cookie 的唯一入口：池子接管时 __cflb / __oailb 用池子那张，否则原样走
 // 罐回放。三个出站挂钩点（HTTP 主咽喉 doOpenAIUpstream、WS 连接池 dialConn、WS 透传适配器）
 // 都经这里，所以「钉死在坏网关」在三条路上一起修掉。
-func (s *openAICodexCookieStore) AttachRoute(
+func (s *openAICodexCookieStore) AttachRoute(ctx context.Context, account *Account, rawURL string, headers http.Header) error {
+	_, err := s.attachRoute(ctx, account, rawURL, headers)
+	return err
+}
+
+// attachRoute 返回实际注入的池路由，使 HTTP 快照与注入共享同一次判断和取值。
+func (s *openAICodexCookieStore) attachRoute(
 	ctx context.Context,
 	account *Account,
 	rawURL string,
 	headers http.Header,
-) error {
+) (*string, error) {
 	if s == nil || headers == nil || !openAICodexCookiesApply(account) {
-		return nil
+		return nil, nil
 	}
 	u := openAICodexCookieURL(rawURL)
 	// 主机过滤：罐分支由 chatgptcookies 自己兜（IsChatGPTURL），接管分支绕开了罐就得自己兜。
 	// 不兜的话 pair 会被发给 api.openai.com 这类第三方主机，而且**白烧一张池子 pair**（根本没
 	// 碰到那个网关，读数却照样上报），供给只有个位数张。
 	if u == nil || !chatgptcookies.IsChatGPTURL(u) {
-		return nil
+		return nil, nil
 	}
 	if !s.gatewayPoolTakeover(account) {
 		s.Attach(account, rawURL, headers)
-		return nil
+		return nil, nil
 	}
 	// 互斥闸必须在取 pair **之前**：WS 预热（min_idle 默认 4，无业务请求也拨）绝不能消耗池子的
 	// 槽位，而复用连接上的后续轮次也拿不到新窗口。
 	if isWebSocketURL(rawURL) {
-		return ErrGatewayPoolWSIncompatible
+		return nil, ErrGatewayPoolWSIncompatible
 	}
 	identity, err := s.gatewayPoolIdentity(ctx, account)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	pair, err := s.gatewayPoolPair(ctx, account, identity)
 	if err != nil {
 		// 包括池子 503（gwpool.ErrNoSlot）。往上抛给既有失败路径，不回落罐回放。
-		return err
+		return nil, err
 	}
 	// 只替换这两项：__cf_bm / cf_clearance / _cfuvid 是**本出口自己**拿到的 Cloudflare 令牌，
 	// 丢掉会让 CF 重新发挑战（这和「跨出口回放 __cf_bm 自相矛盾」不是一回事——那说的是别人出口
@@ -377,7 +374,7 @@ func (s *openAICodexCookieStore) AttachRoute(
 	}
 	headers.Set("Cookie", strings.Join(append(parts, pair.cookie), "; "))
 	s.reportGatewayPoolTouch(ctx, account.ID, identity, pair)
-	return nil
+	return &pair.cookie, nil
 }
 
 // isWebSocketURL 报告这是 WS 拨号地址。罐把 wss:// 归一成 https 后就看不出来了，所以按原始串判。

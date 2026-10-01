@@ -155,6 +155,9 @@ func (s *apiKeyRepoStubForGroupUpdate) Update(_ context.Context, key *APIKey, _ 
 
 // Unused methods – panic on unexpected call.
 func (s *apiKeyRepoStubForGroupUpdate) Create(context.Context, *APIKey) error { panic("unexpected") }
+func (s *apiKeyRepoStubForGroupUpdate) CreateWithLimit(context.Context, *APIKey, int) error {
+	panic("unexpected")
+}
 func (s *apiKeyRepoStubForGroupUpdate) GetKeyAndOwnerID(context.Context, int64) (string, int64, error) {
 	panic("unexpected")
 }

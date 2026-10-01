@@ -27,6 +27,16 @@ func (s *createLimitAPIKeyRepoStub) ExistsByKey(ctx context.Context, key string)
 	return false, nil
 }
 
+func (s *createLimitAPIKeyRepoStub) CreateWithLimit(ctx context.Context, key *APIKey, maxActive int) error {
+	if maxActive > 0 && s.countErr != nil {
+		return s.countErr
+	}
+	if maxActive > 0 && s.activeCount >= int64(maxActive) {
+		return ErrAPIKeyCountExceeded
+	}
+	return s.Create(ctx, key)
+}
+
 func (s *createLimitAPIKeyRepoStub) Create(ctx context.Context, key *APIKey) error {
 	s.created = append(s.created, key)
 	return nil
