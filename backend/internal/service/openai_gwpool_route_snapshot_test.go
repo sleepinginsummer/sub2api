@@ -38,8 +38,7 @@ func TestGatewayPoolRouteSnapshotSurvivesCacheChanges(t *testing.T) {
 			redirect := httptest.NewRequest(http.MethodPost, "https://chatgpt.com/redirected", nil)
 			upstream := &gatewayPoolSnapshotUpstream{responseRequest: redirect}
 			svc := &OpenAIGatewayService{httpUpstream: upstream}
-			svc.codexCookies.pool = pool.client
-			account := gwpoolTestAccount(1)
+			account := pool.account(1)
 			svc.codexCookies.Store(account, gwpoolTestURL, codexCookieUpstreamResponse())
 			send := func() *http.Response {
 				req, err := http.NewRequest(http.MethodPost, gwpoolTestURL, strings.NewReader("{}"))
@@ -47,7 +46,6 @@ func TestGatewayPoolRouteSnapshotSurvivesCacheChanges(t *testing.T) {
 				resp, err := svc.doOpenAIUpstream(req, "", account)
 				require.NoError(t, err)
 				t.Cleanup(func() { _ = resp.Body.Close() })
-				pool.nextTouch(t)
 				return resp
 			}
 			resp := send()
@@ -70,7 +68,6 @@ func TestGatewayPoolRouteSnapshotSurvivesCacheChanges(t *testing.T) {
 			logs := &openAIRecordUsageLogRepoStub{inserted: true}
 			billing := &openAIRecordUsageBillingRepoStub{result: &UsageBillingApplyResult{Applied: true}}
 			recorder := newOpenAIRecordUsageServiceWithBillingRepoForTest(logs, billing, &openAIRecordUsageUserRepoStub{}, &openAIRecordUsageSubRepoStub{}, nil)
-			recorder.codexCookies.pool = pool.client
 			require.NoError(t, recorder.RecordUsage(context.Background(), &OpenAIRecordUsageInput{
 				Result: result, APIKey: &APIKey{ID: 1000, Quota: 100, Group: &Group{RateMultiplier: 1}}, User: &User{ID: 2000}, Account: account, APIKeyService: &openAIRecordUsageAPIKeyQuotaStub{},
 			}))
@@ -100,8 +97,7 @@ func TestGatewayPoolRouteSnapshotForwardedToResults(t *testing.T) {
 				upstream := &gatewayPoolSnapshotUpstream{cookieRecordingUpstream: cookieRecordingUpstream{setCookie: http.Header{"Content-Type": []string{contentType}}}, body: responseBody}
 				cfg := &config.Config{Gateway: config.GatewayConfig{MaxLineSize: defaultMaxLineSize, OpenAIFirstOutputTimeoutSeconds: 1}}
 				svc := &OpenAIGatewayService{cfg: cfg, httpUpstream: upstream, responseHeaderFilter: compileResponseHeaderFilter(cfg)}
-				svc.codexCookies.pool = pool.client
-				account := gwpoolTestAccount(1)
+				account := pool.account(1)
 				account.Credentials["access_token"] = "test-access-token"
 				account.Extra["openai_passthrough"] = passthrough
 				body := []byte(fmt.Sprintf(`{"model":"gpt-6-astra","input":"hi","instructions":"test","stream":%t}`, stream))
@@ -114,7 +110,6 @@ func TestGatewayPoolRouteSnapshotForwardedToResults(t *testing.T) {
 				}
 				result, err := svc.Forward(c.Request.Context(), c, account, body)
 				require.NoError(t, err)
-				pool.nextTouch(t)
 				require.NotNil(t, result.GatewayPoolRoutePair)
 				require.Equal(t, pair, *result.GatewayPoolRoutePair)
 				require.Equal(t, stream, result.Stream)
@@ -128,6 +123,7 @@ func TestGatewayPoolRouteSnapshotDisabledHasNoSnapshot(t *testing.T) {
 	upstream := &cookieRecordingUpstream{}
 	svc := &OpenAIGatewayService{httpUpstream: upstream}
 	account := gwpoolTestAccount(1)
+	account.Extra[openAIGatewayPoolExtraKey] = false
 	req, err := http.NewRequest(http.MethodPost, gwpoolTestURL, strings.NewReader("{}"))
 	require.NoError(t, err)
 	resp, err := svc.doOpenAIUpstream(req, "", account)
