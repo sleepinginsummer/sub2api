@@ -534,6 +534,7 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 		RequestID:                     resp.Header.Get("x-request-id"),
 		UpstreamHeaders:               resp.Header,
 		GatewayPoolRoutePair:          openAIGatewayPoolRoutePairFromResponse(resp),
+		GatewayPoolApplied:            openAIGatewayPoolAppliedFromResponse(resp),
 		ResponseID:                    responseID,
 		Usage:                         *usage,
 		Model:                         reqModel,

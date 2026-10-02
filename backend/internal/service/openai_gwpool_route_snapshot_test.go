@@ -54,7 +54,7 @@ func TestGatewayPoolRouteSnapshotSurvivesCacheChanges(t *testing.T) {
 			snapshot := openAIGatewayPoolRoutePairFromResponse(resp)
 			require.NotNil(t, snapshot)
 			require.Equal(t, first, *snapshot)
-			result := &OpenAIForwardResult{Model: "gpt-6-astra", UpstreamHeaders: resp.Header, GatewayPoolRoutePair: snapshot}
+			result := &OpenAIForwardResult{Model: "gpt-6-astra", UpstreamHeaders: resp.Header, GatewayPoolRoutePair: snapshot, GatewayPoolApplied: openAIGatewayPoolAppliedFromResponse(resp)}
 			cacheKey := openAIGatewayPoolCacheKey(account, gwpoolTestIdentity)
 			svc.codexCookies.poolPairs.Store(cacheKey, openAIGatewayPoolPair{cookie: first, gateway: "unified-142", until: time.Now().Add(-time.Second)})
 			switch state {
@@ -64,7 +64,10 @@ func TestGatewayPoolRouteSnapshotSurvivesCacheChanges(t *testing.T) {
 			case "removed":
 				svc.codexCookies.poolPairs.Delete(cacheKey)
 			}
-			require.Equal(t, first, svc.routePairInUse(account, result))
+			routePair, fromPool, poolGateway, _ := svc.routePairInUse(account, result.UpstreamHeaders, result.GatewayPoolApplied)
+			require.Equal(t, first, routePair)
+			require.True(t, fromPool)
+			require.Equal(t, "unified-142", poolGateway)
 			// 校验最终 UsageLog，而非只验证快照取值函数。
 			logs := &openAIRecordUsageLogRepoStub{inserted: true}
 			billing := &openAIRecordUsageBillingRepoStub{result: &UsageBillingApplyResult{Applied: true}}
@@ -99,6 +102,8 @@ func TestGatewayPoolRouteSnapshotForwardedToResults(t *testing.T) {
 				cfg := &config.Config{Gateway: config.GatewayConfig{MaxLineSize: defaultMaxLineSize, OpenAIFirstOutputTimeoutSeconds: 1}}
 				svc := &OpenAIGatewayService{cfg: cfg, httpUpstream: upstream, responseHeaderFilter: compileResponseHeaderFilter(cfg)}
 				account := pool.account(1)
+				// 透传测试构造了其它 ChatGPT 路径，显式开启全部路径来验证快照传递。
+				account.Extra[openAIGatewayPoolAllModelsExtraKey] = true
 				account.Credentials["access_token"] = "test-access-token"
 				account.Extra["openai_passthrough"] = passthrough
 				body := []byte(fmt.Sprintf(`{"model":"gpt-6-astra","input":"hi","instructions":"test","stream":%t}`, stream))

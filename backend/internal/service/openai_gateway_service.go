@@ -251,10 +251,12 @@ type OpenAIForwardResult struct {
 	ResponseID string
 	// UpstreamHeaders 是直接上游的响应头，用于按账户配置解析上游请求标识。
 	UpstreamHeaders http.Header
-	// GatewayPoolRoutePair 仅供内部用量记录使用，冻结该次出站路由；非池请求为 nil。
+	// GatewayPoolRoutePair 冻结该次 HTTP 出站路由；nil 表示未注入池路由。
 	GatewayPoolRoutePair *string `json:"-"`
-	Usage                OpenAIUsage
-	Model                string // 原始模型（用于响应和日志显示）
+	// GatewayPoolApplied 记录实际注入的票据；Cookie 等内部读数不得进入对外 JSON。
+	GatewayPoolApplied OpenAIGatewayPoolApplied `json:"-"`
+	Usage              OpenAIUsage
+	Model              string // 原始模型（用于响应和日志显示）
 	// BillingModel is the model used for cost calculation.
 	// When non-empty, CalculateCost uses this instead of Model.
 	// This is set by the Anthropic Messages conversion path where

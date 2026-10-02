@@ -252,6 +252,7 @@ func (s *OpenAIGatewayService) forwardGrokResponses(
 		RequestID:            firstNonEmpty(resp.Header.Get("x-request-id"), resp.Header.Get("xai-request-id")),
 		UpstreamHeaders:      resp.Header,
 		GatewayPoolRoutePair: openAIGatewayPoolRoutePairFromResponse(resp),
+		GatewayPoolApplied:   openAIGatewayPoolAppliedFromResponse(resp),
 		ResponseID:           responseID,
 		Usage:                *usage,
 		Model:                originalModel,

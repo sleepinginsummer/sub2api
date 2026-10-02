@@ -98,9 +98,23 @@ func TestRoutePairInUsePrefersUpstream(t *testing.T) {
 	upstream := http.Header{}
 	upstream.Add("Set-Cookie", "__cflb=new; Path=/")
 	upstream.Add("Set-Cookie", "__oailb="+fresh+"; Path=/")
-	require.Equal(t, "unified-165", openAICodexRouteGateway(s.routePairInUse(account, &OpenAIForwardResult{UpstreamHeaders: upstream})))
+	pair, fromPool, poolGateway, poolVersion := s.routePairInUse(account, upstream, OpenAIGatewayPoolApplied{})
+	require.Equal(t, "unified-165", openAICodexRouteGateway(pair))
+	require.False(t, fromPool, "没接管网关池就不是覆写")
+	require.Empty(t, poolGateway)
+	require.Empty(t, poolVersion)
 
 	// 上游没下发时回读罐；罐是空的就给空串，不能崩。
-	require.Empty(t, s.routePairInUse(account, &OpenAIForwardResult{}))
-	require.Empty(t, s.routePairInUse(nil, &OpenAIForwardResult{}))
+	jarPair, fromPool, _, _ := s.routePairInUse(account, http.Header{}, OpenAIGatewayPoolApplied{})
+	require.Empty(t, jarPair)
+	require.False(t, fromPool)
+	nilPair, fromPool, _, _ := s.routePairInUse(nil, http.Header{}, OpenAIGatewayPoolApplied{})
+	require.Empty(t, nilPair)
+	require.False(t, fromPool)
+
+	// 账号类型不适用时「已覆写」读数保持 NULL，与 FALSE 区分开。
+	require.Nil(t, usageCodexRoutePairOverriddenPtr(&Account{ID: 2, Platform: PlatformAnthropic}, true))
+	overridden := usageCodexRoutePairOverriddenPtr(account, true)
+	require.NotNil(t, overridden)
+	require.True(t, *overridden)
 }

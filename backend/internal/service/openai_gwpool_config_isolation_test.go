@@ -13,6 +13,40 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// 拒绝凭据的退避只能阻止对应池配置，不能阻止同身份的其它有效池。
+func TestGatewayPoolBackoffSeparatesAccountConfigurations(t *testing.T) {
+	poolA := newGwpoolFakePool(t, gwpoolTestPairCookie(t, "unified-142"), 150)
+	poolA.refuseStatus = http.StatusServiceUnavailable
+	poolA.refuseCode = gwpool.CodeConsumerRejected
+	poolB := newGwpoolFakePool(t, gwpoolTestPairCookie(t, "unified-84"), 150)
+	store := &openAICodexCookieStore{}
+	a, b := poolA.account(1), poolB.account(2)
+	require.ErrorIs(t, attachRoute(context.Background(), store, a, gwpoolTestURL, http.Header{}), gwpool.ErrNoSlot)
+	headers := http.Header{}
+	require.NoError(t, attachRoute(context.Background(), store, b, gwpoolTestURL, headers))
+	require.Equal(t, "unified-84", openAICodexRouteGateway(headers.Get("Cookie")))
+	require.EqualValues(t, 1, poolB.hits.Load())
+}
+
+// 两个池可以使用相同票号；还票只删除取票池配置下的缓存。
+func TestGatewayPoolReleaseSeparatesAccountConfigurations(t *testing.T) {
+	poolA := newGwpoolFakePool(t, gwpoolTestPairCookie(t, "unified-142"), 150)
+	poolB := newGwpoolFakePool(t, gwpoolTestPairCookie(t, "unified-84"), 150)
+	store := &openAICodexCookieStore{}
+	a, b := poolA.account(1), poolB.account(2)
+	release, err := store.AttachRoute(context.Background(), a, gwpoolTestURL, http.Header{})
+	require.NoError(t, err)
+	require.NotNil(t, release)
+	require.NoError(t, attachRoute(context.Background(), store, b, gwpoolTestURL, http.Header{}))
+	release()
+	require.Equal(t, `{"cookie_version":"tkt-1"}`, poolA.nextRelease(t))
+	_, stateA := store.cachedPoolPair(openAIGatewayPoolCacheKey(a, gwpoolTestIdentity))
+	require.Equal(t, openAIGatewayPoolPairNone, stateA)
+	_, stateB := store.cachedPoolPair(openAIGatewayPoolCacheKey(b, gwpoolTestIdentity))
+	require.Equal(t, openAIGatewayPoolPairLive, stateB)
+	require.Zero(t, poolB.releaseHits.Load())
+}
+
 func TestGatewayPoolCacheSeparatesAccountConfigurations(t *testing.T) {
 	first := gwpoolTestPairCookie(t, "unified-142")
 	second := gwpoolTestPairCookie(t, "unified-84")
@@ -21,16 +55,16 @@ func TestGatewayPoolCacheSeparatesAccountConfigurations(t *testing.T) {
 	store := &openAICodexCookieStore{}
 	a, b := poolA.account(1), poolB.account(2)
 	headers := http.Header{}
-	require.NoError(t, store.AttachRoute(context.Background(), a, gwpoolTestURL, headers))
+	require.NoError(t, attachRoute(context.Background(), store, a, gwpoolTestURL, headers))
 	other := http.Header{}
-	require.NoError(t, store.AttachRoute(context.Background(), b, gwpoolTestURL, other))
+	require.NoError(t, attachRoute(context.Background(), store, b, gwpoolTestURL, other))
 	require.Equal(t, first, headers.Get("Cookie"))
 	require.Equal(t, second, other.Get("Cookie"))
 	require.EqualValues(t, 1, poolB.hits.Load())
 	// 修改同一账号的配置也必须立即切到新池，不能等旧缓存过期。
 	poolB.configure(a)
 	switched := http.Header{}
-	require.NoError(t, store.AttachRoute(context.Background(), a, gwpoolTestURL, switched))
+	require.NoError(t, attachRoute(context.Background(), store, a, gwpoolTestURL, switched))
 	require.Equal(t, second, switched.Get("Cookie"))
 	require.EqualValues(t, 1, poolB.hits.Load(), "相同身份和配置仍复用缓存")
 }
@@ -50,12 +84,13 @@ func TestGatewayPoolCacheSeparatesConsumerKeys(t *testing.T) {
 	defer srv.Close()
 	store := &openAICodexCookieStore{}
 	account := gwpoolTestAccount(1)
+	account.Extra[openAIGatewayPoolSteeringExtraKey] = false
 	account.Extra[openAIGatewayPoolBaseURLExtraKey] = srv.URL
 	account.Extra[OpenAIGatewayPoolConsumerKeyExtraKey] = "first-key"
-	require.NoError(t, store.AttachRoute(context.Background(), account, gwpoolTestURL, http.Header{}))
+	require.NoError(t, attachRoute(context.Background(), store, account, gwpoolTestURL, http.Header{}))
 	account.Extra[OpenAIGatewayPoolConsumerKeyExtraKey] = "second-key"
 	headers := http.Header{}
-	require.NoError(t, store.AttachRoute(context.Background(), account, gwpoolTestURL, headers))
+	require.NoError(t, attachRoute(context.Background(), store, account, gwpoolTestURL, headers))
 	require.Equal(t, second, headers.Get("Cookie"))
 	require.Len(t, calls, 2)
 	require.Equal(t, "Bearer first-key", <-calls)
@@ -68,10 +103,10 @@ func TestGatewayPoolCacheDoesNotBypassInvalidConfiguration(t *testing.T) {
 			pool := newGwpoolFakePool(t, gwpoolTestPairCookie(t, "unified-142"), 150)
 			store := &openAICodexCookieStore{}
 			a, b := pool.account(1), pool.account(2)
-			require.NoError(t, store.AttachRoute(context.Background(), a, gwpoolTestURL, http.Header{}))
+			require.NoError(t, attachRoute(context.Background(), store, a, gwpoolTestURL, http.Header{}))
 			delete(b.Extra, missing)
 			headers := http.Header{}
-			require.ErrorIs(t, store.AttachRoute(context.Background(), b, gwpoolTestURL, headers), gwpool.ErrPool)
+			require.ErrorIs(t, attachRoute(context.Background(), store, b, gwpoolTestURL, headers), gwpool.ErrPool)
 			require.Empty(t, headers.Get("Cookie"))
 		})
 	}
@@ -99,9 +134,10 @@ func TestGatewayPoolConcurrentDifferentConfigurationsDoNotCoalesce(t *testing.T)
 	results := make(chan error, 2)
 	for i, url := range []string{poolA.URL, poolB.URL} {
 		account := gwpoolTestAccount(int64(i + 1))
+		account.Extra[openAIGatewayPoolSteeringExtraKey] = false
 		account.Extra[openAIGatewayPoolBaseURLExtraKey] = url
 		account.Extra[OpenAIGatewayPoolConsumerKeyExtraKey] = "key"
-		go func() { results <- store.AttachRoute(context.Background(), account, gwpoolTestURL, http.Header{}) }()
+		go func() { results <- attachRoute(context.Background(), store, account, gwpoolTestURL, http.Header{}) }()
 	}
 	for range 2 {
 		select {

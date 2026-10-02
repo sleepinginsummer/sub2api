@@ -167,6 +167,7 @@ func (s *OpenAIGatewayService) ForwardEmbeddings(
 		RequestID:            firstNonEmptyString(resp.Header.Get("x-request-id"), resp.Header.Get("request-id")),
 		UpstreamHeaders:      resp.Header,
 		GatewayPoolRoutePair: openAIGatewayPoolRoutePairFromResponse(resp),
+		GatewayPoolApplied:   openAIGatewayPoolAppliedFromResponse(resp),
 		Usage:                extractOpenAIEmbeddingsUsage(respBody),
 		Model:                originalModel,
 		BillingModel:         billingModel,
