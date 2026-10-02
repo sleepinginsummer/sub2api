@@ -20,7 +20,7 @@ func TestGatewayPoolHTTPRouteSnapshotSurvivesSharedSinkOverwrite(t *testing.T) {
 	require.NoError(t, err)
 	response, err := svc.doOpenAIUpstream(request, "", account)
 	require.NoError(t, err)
-	defer response.Body.Close()
+	defer func() { require.NoError(t, response.Body.Close()) }()
 	frozen := openAIGatewayPoolAppliedFromResponse(response)
 	require.Equal(t, "tkt-1", frozen.Version)
 	require.Equal(t, "unified-142", frozen.Gateway)
