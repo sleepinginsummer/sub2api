@@ -60,7 +60,8 @@ func (s *OpenAIGatewayService) doOpenAIUpstreamOnce(
 	parentSink := openAIGatewayPoolSinkFrom(request.Context())
 	requestCtx, poolSink := withOpenAIGatewayPoolSink(request.Context(), nil)
 	poolSink.noteModel(parentSink.modelOf())
-	poolSink.notePoolLive(parentSink.snapshot().PoolLive)
+	parentApplied := parentSink.snapshot()
+	poolSink.notePoolCounts(parentApplied.PoolLive, parentApplied.PoolFree)
 	request = request.WithContext(requestCtx)
 	release, err := s.codexCookies.AttachRoute(request.Context(), account, rawURL, request.Header)
 	if err != nil {
@@ -83,7 +84,7 @@ func (s *OpenAIGatewayService) doOpenAIUpstreamOnce(
 		// 判据先补齐本次读数，再冻结响应快照；共享上下文后续变化不能改写它。
 		if applied := poolSink.snapshot(); applied.Cookie != "" {
 			parentSink.mark(applied)
-			parentSink.notePoolLive(applied.PoolLive)
+			parentSink.notePoolCounts(applied.PoolLive, applied.PoolFree)
 			if resp.Request == nil {
 				resp.Request = request
 			}
