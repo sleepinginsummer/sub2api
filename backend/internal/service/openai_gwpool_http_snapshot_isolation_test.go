@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -17,6 +18,8 @@ func TestGatewayPoolHTTPRouteSnapshotSurvivesSharedSinkOverwrite(t *testing.T) {
 	svc := &OpenAIGatewayService{httpUpstream: &cookieRecordingUpstream{}}
 	ctx, sink := withOpenAIGatewayPoolSink(context.Background(), nil)
 	sink.notePoolCounts(4, 2)
+	// 满血时长属于具体票据，不能把上一发的测量值继承给新 HTTP 请求。
+	sink.noteFullHeld(5 * time.Second)
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, gwpoolTestURL, strings.NewReader("{}"))
 	require.NoError(t, err)
 	request.Header.Set(openAICodexTurnStateHeader, gwpoolEchoLiveTicket)
@@ -29,6 +32,7 @@ func TestGatewayPoolHTTPRouteSnapshotSurvivesSharedSinkOverwrite(t *testing.T) {
 	require.Equal(t, 4, frozen.PoolLive, "验满血阶段的池供给读数必须保留到业务响应")
 	require.Equal(t, 2, frozen.PoolFree, "尚未使用的落点数必须与供给总数成对冻结")
 	require.Equal(t, "full", frozen.Verdict, "必须冻结响应后的 state-echo 判定")
+	require.Zero(t, frozen.FullHeldMs, "新票据没有测量值时不能沿用旧票据时长")
 
 	// 模拟同账号的另一发在首发完成记账前取得不同路由和票号。
 	sink.mark(OpenAIGatewayPoolApplied{
@@ -36,6 +40,7 @@ func TestGatewayPoolHTTPRouteSnapshotSurvivesSharedSinkOverwrite(t *testing.T) {
 		Gateway: "unified-84", Version: "later-ticket",
 	})
 	sink.notePoolCounts(9, 0)
+	sink.noteFullHeld(90 * time.Second)
 	result := &OpenAIForwardResult{
 		GatewayPoolRoutePair: openAIGatewayPoolRoutePairFromResponse(response),
 		GatewayPoolApplied:   openAIGatewayPoolAppliedFromResponse(response),

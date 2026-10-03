@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/url"
+	"time"
 )
 
 func (s *OpenAIGatewayService) SetPluginManager(manager *PluginManager) {
@@ -85,6 +86,7 @@ func (s *OpenAIGatewayService) doOpenAIUpstreamOnce(
 		if applied := poolSink.snapshot(); applied.Cookie != "" {
 			parentSink.mark(applied)
 			parentSink.notePoolCounts(applied.PoolLive, applied.PoolFree)
+			parentSink.noteFullHeld(time.Duration(applied.FullHeldMs) * time.Millisecond)
 			if resp.Request == nil {
 				resp.Request = request
 			}

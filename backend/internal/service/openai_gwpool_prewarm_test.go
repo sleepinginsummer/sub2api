@@ -232,7 +232,8 @@ func TestFullWindowSamplesOnlyCountVerifiedPairs(t *testing.T) {
 
 	// 验过的那张：留下一个约等于「验过之后过了多久」的样本。
 	gwpoolSeedVerifiedAge(store, gwpoolTestIdentity, "tkt-verified", 3*time.Minute)
-	store.gatewayPoolMarkStale(gwpoolTestIdentity, "tkt-verified", "unified-1")
+	held := store.gatewayPoolMarkStale(gwpoolTestIdentity, "tkt-verified", "unified-1")
+	require.GreaterOrEqual(t, held, 3*time.Minute, "返回同一张已验满血票据的测量时长")
 	require.Equal(t, 1, store.poolFullWindow.total)
 	_, ok := store.poolFullWindow.p95()
 	require.False(t, ok, "一个样本还不够开预热")
