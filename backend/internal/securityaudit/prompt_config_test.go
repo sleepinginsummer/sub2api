@@ -504,3 +504,59 @@ func TestConfigLoadedIsLoggedOnlyWhenSomethingChanged(t *testing.T) {
 	require.NoError(t, manager.Reload(context.Background()))
 	require.Equal(t, 4, loadedCount(), "recovering from a failed reload must be visible")
 }
+
+func TestScanMaxCharsDefaultRoundTripAndValidation(t *testing.T) {
+	// 缺省与显式 0 都落到默认上限。
+	storage, err := ParseStorageConfig(`{"enabled":false,"config_version":1}`)
+	require.NoError(t, err)
+	require.Equal(t, DefaultScanMaxChars, storage.ScanMaxChars)
+	zeroed, err := ParseStorageConfig(`{"enabled":false,"config_version":1,"scan_max_chars":0}`)
+	require.NoError(t, err)
+	require.Equal(t, DefaultScanMaxChars, zeroed.ScanMaxChars)
+
+	// -1 表示关闭上限。
+	off, err := ParseStorageConfig(`{"enabled":false,"config_version":1,"scan_max_chars":-1}`)
+	require.NoError(t, err)
+	require.Equal(t, ScanMaxCharsOff, off.ScanMaxChars)
+
+	// 越界值必须被拒绝，而不是静默夹取。
+	for _, raw := range []string{
+		`{"enabled":false,"config_version":1,"scan_max_chars":64}`,
+		`{"enabled":false,"config_version":1,"scan_max_chars":500000}`,
+	} {
+		_, err := ParseStorageConfig(raw)
+		require.Error(t, err, raw)
+	}
+
+	// 运行态与公开配置都要带上该值。
+	active, err := ActiveFromStorage(off, true, prefixEncryptor{})
+	require.NoError(t, err)
+	require.Equal(t, ScanMaxCharsOff, active.ScanMaxChars)
+	publicJSON, err := json.Marshal(PublicFromStorage(off, true, nil))
+	require.NoError(t, err)
+	require.Contains(t, string(publicJSON), `"scan_max_chars":-1`)
+}
+
+// 后台表单暂时没有该字段：保存时缺省必须沿用当前值，而不是把上限清成 0。
+func TestBuildNextStorageKeepsScanMaxCharsWhenOmitted(t *testing.T) {
+	manager := &ConfigManager{encryptor: prefixEncryptor{}, encryptionKeyConfigured: true}
+	current := DefaultStorageConfig()
+	current.ScanMaxChars = 12345
+	base := UpdateConfigRequest{ExpectedConfigVersion: 1, Strategy: "priority", WorkerCount: 1, QueueCapacity: 10, Scanners: []string{"PII"}, AllGroups: true,
+		Endpoints: []UpdateEndpoint{{ID: "one", Name: "One", Protocol: "openai_compatible", BaseURL: "http://127.0.0.1:8080", TimeoutMS: 1000, InputLimit: 1000}}}
+
+	kept, err := manager.buildNextStorage(current, base, 9)
+	require.NoError(t, err)
+	require.Equal(t, 12345, kept.ScanMaxChars)
+
+	changed := base
+	changed.ScanMaxChars = 8000
+	updated, err := manager.buildNextStorage(current, changed, 9)
+	require.NoError(t, err)
+	require.Equal(t, 8000, updated.ScanMaxChars)
+
+	invalid := base
+	invalid.ScanMaxChars = 10
+	_, err = manager.buildNextStorage(current, invalid, 9)
+	require.Error(t, err)
+}

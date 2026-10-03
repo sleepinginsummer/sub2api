@@ -348,11 +348,18 @@ func (m *ConfigManager) buildNextStorage(current storageConfig, req UpdateConfig
 	for _, endpoint := range current.Endpoints {
 		currentByID[endpoint.ID] = endpoint
 	}
+	// scan_max_chars is absent from older admin clients: keep the stored value instead of
+	// clearing the cap whenever the config is saved without that field.
+	scanMaxChars := current.ScanMaxChars
+	if req.ScanMaxChars != 0 {
+		scanMaxChars = req.ScanMaxChars
+	}
 	next := storageConfig{
 		Enabled: req.Enabled, BlockingEnabled: req.BlockingEnabled, BlockingLatestTurnOnly: req.BlockingLatestTurnOnly, StorePassEvents: req.StorePassEvents,
 		Strategy: strings.TrimSpace(req.Strategy), WorkerCount: req.WorkerCount,
 		QueueCapacity: req.QueueCapacity, Scanners: append([]string(nil), req.Scanners...),
 		AllGroups: req.AllGroups, GroupIDs: append([]int64(nil), req.GroupIDs...),
+		ScanMaxChars:  scanMaxChars,
 		ConfigVersion: current.ConfigVersion, UpdatedBy: actorID,
 		Endpoints: make([]StorageEndpoint, 0, len(req.Endpoints)),
 	}

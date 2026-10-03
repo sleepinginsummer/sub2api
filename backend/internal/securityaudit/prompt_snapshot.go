@@ -30,17 +30,30 @@ type promptSegment struct {
 }
 
 func ExtractPromptSnapshot(req Request) (PromptSnapshot, error) {
-	return extractPromptSnapshot(req, false)
+	return extractPromptSnapshot(req, false, DefaultScanMaxChars)
+}
+
+// ExtractPromptSnapshotWithLimit behaves like ExtractPromptSnapshot but bounds the
+// scanned text with scanMaxChars (scanMaxChars <= 0 disables the cap).
+func ExtractPromptSnapshotWithLimit(req Request, scanMaxChars int) (PromptSnapshot, error) {
+	return extractPromptSnapshot(req, false, scanMaxChars)
 }
 
 // ExtractBlockingPromptSnapshot builds the narrow, low-latency blocking input
 // when configured. Asynchronous auditing always uses ExtractPromptSnapshot so
 // the complete client-controlled transcript is retained for review.
 func ExtractBlockingPromptSnapshot(req Request, latestTurnOnly bool) (PromptSnapshot, error) {
-	return extractPromptSnapshot(req, latestTurnOnly)
+	return extractPromptSnapshot(req, latestTurnOnly, DefaultScanMaxChars)
 }
 
-func extractPromptSnapshot(req Request, latestTurnOnly bool) (PromptSnapshot, error) {
+// ExtractBlockingPromptSnapshotWithLimit is the blocking variant of
+// ExtractPromptSnapshotWithLimit: the configured cap is applied before evaluation so a
+// single oversized turn cannot occupy the whole per-request scan budget.
+func ExtractBlockingPromptSnapshotWithLimit(req Request, latestTurnOnly bool, scanMaxChars int) (PromptSnapshot, error) {
+	return extractPromptSnapshot(req, latestTurnOnly, scanMaxChars)
+}
+
+func extractPromptSnapshot(req Request, latestTurnOnly bool, scanMaxChars int) (PromptSnapshot, error) {
 	var document any
 	if err := json.Unmarshal(req.Body, &document); err != nil {
 		return PromptSnapshot{}, errors.New("prompt audit request JSON is invalid")
@@ -54,10 +67,19 @@ func extractPromptSnapshot(req Request, latestTurnOnly bool) (PromptSnapshot, er
 		return PromptSnapshot{}, ErrNoPromptText
 	}
 	scanText, metadataText := buildPrioritizedScanText(segments)
+	scanText = truncateScanText(scanText, scanMaxChars)
 	digest := sha256.Sum256([]byte(metadataText))
 	stage := strings.TrimSpace(req.Stage)
 	if stage == "" {
 		stage = "http"
+	}
+	if original, scanned := utf8.RuneCountInString(metadataText), utf8.RuneCountInString(scanText); scanned < original {
+		LogInfo(EventScanTextTruncated, map[string]any{
+			"request_id": req.RequestID, "user_id": req.UserID, "api_key_id": req.APIKeyID,
+			"group_id": pointerLogID(req.GroupID), "model": req.Model, "stage": stage,
+			"scan_max_chars": scanMaxChars, "input_chars": original, "scanned_chars": scanned,
+			"status": "truncated",
+		})
 	}
 	return PromptSnapshot{
 		RequestID: req.RequestID, UserID: req.UserID, UsernameSnapshot: req.Username,
@@ -609,6 +631,27 @@ func promptSegmentTexts(values []promptSegment) []string {
 		result = append(result, value.text)
 	}
 	return result
+}
+
+// truncateScanText bounds how many runes are handed to the guard. Oversized input keeps
+// the head and the tail (half each) so the leading instructions and the trailing request
+// both survive while the middle is dropped; runes are counted so UTF-8 never splits.
+// ScanMaxCharsOff disables the cap; 0/absent falls back to DefaultScanMaxChars so a
+// zero-value config can never silently disable it. Metadata (hash, length, stored
+// preview) always keeps the full text.
+func truncateScanText(text string, max int) string {
+	if max == ScanMaxCharsOff {
+		return text
+	}
+	if max <= 0 {
+		max = DefaultScanMaxChars
+	}
+	runes := []rune(text)
+	if len(runes) <= max {
+		return text
+	}
+	half := max / 2
+	return string(runes[:half]) + string(runes[len(runes)-half:])
 }
 
 func buildPrioritizedScanText(segments []string) (scanText string, metadataText string) {

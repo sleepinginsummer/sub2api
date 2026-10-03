@@ -462,3 +462,60 @@ func TestPromptSnapshotTypeSafeSystemOneAuditsKeyOnlyPayloads(t *testing.T) {
 		require.Contains(t, snapshot.ScanText, "HIDDEN_QUESTION_ID")
 	}
 }
+
+// 单轮超大输入（agent 客户端常见 3.5 万–24 万字符）只保留头尾，避免把整请求预算耗在几十个分块上。
+func TestTruncateScanTextKeepsHeadAndTail(t *testing.T) {
+	text := strings.Repeat("A", 30000) + strings.Repeat("B", 30000)
+	// 0/缺省落到默认上限（零值配置不能静默关闭上限），只有显式 -1 才关闭。
+	require.Equal(t, strings.Repeat("A", 10000)+strings.Repeat("B", 10000), truncateScanText(text, 0))
+	require.Equal(t, text, truncateScanText(text, ScanMaxCharsOff), "-1 表示不设上限")
+	require.Equal(t, text, truncateScanText(text, len(text)))
+	require.Equal(t, strings.Repeat("A", 10000)+strings.Repeat("B", 10000), truncateScanText(text, 20000))
+
+	// 多字节字符必须按 rune 切，不能切断 UTF-8。
+	wide := strings.Repeat("中", 300)
+	cut := truncateScanText(wide, 200)
+	require.True(t, utf8.ValidString(cut))
+	require.Equal(t, 200, utf8.RuneCountInString(cut))
+	require.Equal(t, strings.Repeat("中", 200), cut)
+}
+
+func TestExtractPromptSnapshotWithLimitTruncatesScanTextOnly(t *testing.T) {
+	payload, err := json.Marshal(map[string]any{"messages": []any{
+		map[string]any{"role": "user", "content": strings.Repeat("A", 30000) + strings.Repeat("B", 30000)},
+	}})
+	require.NoError(t, err)
+	req := Request{Protocol: "openai_chat_completions", Body: payload, Stage: "http"}
+
+	uncapped, err := ExtractPromptSnapshotWithLimit(req, ScanMaxCharsOff)
+	require.NoError(t, err)
+	require.Equal(t, 60000, uncapped.PromptLength)
+	require.Equal(t, 60000, utf8.RuneCountInString(uncapped.ScanText))
+
+	limited, err := ExtractPromptSnapshotWithLimit(req, DefaultScanMaxChars)
+	require.NoError(t, err)
+	require.Equal(t, DefaultScanMaxChars, utf8.RuneCountInString(limited.ScanText))
+	require.Equal(t, strings.Repeat("A", 10000)+strings.Repeat("B", 10000), limited.ScanText)
+	// 元数据仍基于完整文本：长度、指纹与存档预览不受截断影响。
+	require.Equal(t, uncapped.PromptLength, limited.PromptLength)
+	require.Equal(t, uncapped.PromptHash, limited.PromptHash)
+	require.Equal(t, uncapped.FullPrompt, limited.FullPrompt)
+
+	// 不带上限参数的入口默认套用 DefaultScanMaxChars。
+	defaulted, err := ExtractPromptSnapshot(req)
+	require.NoError(t, err)
+	require.Equal(t, limited.ScanText, defaulted.ScanText)
+
+	// 阻断路径使用同一上限。
+	blockingFull, err := ExtractBlockingPromptSnapshot(req, true)
+	require.NoError(t, err)
+	blockingLimited, err := ExtractBlockingPromptSnapshotWithLimit(req, true, DefaultScanMaxChars)
+	require.NoError(t, err)
+	require.Equal(t, DefaultScanMaxChars, utf8.RuneCountInString(blockingLimited.ScanText))
+	require.Equal(t, blockingFull.PromptLength, blockingLimited.PromptLength)
+
+	// 关闭上限时与不带上限的行为一致。
+	off, err := ExtractPromptSnapshotWithLimit(req, ScanMaxCharsOff)
+	require.NoError(t, err)
+	require.Equal(t, uncapped.ScanText, off.ScanText)
+}

@@ -33,7 +33,8 @@ func TestPromptAuditLogAllowlistAndErrorsDoNotLeakCanarySecrets(t *testing.T) {
 	beforeUnknown := output.Len()
 	LogWarn("prompt_audit.typo_event", map[string]any{"status": "failed"})
 	require.Equal(t, beforeUnknown, output.Len(), "events outside the stable dictionary must not be emitted")
-	require.Len(t, knownLogEvents, 28)
+	// 事件字典是封闭集合：新增事件必须同步更新这里（本轮加入 prompt_audit.scan_text_truncated）。
+	require.Len(t, knownLogEvents, 29)
 
 	_, err := NormalizeBaseURL("https://guard.example.test/path?token=" + canary)
 	require.Error(t, err)

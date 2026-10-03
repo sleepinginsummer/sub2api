@@ -25,6 +25,14 @@ const (
 	MinInputLimit        = 128
 	MaxInputLimit        = 100000
 	DefaultPayloadTTL    = 30 * time.Minute
+	// DefaultScanMaxChars caps how many runes of an extracted prompt are handed to the guard.
+	// A single oversized turn (agent clients send 35k–240k rune turns) would otherwise be split
+	// into dozens of chunks and blow the whole scan budget. Oversized input keeps head and tail
+	// only, see truncateScanText. Zero/absent storage value falls back to this; ScanMaxCharsOff disables it.
+	DefaultScanMaxChars = 20000
+	MinScanMaxChars     = 512
+	MaxScanMaxChars     = 200000
+	ScanMaxCharsOff     = -1
 )
 
 type SecretEncryptor interface {
@@ -75,6 +83,7 @@ type storageConfig struct {
 	AllGroups              bool              `json:"all_groups"`
 	GroupIDs               []int64           `json:"group_ids"`
 	Endpoints              []StorageEndpoint `json:"endpoints"`
+	ScanMaxChars           int               `json:"scan_max_chars"`
 	ConfigVersion          int64             `json:"config_version"`
 	UpdatedAt              time.Time         `json:"updated_at"`
 	UpdatedBy              int64             `json:"updated_by"`
@@ -111,6 +120,7 @@ type ActiveConfig struct {
 	AllGroups              bool
 	GroupIDs               []int64
 	Endpoints              []ActiveEndpoint
+	ScanMaxChars           int
 	ConfigVersion          int64
 	UpdatedAt              time.Time
 	UpdatedBy              int64
@@ -143,6 +153,7 @@ type PublicConfig struct {
 	AllGroups              bool             `json:"all_groups"`
 	GroupIDs               []int64          `json:"group_ids"`
 	Endpoints              []PublicEndpoint `json:"endpoints"`
+	ScanMaxChars           int              `json:"scan_max_chars"`
 	ConfigVersion          int64            `json:"config_version"`
 	UpdatedAt              time.Time        `json:"updated_at"`
 	UpdatedBy              int64            `json:"updated_by"`
@@ -175,6 +186,7 @@ type UpdateConfigRequest struct {
 	AllGroups              bool             `json:"all_groups"`
 	GroupIDs               []int64          `json:"group_ids"`
 	Endpoints              []UpdateEndpoint `json:"endpoints"`
+	ScanMaxChars           int              `json:"scan_max_chars"`
 }
 
 func DefaultStorageConfig() storageConfig {
@@ -190,6 +202,7 @@ func DefaultStorageConfig() storageConfig {
 		AllGroups:              true,
 		GroupIDs:               []int64{},
 		Endpoints:              []StorageEndpoint{},
+		ScanMaxChars:           DefaultScanMaxChars,
 		ConfigVersion:          1,
 	}
 }
@@ -224,6 +237,9 @@ func normalizeStorageConfig(cfg *storageConfig) {
 	}
 	if cfg.QueueCapacity == 0 {
 		cfg.QueueCapacity = DefaultQueueCapacity
+	}
+	if cfg.ScanMaxChars == 0 {
+		cfg.ScanMaxChars = DefaultScanMaxChars
 	}
 	if len(cfg.Scanners) == 0 {
 		cfg.Scanners = append([]string(nil), AllScannerIDs...)
@@ -266,6 +282,10 @@ func validateStorageConfig(cfg storageConfig) error {
 	}
 	if cfg.QueueCapacity < 1 || cfg.QueueCapacity > MaxQueueCapacity {
 		return infraerrors.BadRequest("prompt_audit_invalid_queue_capacity", "队列容量超出允许范围")
+	}
+	// 0 表示缺省（normalizeStorageConfig 会替换为 DefaultScanMaxChars），-1 表示关闭上限。
+	if cfg.ScanMaxChars != 0 && cfg.ScanMaxChars != ScanMaxCharsOff && (cfg.ScanMaxChars < MinScanMaxChars || cfg.ScanMaxChars > MaxScanMaxChars) {
+		return infraerrors.BadRequest("prompt_audit_invalid_scan_max_chars", "送审文本上限超出允许范围")
 	}
 	if !cfg.AllGroups && len(cfg.GroupIDs) == 0 {
 		return infraerrors.BadRequest("prompt_audit_groups_required", "指定分组模式至少需要选择一个分组")
@@ -314,6 +334,9 @@ func validateUpdateConfigRequest(req UpdateConfigRequest) error {
 	}
 	if req.QueueCapacity < 1 || req.QueueCapacity > MaxQueueCapacity {
 		return infraerrors.BadRequest("prompt_audit_invalid_queue_capacity", "队列容量超出允许范围")
+	}
+	if req.ScanMaxChars != 0 && req.ScanMaxChars != ScanMaxCharsOff && (req.ScanMaxChars < MinScanMaxChars || req.ScanMaxChars > MaxScanMaxChars) {
+		return infraerrors.BadRequest("prompt_audit_invalid_scan_max_chars", "送审文本上限超出允许范围")
 	}
 	if len(req.Scanners) == 0 {
 		return infraerrors.BadRequest("prompt_audit_scanners_required", "至少需要启用一个风险分类")
@@ -416,7 +439,8 @@ func PublicFromStorage(cfg storageConfig, riskControlEnabled bool, invalidTokenE
 		EffectiveMode: active.EffectiveMode(), Strategy: cfg.Strategy, WorkerCount: cfg.WorkerCount,
 		QueueCapacity: cfg.QueueCapacity, Scanners: scanners, AllGroups: cfg.AllGroups,
 		GroupIDs: groupIDs, Endpoints: endpoints, ConfigVersion: cfg.ConfigVersion,
-		UpdatedAt: cfg.UpdatedAt, UpdatedBy: cfg.UpdatedBy, ChangeSummary: cfg.ChangeSummary,
+		ScanMaxChars: cfg.ScanMaxChars,
+		UpdatedAt:    cfg.UpdatedAt, UpdatedBy: cfg.UpdatedBy, ChangeSummary: cfg.ChangeSummary,
 	}
 }
 
@@ -426,7 +450,8 @@ func ActiveFromStorage(cfg storageConfig, riskControlEnabled bool, encryptor Sec
 		BlockingLatestTurnOnly: cfg.BlockingLatestTurnOnly,
 		StorePassEvents:        cfg.StorePassEvents, Strategy: cfg.Strategy, WorkerCount: cfg.WorkerCount,
 		QueueCapacity: cfg.QueueCapacity, Scanners: append([]string(nil), cfg.Scanners...), AllGroups: cfg.AllGroups,
-		GroupIDs: append([]int64(nil), cfg.GroupIDs...), ConfigVersion: cfg.ConfigVersion,
+		ScanMaxChars: cfg.ScanMaxChars,
+		GroupIDs:     append([]int64(nil), cfg.GroupIDs...), ConfigVersion: cfg.ConfigVersion,
 		UpdatedAt: cfg.UpdatedAt, UpdatedBy: cfg.UpdatedBy, ChangeSummary: cfg.ChangeSummary,
 		Endpoints: make([]ActiveEndpoint, 0, len(cfg.Endpoints)),
 	}

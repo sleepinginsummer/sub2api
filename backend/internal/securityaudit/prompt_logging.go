@@ -26,6 +26,7 @@ const (
 	EventChunkCompleted       = "prompt_audit.scan_chunk_completed"
 	EventChunkFailed          = "prompt_audit.scan_chunk_failed"
 	EventChunksAggregated     = "prompt_audit.scan_chunks_aggregated"
+	EventScanTextTruncated    = "prompt_audit.scan_text_truncated"
 	EventEvaluationStarted    = "prompt_guard.evaluation_started"
 	EventGuardAllowed         = "prompt_guard.allowed"
 	EventGuardBlocked         = "prompt_guard.blocked"
@@ -42,7 +43,7 @@ var knownLogEvents = map[string]struct{}{
 	EventProbeStarted: {}, EventProbeFinished: {}, EventProbeFailed: {},
 	EventJobEnqueued: {}, EventEnqueueSkipped: {}, EventEnqueueDropped: {},
 	EventAuditStarted: {}, EventProcessingReclaimed: {}, EventProcessed: {}, EventProcessFailed: {}, EventFindingRecorded: {},
-	EventChunkStarted: {}, EventChunkCompleted: {}, EventChunkFailed: {}, EventChunksAggregated: {},
+	EventChunkStarted: {}, EventChunkCompleted: {}, EventChunkFailed: {}, EventChunksAggregated: {}, EventScanTextTruncated: {},
 	EventEvaluationStarted: {}, EventGuardAllowed: {}, EventGuardBlocked: {}, EventGuardFailed: {}, EventResultRecordFailed: {},
 	EventEventDeleted: {}, EventEventsDeleted: {}, EventDeletePreviewed: {}, EventEventsFilterDeleted: {},
 }
@@ -53,6 +54,7 @@ var allowedLogFields = map[string]struct{}{
 	"config_version": {}, "guard_endpoint_id": {}, "decision": {}, "risk_level": {},
 	"action": {}, "chunk_index": {}, "chunk_total": {}, "chunk_chars": {}, "input_chars": {},
 	"input_limit": {}, "latency_ms": {}, "status": {}, "error_code": {}, "error_kind": {},
+	"scan_max_chars": {}, "scanned_chars": {},
 	"queue_length": {}, "queue_capacity": {}, "stage": {}, "upstream_dispatched": {},
 	"billing_preconsumed": {}, "worker_id": {}, "reclaimed_total": {}, "attempts": {},
 	"max_attempts": {}, "claim_version": {}, "http_status": {}, "retryable": {},
