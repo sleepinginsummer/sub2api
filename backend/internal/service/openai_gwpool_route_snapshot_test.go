@@ -43,7 +43,7 @@ func TestGatewayPoolRouteSnapshotSurvivesCacheChanges(t *testing.T) {
 			send := func() *http.Response {
 				req, err := http.NewRequest(http.MethodPost, gwpoolTestURL, strings.NewReader("{}"))
 				require.NoError(t, err)
-				resp, err := svc.doOpenAIUpstream(req, "", account)
+				resp, _, err := svc.doOpenAIUpstreamOnce(req, "", account)
 				require.NoError(t, err)
 				t.Cleanup(func() { _ = resp.Body.Close() })
 				return resp
@@ -102,8 +102,6 @@ func TestGatewayPoolRouteSnapshotForwardedToResults(t *testing.T) {
 				cfg := &config.Config{Gateway: config.GatewayConfig{MaxLineSize: defaultMaxLineSize, OpenAIFirstOutputTimeoutSeconds: 1}}
 				svc := &OpenAIGatewayService{cfg: cfg, httpUpstream: upstream, responseHeaderFilter: compileResponseHeaderFilter(cfg)}
 				account := pool.account(1)
-				// 透传测试构造了其它 ChatGPT 路径，显式开启全部路径来验证快照传递。
-				account.Extra[openAIGatewayPoolAllModelsExtraKey] = true
 				account.Credentials["access_token"] = "test-access-token"
 				account.Extra["openai_passthrough"] = passthrough
 				body := []byte(fmt.Sprintf(`{"model":"gpt-6-astra","input":"hi","instructions":"test","stream":%t}`, stream))
@@ -116,8 +114,13 @@ func TestGatewayPoolRouteSnapshotForwardedToResults(t *testing.T) {
 				}
 				result, err := svc.Forward(c.Request.Context(), c, account, body)
 				require.NoError(t, err)
-				require.NotNil(t, result.GatewayPoolRoutePair)
-				require.Equal(t, pair, *result.GatewayPoolRoutePair)
+				if passthrough && !stream {
+					// compact 已不属于网关池覆写范围，结果应明确没有池票快照。
+					require.Nil(t, result.GatewayPoolRoutePair)
+				} else {
+					require.NotNil(t, result.GatewayPoolRoutePair)
+					require.Equal(t, pair, *result.GatewayPoolRoutePair)
+				}
 				require.Equal(t, stream, result.Stream)
 				require.NotContains(t, rec.Body.String(), pair, "Cookie 快照不能进入客户端响应")
 			})

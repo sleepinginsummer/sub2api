@@ -96,6 +96,12 @@ export default {
       schedulableEnabled: 'Scheduling enabled',
       schedulableDisabled: 'Scheduling disabled',
       failedToToggleSchedulable: 'Failed to toggle scheduling status',
+      priorityQuick: {
+        raise: 'Raise priority (value -1)',
+        lower: 'Lower priority (value +1)',
+        editHint: 'Click to type a value; lower is used first',
+        failed: 'Failed to update priority'
+      },
       groupCountTotal: '{count} groups total',
       platforms: {
         anthropic: 'Anthropic',
@@ -109,6 +115,7 @@ export default {
         deepseek: 'DeepSeek',
         minimax: 'MiniMax',
         opencode_go: 'OpenCode',
+        typesafe: 'TypeSafe / Jev',
       },
       cnProviders: {
         accountMode: {
@@ -264,6 +271,7 @@ export default {
         todayStats: 'Today Stats',
         groups: 'Groups',
         usageWindows: 'Usage Windows',
+        gateway: 'Gateway',
         proxy: 'Proxy',
         lastUsed: 'Last Used',
         createdAt: 'Created',
@@ -276,6 +284,7 @@ export default {
         ungrouped: 'Ungrouped',
         hint: 'Displayed as "group / base score / sticky bonus". The base score is computed within the current filtered candidate set and includes priority, load, queue depth, error rate, first-token latency, reset window, quota headroom, billing rate, and related factors. The sticky bonus applies only when sticky weighting is enabled for previous_response_id or session_hash. Higher scores are preferred.'
       },
+      gatewayColumnHint: 'Landing gateways come from the route tickets delivered by the gateway pool (gwpool). The full-strength window applies to (upstream account × gateway), and a gateway is determined by (region × account), so this column is laid out by the nine regions: the first line is the current region and gateway, and each cell below is the gateway most recently landed on in that region. Amber means the gateway was used within the local ledger window (4 hours by default, adjustable in the gateway pool settings of that account) and is still cooling; grey means the window has elapsed and that region is usable again. Note that both the region and the gateway name are what the pool claimed on delivery, not the upstream landing point actually observed.',
       usageWindowsHint: '"5h / 7d" are the upstream account\'s official rolling usage windows (e.g. OpenAI ChatGPT, Claude). They are imposed by the upstream provider on the account itself — not configured by sub2api, and unrelated to the models you map. Usage resets automatically once each window rolls over, and the limit cannot be lifted from within sub2api. Purple/amber rows are the Codex turn-states currently in effect for this account (one per model); the countdown is the remainder of the one-hour validity from minting, and amber means the ticket looks degraded.',
       ollamaCloud: {
         title: 'Ollama Cloud usage',
@@ -735,21 +744,37 @@ export default {
         gwpoolConsumerKeyKeep: 'Saved — leave blank to keep it',
         gwpoolConsumerKeyDesc:
           'The pool issues one key per account, so it lives on the account rather than on the instance. Treated like an access token: it is never echoed back after saving and never returned in list or detail responses.',
-        gwpoolAllModels: 'Override every chatgpt.com request',
-        gwpoolAllModelsDesc:
-          'Scope is decided by the request path. Off (default): only the Codex inference endpoint (/backend-api/codex/responses) gets a pooled pair. Side calls and the /codex/alpha/search, /codex/realtime/calls, /codex/images/* endpoints also hit chatgpt.com but are not inference turns, and a pair spent on them burns one (account x gateway) unit for nothing. Note that alpha search has a fallback that posts to the inference endpoint itself, so that one does take a pair even while this is off - it really is one /responses call. On: every chatgpt.com request on this account is overridden.',
         gwpoolAdvanced: 'Advanced (blank = default)',
         gwpoolGatewayWindow: 'Local ledger window (s)',
         gwpoolGatewayWindowDesc:
           'How long this account treats a gateway it already touched as burnt when picking a landing spot. Default 14400 (4h). The pool keeps its own book per consumer key, which cannot see one Codex credential sitting on several account rows.',
         gwpoolFetchTimeout: 'Pair fetch timeout (s)',
-        gwpoolFetchTimeoutDesc: 'Caps one /cookie call. Default 8.',
+        gwpoolFetchTimeoutDesc:
+          'Caps one /cookie call. Default 25. It also decides how long we let the pool mint (the wait we send is this value minus 1s, capped at 30). The number has to cover everything the pool does for one delivery, not just the network round trip: with verify-before-deliver on, every gateway it tries costs a real state-echo request upstream. The old 8s did not cover it - on 2026-10-02, 301 of 458 production takes (66%) were cut off before a response was written, after the upstream call had already gone out and burned a slot for nothing. Lowering this brings that failure back.',
         gwpoolListTimeout: 'Gateway list timeout (s)',
         gwpoolListTimeoutDesc:
           'Caps the /gateways call used to pick a landing spot. Default 2 — it is an optimisation and must never eat into the fetch budget; on timeout the pool picks for you.',
+        gwpoolWarmTickets: 'Pairs tried per warm-up',
+        gwpoolWarmTicketsDesc:
+          'How many pairs one business request may take and check before giving up. Default 5 (hit rate is roughly one in three, so 5 pairs is about 82% cumulative), capped at 8, blank uses the default. ' +
+          'This is a supply knob, not a performance knob: every pair burns one (upstream account x gateway) unit, and that unit regenerates at roughly known-gateways / slot-cooldown (99 gateways over a 4-hour cooldown is about 25 per hour in production). Overspending does not make things slow - the pool starts answering all_cooling for this account and every request during the back-off returns 503 instantly. Count your gateways before raising it.',
         gwpoolSteering: 'Pick the landing gateway myself',
         gwpoolSteeringDesc:
           'On (default): list the gateways first and name one this account has not burnt in the ledger window. Off: let the pool schedule it.',
+        gwpoolPrewarm: 'Background prewarm (off by default)',
+        gwpoolPrewarmDesc:
+          'When on, a candidate pair is taken and verified in the background as the current pair nears the end of its full-strength window, and swapped in only once it verifies full strength - so the next client request does not wait on verification. The current pair keeps serving throughout (no gap at all), and nothing changes if no candidate verifies. ' +
+          'The start point is not hardcoded: once 100 full-strength-window samples have accumulated, it uses their p95 and starts when the ticket age reaches p95 minus 15 seconds; the first 100 do not prewarm. One round per account at a time. ' +
+          'The cost is pairs: up to "pairs tried per warm-up" extra pairs per window, burned while no client is waiting. On an account whose supply is already exhausted this only reaches all_cooling faster (every request during the pool back-off returns 503 instantly). Watch gwpool_prewarm_start / _ready / _degraded / _no_ticket / _exhausted in the log.',
+        gwpoolGuard: 'Degradation guard (no switch - always on once the pool is enabled)',
+        // The check discipline and the cost paragraph are both unconditional now, so both stay on screen.
+        gwpoolGuardDesc:
+          'The check (state-echo): send a live turn-state and read the verdict off the response headers - no fresh ticket (or the same one) means full strength, a different fresh one means degraded. Response headers only, and a verdict only on HTTP 200 (a fresh ticket on a 429/5xx is rate limiting or a fault, not evidence of degradation). It has false negatives but no false positives: a full-strength verdict is trustworthy, a degraded verdict is occasionally wrong, and that error is absorbed by ticket-age tiering (the younger the ticket, the more consecutive refreshes it takes to call it dead). The old three modes (off / truncate only / check first) were removed on 2026-10-03: the whole point of the pool is full strength, and truncate-only could act solely on requests that already carried a turn-state - the first request of a session has no ticket to echo, so the check structurally cannot run and degradation on that request got through.',
+        gwpoolGuardDescs: {
+          queue:
+            'After taking a fresh pair, two cheap filler shots run the check first and the business request is only let through once a full-strength verdict comes back; a degraded verdict rotates to the next pair, up to the "pairs tried per warm-up" limit (default 5), after which the request fails. This is the only way to catch degradation on the first request of a session - the check needs a live turn-state to echo and that request has none, so it mints its own baseline. No filler is spent while the current pair is both verified full strength and still inside its delivery window. ' +
+            'Five costs to know up front: (1) about 6 filler shots per window on average (hit rate is roughly one in three); concurrent requests share one pair and one check, so this does not scale with concurrency. (2) The client receives no bytes at all while this runs (not even response headers); the budget is 90 seconds, but taking a pair does not spend that budget, so the worst case is about 2 minutes - make sure your client timeout exceeds that. Each account gets its own budget and failover adds them up (accounts have burned different pairs, so one must not eat into the chance of the next); the real brakes are the pairs-per-warm-up limit above and the Retry-After returned on failure. (3) Filler shots are not billed and get no usage row (a known gap), so reconcile them against the gwpool_warm_probe / gwpool_warm_degraded / gwpool_warm_exhausted log lines; gateways judged degraded do turn red on the gateway cell. (4) When a filler shot comes back inconclusive (non-200, rate limiting, a fault) there is no verdict, no further rotation, and the request is not blocked: it is let through, and the check still runs on the business response. So requests are not blocked during upstream rate limiting - the guard is temporarily less strict than usual; count gwpool_warm_inconclusive in the log. (5) It shares wall-clock with the server-side first-output timeout (gateway.openai_first_output_timeout_seconds): warming takes at most half of whatever that deadline has left, and when the remainder is too short to verify a single pair warming is silently skipped (only a gwpool_warm_no_budget line). So leave that value at 0 (the default) or set it above 60 seconds.'
+        },
         gwpoolErrors: {
           GWPOOL_BASE_URL_INVALID:
             'The gateway pool URL must be an absolute http(s) address, e.g. https://pool.0102400.xyz. Fill in the pool root, not the /a/xxxx page.',
@@ -771,6 +796,68 @@ export default {
         turnStateRecoveryCooldown: 'Failure cooldown (hours)',
         turnStateRecoveryMin: 'Min interval (minutes)',
         turnStateRecoveryMax: 'Max interval (minutes)',
+        gatewayHistory: {
+          empty: 'Gateway -',
+          current: 'Current',
+          seen: '{n} used',
+          // The tooltip's five segments are region-gateway-fullTime-state-verdict, each
+          // carrying only the VALUE and no label: operators scan a column vertically, and
+          // repeating "used within the window, still cooling" on every row pushes the values
+          // that actually need comparing off to the right where they no longer line up.
+          // The long wording stays in gatewayColumnHint and legend, which appear once.
+          regionHot: 'cooling',
+          regionCooled: 'usable',
+          regionIdle: 'never used',
+          // Segment 3 is how LONG full strength held (full verdict → degraded verdict),
+          // rendered straight as `180s` with no i18n key. This one is the placeholder when
+          // there is no duration to show: window still running, never verified full, or both
+          // readings landed in one write so the length cannot be measured — same thing to the
+          // reader, so one label.
+          fullUntimed: 'not timed',
+          legend:
+            '✓ verified full (inside the 183s window) · ! used inside the window, degraded right now · grey window elapsed, usable again',
+          // Window usage. The denominator is the POOL'S deliverable gateway count, not the
+          // size of this row's ledger: the ledger only holds gateways we have touched, so
+          // using it as the denominator makes "how many are left" equal "how many I touched
+          // that have cooled off" — a different question.
+          windowUsage: '{used} landing(s) used in the {hours}h window, {free} left in the pool',
+          // When the pool listing is unavailable, report only the used half: inventing a
+          // denominator is worse than omitting it.
+          windowUsageUsedOnly: '{used} landing(s) used in the {hours}h window',
+          windowUsageHint:
+            '"Used" counts landings in this row\'s ledger touched inside the window; the denominator is how many gateways the pool can deliver right now (the listing length fetched alongside ticket pickup — unavailable when "let the pool pick the landing" is off, in which case only the used half is shown).\n' +
+            'The two are not measured the same way: the ledger spans the local window while the listing is a snapshot of now, so a ledger landing may already be off the listing (ticket expired). The difference is clamped at 0 — it never goes negative.',
+          // Full-strength minutes forecast for the next hour, deliberately a LOWER bound.
+          // "at least" is required: "at most" would get read as a quota.
+          forecast: 'at least {minutes} min full-strength in the next hour',
+          // At 0 this must not read "at least 0 minutes": that sounds like a verdict on the
+          // account, when it actually states a fact about TIME — every landing in the ledger
+          // comes out of cooldown more than an hour from now. And the number is a lower bound
+          // anyway: gateways never touched are not counted at all.
+          forecastNone: 'no landing comes out of cooldown within the hour',
+          forecastHint:
+            'Counted per (account × gateway): {units} gateways are in the ledger and come out of cooldown within the hour, each worth about {window}s of full strength. One gateway name is one unit — different gateways in the same region have separate full-strength windows, so do not collapse by region (region is only the grouping for the grid above).\n' +
+            'This is a **lower bound**: only units with positive evidence are counted. Gateways this row never touched are left out, so possibly more — no number is given because this row cannot work it out: it does not know how many gateways the pool has, and "this row never touched it" may well mean another row on the same credential burned it, or the record was pruned.\n' +
+            'One thing still optimistic: the 4h cooldown itself is not pinned down (resting 30 minutes vs 4 hours gave a constant full-strength rate, zero correlation), so if real recovery takes longer this number is still too high.',
+          // state-echo verdict (backend openai_gwpool_state_echo.go).
+          verdicts: {
+            full: 'full',
+            degraded: 'degraded',
+            none: 'never judged'
+          },
+          regions: {
+            'us-east': 'US-E',
+            'us-west': 'US-W',
+            'south-america': 'S.Am',
+            'west-europe': 'W.EU',
+            europe: 'EU',
+            'east-asia': 'E.Asia',
+            oceania: 'Ocea',
+            'south-asia': 'S.Asia',
+            'middle-east': 'M.East',
+            unknown: 'Unknown'
+          }
+        },
         turnStatePool: {
           empty: 'Turn-state —',
           starved: 'Turn-state: no ticket, passing through',
@@ -944,7 +1031,7 @@ export default {
       customErrorCodes: 'Custom Error Codes',
       customErrorCodesHint: 'Only stop scheduling for selected error codes',
       customErrorCodesWarning:
-        'Only selected error codes will stop scheduling. Other errors will return 500.',
+        'Custom error codes only filter normal account-error handling (such as stopping scheduling or marking rate limits). They do not decide whether a request is retried or switched to another account. Unselected errors may still trigger a retry or an account switch, and the status returned to the client depends on the gateway path and error-passthrough rules; it is not always 500. An empty list applies no filtering.',
       customErrorCodes429Warning:
         '429 already has built-in rate limit handling. Adding it to custom error codes will disable the account instead of temporary rate limiting. Are you sure?',
       customErrorCodes529Warning:

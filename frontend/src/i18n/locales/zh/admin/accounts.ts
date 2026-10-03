@@ -94,6 +94,12 @@ export default {
       schedulableEnabled: '调度已开启',
       schedulableDisabled: '调度已关闭',
       failedToToggleSchedulable: '切换调度状态失败',
+      priorityQuick: {
+        raise: '提高优先级（数值 -1）',
+        lower: '降低优先级（数值 +1）',
+        editHint: '点击直接输入；数值越小越优先',
+        failed: '更新优先级失败'
+      },
       groupCountTotal: '共 {count} 个分组',
       columns: {
         name: '名称',
@@ -113,6 +119,7 @@ export default {
         todayStats: '今日统计',
         groups: '分组',
         usageWindows: '用量窗口',
+        gateway: '网关落点',
         proxy: '代理',
         lastUsed: '最近使用',
         createdAt: '创建时间',
@@ -125,6 +132,7 @@ export default {
         ungrouped: '未分组',
         hint: '显示格式为“分组名 / 基础分 / 粘性加分”。基础分按当前筛选条件限定的候选账号计算，包含优先级、负载、排队、错误率、首包延迟、重置窗口、额度余量、计费倍率等因子；粘性加分只在开启粘性加权时用于 previous_response_id 或 session_hash。分数越大越优先。'
       },
+      gatewayColumnHint: '网关落点来自网关池（gwpool）下发的路由票。满血窗口的作用单位是（上游账号 × 网关），而网关由（大区 × 账号）决定，所以这一列按九个大区摊开：第一行是当前大区与当前网关，下面每格是该大区最近一次落在哪个网关上。琥珀色表示该网关在本地账本窗口（默认 4 小时，可在账号的网关池配置里调）内打过、仍在冷却；灰色表示已过窗口，该大区可以再用。括注：大区与网关名均为网关池交付时的口径，不代表上游实际落点。',
       usageWindowsHint: '“5h / 7d”是上游账号（如 OpenAI ChatGPT、Claude）官方的滚动用量窗口限制，由上游对账号设定，并非 sub2api 配置，也与你映射的模型无关。窗口滚动到期后用量会自动重置，无法在 sub2api 端解除该限制。紫色/琥珀色的条目是该账号当前生效的 Codex Turn-State（按模型分），倒计时是这张票自铸造起 1 小时的剩余有效期；琥珀色代表这张票疑似降智。',
       ollamaCloud: {
         title: 'Ollama Cloud 用量',
@@ -313,6 +321,7 @@ export default {
         deepseek: 'DeepSeek',
         minimax: 'MiniMax',
         opencode_go: 'OpenCode',
+        typesafe: 'TypeSafe / Jev',
       },
       cnProviders: {
         accountMode: {
@@ -842,21 +851,37 @@ export default {
         gwpoolConsumerKeyKeep: '已保存，留空不修改',
         gwpoolConsumerKeyDesc:
           '池子按账号发 key，所以它配在账号上而不是实例上。与 access_token 同级：保存后页面不再回显，列表与详情里也不返回。',
-        gwpoolAllModels: '所有 chatgpt.com 请求都覆写',
-        gwpoolAllModelsDesc:
-          '范围按**请求路径**算。关（默认）：只有 Codex 推理面（/backend-api/codex/responses）取票覆写；侧信道与 /codex/alpha/search、/codex/realtime/calls、/codex/images/* 这些端点也打在 chatgpt.com 上，但它们不是推理轮次，给它们取一张票等于白烧一个 (账号 × 网关) 单位。注意 alpha 搜索还有一条兜底是直接打推理面的，那一条开关关着也会取票 —— 它确实是一发 /responses。开：这个账号打到 chatgpt.com 的每一个请求都覆写。',
         gwpoolAdvanced: '高级（留空即默认值）',
         gwpoolGatewayWindow: '本地账本窗口（秒）',
         gwpoolGatewayWindowDesc:
           '挑落点时，这个账号把碰过的网关当作「烧过」的时长。默认 14400（4 小时）。池子按它发的 consumer key 自己记一本账，认不出「同一份 Codex 凭据挂在多个账号行上」。',
         gwpoolFetchTimeout: '取票超时（秒）',
-        gwpoolFetchTimeoutDesc: '兜住一次 /cookie 调用。默认 8。',
+        gwpoolFetchTimeoutDesc:
+          '兜住一次 /cookie 调用，默认 25。它同时决定愿意等池子现铸多久（送出去的 wait = 本值 − 1 秒，上限 30）。这个数要盖住池子那边一次交付的全部工作，不只是网络往返：池子开着交付前验证时，每试一个网关都要打一发真实的 state-echo。原来的 8 秒盖不住 —— 2026-10-02 线上 458 次取票里 301 次（66%）是响应还没写出来就被这条线掐断的，而那几发已经打到上游、槽位照烧、一张票都没交付。调小会把这个故障带回来。',
         gwpoolListTimeout: '网关清单超时（秒）',
         gwpoolListTimeoutDesc:
           '兜住挑落点用的那次 /gateways。默认 2——它只是优化，绝不能吃掉取票的预算；超时就退回「由池子自己挑」。',
+        gwpoolWarmTickets: '一轮最多试几张票',
+        gwpoolWarmTicketsDesc:
+          '一发业务请求之前最多取几张票去验满血，都没验出来就按失败返回。默认 5（命中率约三分之一 ⇒ 5 张累计约 82%），上限 8，留空用默认值。' +
+          '**这是供给旋钮，不是性能旋钮**：每张票都烧掉一个 (上游账号 × 网关) 单位，而那个单位的再生预算 ≈ 网关总数 ÷ 冷却 4 小时（现场 99 个网关 ≈ 25 张/小时）。超支的后果不是慢，是池子对这个号报 all_cooling、整段退避期里每一发请求都秒回 503。调大之前先数网关总数。',
         gwpoolSteering: '自己挑落点网关',
         gwpoolSteeringDesc:
           '开（默认）：先列网关，再点名一个本地账本窗口内没烧过的。关：交给池子按它的调度选。',
+        gwpoolPrewarm: '后台预热（默认关）',
+        gwpoolPrewarmDesc:
+          '开了之后在手里那张票的满血窗口快到点时，后台另取一张候选票去验满血，验出来才换上去 —— 客户端下一次请求就不用在验满血上等了（手里那张在整个过程里照常服务，一秒空档都没有；候选票一张都没验出满血时也什么都不动）。' +
+          '开始时刻不是写死的：攒满 100 个满血时长样本之后算 p95，票龄到 p95 减 15 秒才开始，0–100 发不预热。同一个账号同时只跑一轮。' +
+          '**代价是票**：每个满血窗口多烧最多「一轮最多试几张票」那么多张，而且是在没有客户端等着的时候烧。供给见底的号开它只会更快打到 all_cooling（池子退避期里每一发请求都秒回 503）。日志看 gwpool_prewarm_start / _ready / _degraded / _no_ticket / _exhausted。',
+        gwpoolGuard: '降智防护（无开关，接了池子就一律生效）',
+        // 判据纪律那一段：它和下面那段「代价」都是无条件生效的，所以两段都常驻。
+        gwpoolGuardDesc:
+          '判据（state-echo）：带着一张活 turn-state 打一发，看上游在响应头里回不回一张新的 —— 不回（或回同一张）= 满血，回一张不同的 = 降智。只读响应头、只在 HTTP 200 上下结论（429/5xx 回新票是限流或故障，不算降智证据）。它有假阴性、没有假阳性 —— 判「满血」可信，判「降智」偶尔会误判；误判的代价由票龄分档吸收（票越新要连着被刷新越多次才判死）。原来那三档开关（关 / 只截断 / 先验再放行）2026-10-03 删了：接网关池就是为了满血，而「只截断」只能在客户端本来就送了 turn-state 的那些发上生效 —— 一轮会话的第一发没有票可回声，判据结构性判不出来，那一发的降智它拦不住。',
+        gwpoolGuardDescs: {
+          queue:
+            '取到新票之后先拿两发便宜的垫话跑判据，验出满血才放业务请求进去；判降智就换下一张，试满「一轮最多试几张票」那个数（默认 5）还没验出来就按失败返回。这是唯一能拦住**会话第一发**降智的做法 —— 判据要有一张活 turn-state 才能读回声，而第一发没有，所以它自己铸一张当基准。手里那张**验过满血**而且还在交付窗口里时，一发垫话都不打。' +
+            '五个代价要先知道：① 换一个窗口平均约 6 发垫话（命中率约三分之一），并发请求共享同一张票、判据只跑一遍，不随并发放大。② 等待期间客户端一个字节都收不到（响应头还没发）；预算 90 秒，但取票那一步不吃这个预算，最坏约 2 分钟 —— 确认客户端超时大于这个数。**预算按账号各发一份，换号重试会叠加**（每个账号碰过的票不一样，不该互相挤掉机会），所以真正的闸是上面那个张数和失败时返回的 Retry-After。③ 垫话不计费、也不落使用记录（已知缺口），只能在服务端日志里查 gwpool_warm_probe / gwpool_warm_degraded / gwpool_warm_exhausted，网关卡上能看到被判死的落点变红。④ 垫话判不出来（非 200、限流、故障）时不下结论、不再换票，也**不拦这一发** —— 业务请求照常放行，判据仍会在业务响应上跑。所以上游限流期间请求不会被挡掉，而是暂时不如平时严；看日志里 gwpool_warm_inconclusive 的条数。⑤ 和服务端的「首输出超时」（gateway.openai_first_output_timeout_seconds）共享同一段墙上时间：预热最多吃掉它剩余额度的一半，剩下不够验一张票时**静默跳过预热**（只打一条 gwpool_warm_no_budget）。所以那个值请留 0（默认）或配到 60 秒以上。'
+        },
         gwpoolErrors: {
           GWPOOL_BASE_URL_INVALID:
             '网关池地址必须是绝对的 http(s) 地址，例如 https://pool.0102400.xyz。填池子的根地址，不是 /a/xxxx 个人页面。',
@@ -878,6 +903,60 @@ export default {
         turnStateRecoveryCooldown: '失败冷却（小时）',
         turnStateRecoveryMin: '间隔下限（分钟）',
         turnStateRecoveryMax: '间隔上限（分钟）',
+        gatewayHistory: {
+          empty: '网关 -',
+          current: '当前',
+          seen: '打过 {n} 个',
+          // tooltip 的五段是「区域-网关名-满血时间-状态-判定」，每段只放**值**不带标签：
+          // 运营方竖着扫一列看，每行重复一遍「窗口内打过，仍在冷却」会把真正要比的那几个
+          // 值推到行尾对不齐。长说法留在 gatewayColumnHint 和 legend 里，那两处只出现一次。
+          regionHot: '冷却中',
+          regionCooled: '可再用',
+          regionIdle: '未打过',
+          // 第三段是满血**时长**（判成满血到判成降智那一段），直接渲染成 `180s`，没有 i18n 键。
+          // 这一条是没有时长读数时的占位：窗口还在跑、从没验出过满血、两条读数挤在同一次写入
+          // 里算不出长度——对读者是同一件事，合成一个标签。
+          fullUntimed: '未计时',
+          legend: '✓ 验过满血（183 秒窗口内）· ! 窗口内碰过，现在打就是降智 · 灰 已过窗口，可再用',
+          // 窗口用量。分母是**池子报的可交付网关数**，不是账本条目数：账本只装「我碰过的」，
+          // 拿它当分母的话「还剩多少没用」恒等于「我碰过但已经凉了的」，答的是另一个问题。
+          windowUsage: '{hours} 小时窗口内已用 {used} 个落点，池子里还剩 {free} 个没用',
+          // 问不到池子清单时只报已用那一半：编一个分母比不报更坏。
+          windowUsageUsedOnly: '{hours} 小时窗口内已用 {used} 个落点',
+          windowUsageHint:
+            '「已用」= 这一行账本里在窗口内碰过的落点数；分母是网关池此刻**可交付**的网关数' +
+            '（取票时顺带问到的清单长度，关了「由池子按调度选落点」就问不到，那时只报已用）。\n' +
+            '两个数的口径不完全重合：账本按本地窗口算，而清单是此刻的，账本里的落点可能已经' +
+            '不在清单上了（票过期），所以差值夹到 0，不会出现负数。',
+          // 一小时满血分钟预测，刻意算**下界**。文案必须写「至少」：写「最多」会被当配额用。
+          forecast: '一小时内至少 {minutes} 分钟满血',
+          // 0 的时候不能写成「至少 0 分钟满血」：那读起来像「这个号废了」，而它实际的意思是
+          // 「账本里每个落点的冷却都要一小时之后才结束」——一个关于**时间**的事实，不是关于
+          // 号的判决。而且这个数是下界，没碰过的网关压根不计入。
+          forecastNone: '一小时内没有落点出冷却',
+          forecastHint:
+            '按 (账号 × 网关) 算：账本里有记录、且冷却在一小时内结束的有 {units} 个网关，每个给约 {window} 秒满血。一个网关名就是一个单位——同一个大区里的不同网关各有各的满血期，别按大区并（大区只是上面那个九宫格的分组）。\n' +
+            '这是**下界**：只数有正面证据的单位。本行没碰过的网关不算进来，实际可能更多——不给数字是因为这一行算不出来：池子一共有多少网关它不知道，而「本行没碰过」也完全可能是同一份凭据的别的行烧过了、或者记录被裁过。\n' +
+            '仍然乐观的一处：4 小时冷却本身没测准（静置 30 分钟到 4 小时，满血率恒定、零相关），真实恢复时间比它长的话这个数还会偏大。',
+          // state-echo 判定（后端 openai_gwpool_state_echo.go）。
+          verdicts: {
+            full: '满血',
+            degraded: '降智',
+            none: '没判过'
+          },
+          regions: {
+            'us-east': '美东',
+            'us-west': '美西',
+            'south-america': '南美',
+            'west-europe': '西欧',
+            europe: '欧洲',
+            'east-asia': '东亚',
+            oceania: '大洋',
+            'south-asia': '南亚',
+            'middle-east': '中东',
+            unknown: '未归类'
+          }
+        },
         turnStatePool: {
           empty: 'Turn-State -',
           starved: 'Turn-State 无票·裸奔中',
@@ -1045,7 +1124,8 @@ export default {
       poolModeRetryStatusCodesHint: '仅在池模式下生效。以英文逗号分隔的 HTTP 状态码（100-599），命中时触发同账号重试。留空使用默认值（{default}）。',
       customErrorCodes: '自定义错误码',
       customErrorCodesHint: '仅对选中的错误码停止调度',
-      customErrorCodesWarning: '仅选中的错误码会停止调度，其他错误将返回 500。',
+      customErrorCodesWarning:
+        '自定义错误码仅用于筛选常规的账号错误处理（如停止调度、限流标记），不决定请求是否重试或切换账号。未选中的错误仍可能触发重试或切换账号，最终返回给客户端的状态码取决于网关路径和错误透传规则，并非统一返回 500。列表为空时不做筛选。',
       customErrorCodes429Warning:
         '429 已有内置的限流处理机制。添加到自定义错误码后，将直接停止调度而非临时限流。确定要添加吗？',
       customErrorCodes529Warning:

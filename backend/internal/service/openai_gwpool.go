@@ -11,10 +11,11 @@ package service
 //     klno.5（2026-09-25）那套按账号罐回放。那套回放的已知毛病正是把账号钉死在一个网关上——
 //     罐里存着上游上次下发的 __oailb，下一发又把它带回去，于是 pro1 被钉在 unified-126、
 //     pro3 被钉在 unified-121。
-//   - 挑：要票前先 GET /gateways，在池子说「有活 pair、你没烧过」的网关里再滤掉
-//     本地账本里近 4 小时碰过的，点名取票（/cookie?gateway=）。多那一道本地账本是因为池子
+//   - 挑：要票前先 GET /gateways，在池子说「有活 pair、你没烧过」的网关里再按本地账本分两级挑
+//     （见 gatewayPoolPick）：先挑近 4 小时**没碰过**的里面池子说最久没人用的那个；全碰过了就
+//     轮到**我们自己碰得最早**的那个，点名取票（/cookie?gateway=）。多那一道本地账本是因为池子
 //     按它发的 consumer key 记账，而同一份 Codex 凭据可能挂在多个 sub2api 账号行上，按行记会
-//     让两边都以为自己还有满血窗口。**列不出来 / 挑不出来一律退回裸取**（池子自己挑），
+//     让两边都以为自己还有满血窗口。**列不出来一律退回裸取**（池子自己挑），
 //     绝不因此让这一发失败。两个端点都带 ?account=<上游 account_id>：一把 consumer key 能替
 //     多个上游账号取票，不报的话池子把槽位记在上传者头上（跨账号取到的票 verified_full 恒为
 //     false——池子没有那个账号的凭据、验不了，这不是丢票的理由）。
@@ -55,6 +56,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gin-gonic/gin"
+
 	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/chatgptcookies"
 	infraerrors "github.com/Wei-Shaw/sub2api/internal/pkg/errors"
@@ -73,20 +76,6 @@ const (
 	// 与 access_token 同级：不进日志、不进任何 API 响应（dto.redactAccountManagedExtra 把它
 	// 脱敏成 bool），管理端写入按「只有非空字符串才算改动」合并（见 admin_account.go）。
 	OpenAIGatewayPoolConsumerKeyExtraKey = "openai_gwpool_consumer_key"
-	// openAIGatewayPoolAllModelsExtraKey 决定覆写范围是**整个 chatgpt.com**还是只有 Codex 推理面。
-	//
-	// 开关出现之前恒为「整个 chatgpt.com」，于是侧信道（openai_codex_side_calls.go 的
-	// settings/user 之类装饰性 GET）、/codex/alpha/search 的 alpha 端点、/codex/realtime/calls、
-	// /codex/images/* 这些**不是推理轮次**的调用也会取票，一张票就这么没了（供给是个位数张/小时）。
-	// 默认关 = 只有推理面取票；开 = 回到那个行为。
-	//
-	// 范围按**路径**算，所以要按路径读，不能按功能名读：alpha 搜索还有一条兜底
-	// （buildOpenAIAlphaSearchResponsesWebSearchRequest，openai_alpha_search.go）打的就是
-	// chatgptCodexURL = 推理面本身，那一条**开关关着也会取票**，而且这是对的——它确实是一发
-	// /responses。开关关着时不取票的是「打在别的路径上」的那些。
-	// 按模型筛做不到也没有意义：
-	// AttachRoute 在出站挂钩点上，手里只有 URL，没有模型名（见 AttachRoute）。
-	openAIGatewayPoolAllModelsExtraKey = "openai_gwpool_all_models"
 	// openAIGatewayPoolInferencePath 是 Codex 推理面的路径。chatgptCodexURL（HTTP 出口）与
 	// buildOpenAIResponsesWSURL（WS 握手）用的是同一条；那两个是整串 URL，这里只能另抄一份路径，
 	// 由 TestGatewayPoolInferencePathMatchesCodexURL 钉住不漂。
@@ -96,7 +85,25 @@ const (
 	openAIGatewayPoolFetchTimeoutExtraKey = "openai_gwpool_fetch_timeout_s"
 	openAIGatewayPoolListTimeoutExtraKey  = "openai_gwpool_list_timeout_s"
 	// openAIGatewayPoolFetchTimeout 兜住一次取 pair。不跟随业务 ctx 的取消（见 gatewayPoolPair）。
-	openAIGatewayPoolFetchTimeout = 8 * time.Second
+	//
+	// 这个数要盖住**池子那边一次交付的全部工作**，而不只是网络往返：池子开着
+	// verify_full_at_deliver 时，每试一个网关都要用交付对象的凭据经住宅代理打一发真实
+	// state-echo（池子给每发上游 60s），而 max_tries_per_deliver 默认 2 ⇒ 一次 /cookie
+	// 合法地要跑十秒量级。原来的 8s 盖不住，于是：
+	//
+	//   2026-10-02 线上 caddy 访问日志，458 次 /cookie —— **301 次（66%）是 status 0**
+	//   （响应还没写出来，客户端先断了），它们的 p90 = 7.97s，正好钉在这条 8s 线上；
+	//   而真正返回 200 的那 47 次最长 11.28s。
+	//
+	// 代价不只是失败：被掐断的那一发 state-echo **已经打到上游了**，(账号 × 网关) 照烧、
+	// 每区域每小时 6 发的预算照扣（state-echo 与铸票共用，见池子 mint.go 的 VerifyFull），
+	// 一张票都没交付。池子侧看到的是 "请求被调用方取消"，报给客户端的却是 no_live_pair，
+	// 于是现场读起来像「池子没票」，其实票就在它手上。
+	//
+	// 25s = 实测上限 11.28s 的两倍余量，仍在池子 wait 契约上限 30s 之内。业务请求确实会多
+	// 挂一会儿再失败，但换来的是那 66% 从「挂 8s 然后 502」变成「挂 5s 然后拿到票」。
+	// 嫌长的账号用 openai_gwpool_fetch_timeout_s 单独调。
+	openAIGatewayPoolFetchTimeout = 25 * time.Second
 	// openAIGatewayPoolListTimeout 兜住那次「列网关」。它是**优化**，绝不能吃掉取票的预算：
 	// 列不出来就退回池子自己挑，所以给一个远小于 FetchTimeout 的额度。
 	openAIGatewayPoolListTimeout = 2 * time.Second
@@ -106,8 +113,14 @@ const (
 	// openAIGatewayPoolGatewayWindowExtraKey 是本地账本的保留窗口（秒）。缺省 / 非正数走默认值。
 	//
 	// 没进 openAIGatewayPoolConfigExtraKeys：它没有跨字段约束，写什么都不会让账号配到一个
-	// 必然失败的状态（最坏只是挑落点变松或变严）。同理另外三个旋钮也不进。
+	// 必然失败的状态（最坏只是挑落点变松或变严）。同理另外几个旋钮也不进。
 	openAIGatewayPoolGatewayWindowExtraKey = "openai_gwpool_gateway_window_s"
+	// openAIGatewayPoolWarmTicketsExtraKey 是一轮预热最多试几张票（见
+	// gatewayPoolWarmMaxTickets 那笔供给账）。缺省 / 非正数 / 超上限走默认值。
+	openAIGatewayPoolWarmTicketsExtraKey = "openai_gwpool_warm_tickets"
+	// openAIGatewayPoolPrewarmExtraKey 决定要不要开**后台**预热（openai_gwpool_prewarm.go）。
+	// **缺省即关**，只有显式 true 才开：它会在没有客户端等着的时候自己花票。
+	openAIGatewayPoolPrewarmExtraKey = "openai_gwpool_prewarm"
 	// openAIGatewayPoolMinRemaining 是能接受的 pair 最低剩余寿命（池子的 min_remaining）。
 	//
 	// 定这个值看的**不是**「够这一发用」：路由只在**建连那一刻**生效，连上之后这一轮跑多久都不
@@ -137,21 +150,6 @@ const (
 	// 退 300s 不会损失任何本来会成功的请求（请求不改，下一发同样不合法），而且能把这个 bug
 	// 变响，不至于静默刷日志。
 	openAIGatewayPoolBadRequestBackoff = 5 * time.Minute
-	// openAIGatewayPoolRenewBelow 是续期闸：只有池子报的 pair_remaining_s **低于**它，取票后的
-	// 第一发业务请求才去续（摘 __oailb、抓新 __cflb、回传池子，见 gatewayPoolRenew）。
-	//
-	// 为什么不是每张票都续：续一次就把 __cflb 的 3600s 重新拉满，而常态下池子刚铸的票还剩
-	// 50 多分钟，续了没有任何增量；代价是每一发摘 __oailb 都偏离真实 Codex 客户端的报文形状
-	// （docs/conventions/codex-real-client-wire-shape.md：两件齐发）。常态零续期就是这个闸的
-	// 全部理由，只有临期票才值得拿形状换寿命。
-	//
-	// **必须大于池子的 DeliverFloor（300s）**：池子在 pair 剩余低于 floor 时就不再交付这张票，
-	// 阈值取得比它小会留出一段「池子还肯发、我们已经不续」的空档，临期票就再没人救得回来。
-	// 12 分钟留出约一倍余量（够覆盖 floor 加上一个交付周期）。
-	//
-	// 判据只能用 pair_remaining_s，**不能用 valid_for_s**：后者是 min(满血窗口剩余, pair 剩余)，
-	// 绝大多数时候等于那 183 秒的窗口，分不出 pair 还剩 50 分钟还是 8 分钟。
-	openAIGatewayPoolRenewBelow = 12 * time.Minute
 	// openAIGatewayPoolMaxSeconds 是所有「秒」旋钮的上限（1 天）。超了回默认值，
 	// 见 gatewayPoolSeconds。
 	openAIGatewayPoolMaxSeconds = 86400
@@ -207,9 +205,20 @@ func (a *Account) gatewayPoolSeconds(key string, fallback time.Duration) time.Du
 	return fallback
 }
 
-// gatewayPoolAllModels 报告这个账号要不要给**所有**打到 chatgpt.com 的请求覆写 pair。
-func (a *Account) gatewayPoolAllModels() bool {
-	return a != nil && a.getExtraBool(openAIGatewayPoolAllModelsExtraKey)
+// gatewayPoolWarmTickets 读「一轮预热最多试几张票」。缺省 / 非正数 / 超上限回默认值。
+//
+// 这是个**供给旋钮**，不是性能旋钮：每张票都烧掉一个 (上游账号 × 网关) 单位，而那个单位的
+// 再生预算 ≈ 已知网关数 ÷ 槽位冷却（现场约 25 张/小时，见 gatewayPoolWarmMaxTickets）。调大它换到的是单发请求的命中率，
+// 花掉的是整个账号的小时预算 —— 超支的后果是池子报 all_cooling、整段时间里每一发业务请求
+// 都秒回 503（见 gatewayPoolWarmMaxTickets 的注释）。
+func (a *Account) gatewayPoolWarmTickets() int {
+	if a == nil {
+		return gatewayPoolWarmMaxTickets
+	}
+	if n := a.getExtraInt(openAIGatewayPoolWarmTicketsExtraKey); n > 0 && n <= gatewayPoolWarmMaxTicketsCeiling {
+		return n
+	}
+	return gatewayPoolWarmMaxTickets
 }
 
 // gatewayPoolSteering 报告要不要自己挑落点。缺省 / 非 bool = 开（接这个键之前的写死行为），
@@ -220,6 +229,16 @@ func (a *Account) gatewayPoolSteering() bool {
 	}
 	enabled, ok := a.Extra[openAIGatewayPoolSteeringExtraKey].(bool)
 	return !ok || enabled
+}
+
+// gatewayPoolPrewarmEnabled 报告要不要开后台预热（openai_gwpool_prewarm.go）。
+//
+// **缺省即关**：它会在没有客户端请求等着的时候自己花票，
+// 而这件事从没在现网测过。开它之前要先接受一笔账 —— 每个开着的身份每个满血窗口
+// 多烧最多 gatewayPoolWarmTickets 张票，换到的是「客户端不用在换票时干等」。
+// 供给见底的账号开它只会更快打到 all_cooling。
+func (a *Account) gatewayPoolPrewarmEnabled() bool {
+	return a != nil && a.getExtraBool(openAIGatewayPoolPrewarmExtraKey)
 }
 
 // poolClient 取该账号的池子客户端，按 (base_url, consumer key) 缓存。
@@ -334,6 +353,8 @@ func validateOpenAIGatewayPoolAccountExtra(account *Account, extra map[string]an
 			"account %d enables %s so %s must be set",
 			account.ID, openAIGatewayPoolExtraKey, OpenAIGatewayPoolConsumerKeyExtraKey)
 	}
+	// 降智防护的档位 2026-10-03 删了，所以这里也不再校验那个键。**刻意不改成「带这个键就报错」**：
+	// 校验看的是合并后的 extra，存量行里那个死键还在，报错会让它们一存就失败。
 	return nil
 }
 
@@ -349,6 +370,90 @@ const (
 		"consumer key)"
 )
 
+// OpenAIGatewayPoolReason 是网关池这一侧失败的原因码。
+//
+// 有它之前，池子没票 / 池子容器重启 / 退避中 / state-echo 判降智，普通使用者在 Codex CLI
+// 里看到的统一是一句 `{"error":{"type":"upstream_error","message":"Upstream request failed"}}`
+// ——分不出「稍后重试就行」和「运维得去改配置」，也不知道该等多久。上面那三条双语说明
+// 写得很清楚，却只进了 Ops 日志，一个字到不了客户端。
+// 同型先例：OpenAITurnStateHoldReason（注释写的正是「客户端一眼能看出不是上游故障」）。
+const OpenAIGatewayPoolReason = GatewayFailureReason("openai_gateway_pool")
+
+// gatewayPoolHopelessCodes 是「重试不会好」的池子错误码：要人去改 key 或改参数。
+//
+// 分流线刻意按**重试会不会好**划，不按谁的责任。no_exit / public_closed / upstream_rejected
+// 也不是我们的错，但它们**会自愈**，所以「稍后重试即可」对它们是对的，留在 NoSlot 那条。
+var gatewayPoolHopelessCodes = map[string]struct{}{
+	gwpool.CodeConsumerRejected: {}, // 我们的 consumer key 配错 / 被吊销（owner 一拆就会变）
+	gwpool.CodeBadRequest:       {}, // 我们发出去的参数不合法，池子刻意不给 retry_after
+}
+
+// gatewayPoolClientMessage 挑出该交给客户端的那一条，空串 = 这不是池子的错。
+//
+// 判序不能动：errOpenAIGatewayPoolRouteDegraded 自己就包着 ErrPool，排在后面会被吃掉。
+//
+// 码要在 ErrNoSlot 之前看：*PoolError **全部** Unwrap 到 ErrNoSlot（pkg/gwpool 的设计，
+// 让 fail-closed 判断不用逐码改），所以仅按 errors.Is 分流的话十一个码只剩一句话。
+// 2026-10-02 现场：池子回 consumer_rejected（owner 拆分后 key 变了），客户端却收到
+// 「没有满血槽位……稍后重试即可」，而那一刻池子有 51 个空闲网关、一个槽位都不缺。
+func gatewayPoolClientMessage(err error) string {
+	switch {
+	case err == nil:
+		return ""
+	case errors.Is(err, errOpenAIGatewayPoolRouteDegraded):
+		return gatewayPoolDegradedClientMsg
+	case errors.Is(err, errOpenAIGatewayPoolWarmNoModel):
+		return gatewayPoolWarmNoModelClientMsg
+	case errors.Is(err, errOpenAIGatewayPoolWarmExhausted):
+		return gatewayPoolWarmExhaustedClientMsg
+	case gatewayPoolHopeless(err):
+		return gatewayPoolUnavailableClientMsg
+	case errors.Is(err, gwpool.ErrNoSlot):
+		return gatewayPoolNoSlotClientMsg
+	case errors.Is(err, gwpool.ErrPool):
+		return gatewayPoolUnavailableClientMsg
+	default:
+		return ""
+	}
+}
+
+// gatewayPoolRetryAfter 报告该让客户端歇多久再来（0 = 不报）。
+//
+// 这个数走 UpstreamFailoverError.ResponseHeaders 里的 Retry-After，由 handler 的
+// copyFailoverRetryAfter 原样转给客户端。**它是这条链路上唯一的刹车**：池子这边的失败全是
+// 秒级返回的 503（退避期里甚至只要 0.2 秒），而 Codex CLI 对 503 立刻重发 —— 2026-10-02
+// 现场 16:17–16:22 五分钟打出 200 发 503、16:58–17:12 又 180 发，用户座位上看就是「卡死」。
+// 每一轮重发还可能再烧几张票，而 (消费账号 × 网关) 的再生预算只有「已知网关数 ÷ 4 小时」
+// ≈ 25 张/小时，重试环本身就是供给见底的一个主因。
+//
+// 池子说了多久就报多久（退避那条把剩余时长放进了 PoolError.RetryAfter）；没说的用
+// openAIGatewayPoolClientRetryAfter 兜底。
+func gatewayPoolRetryAfter(err error) time.Duration {
+	var refused *gwpool.PoolError
+	if errors.As(err, &refused) && refused.RetryAfter > 0 {
+		return refused.RetryAfter
+	}
+	return openAIGatewayPoolClientRetryAfter
+}
+
+// openAIGatewayPoolClientRetryAfter 是池子没给具体时长时报给客户端的 Retry-After。
+//
+// 30 秒的两条边界：① 足够掐死「失败就立刻重发」那个环（一轮预热本身才 8–15 秒，不设限的话
+// 客户端每十几秒就再烧 2 张票）；② 远小于槽位冷却（4 小时），所以池子随时铸出来的新落点
+// 不会因为这个数被白等掉。
+const openAIGatewayPoolClientRetryAfter = 30 * time.Second
+
+// gatewayPoolHopeless 报告这个错误的码属不属于「重试不会好」。
+// 没报码（池子回了闭集外的值）⇒ false：不凭空把供给不足升级成「你配错了」。
+func gatewayPoolHopeless(err error) bool {
+	var refused *gwpool.PoolError
+	if !errors.As(err, &refused) {
+		return false
+	}
+	_, ok := gatewayPoolHopelessCodes[refused.Code]
+	return ok
+}
+
 // gatewayPoolClientError 给池子侧的失败套一层双语说明。
 //
 // 一处收口而不是逐条改措辞：池子的原始错误（HTTP 401/403/503、解码失败、connection refused）
@@ -358,7 +463,9 @@ func gatewayPoolClientError(err error) error {
 	if err == nil {
 		return nil
 	}
-	if errors.Is(err, gwpool.ErrNoSlot) {
+	// 和 gatewayPoolClientMessage 同一条分流线：客户端看到的那串就是这里拼的前缀
+	// （2026-10-02 那发 503 的正文），两处必须一致，否则日志和客户端各说一套。
+	if errors.Is(err, gwpool.ErrNoSlot) && !gatewayPoolHopeless(err) {
 		return fmt.Errorf("%s: %w", gatewayPoolNoSlotClientMsg, err)
 	}
 	return fmt.Errorf("%s: %w", gatewayPoolUnavailableClientMsg, err)
@@ -443,13 +550,23 @@ func mergeOpenAIGatewayPoolConsumerKey(existing, incoming map[string]any) {
 type openAIGatewayPoolPair struct {
 	cookie  string
 	gateway string
+	// region 是池子报的「铸这张票的出口属于哪个大区」。只用于账号卡片上按大区归档落点，
+	// 一个判定都不接（口径见 gwpool.Pair.Region）。空 = 池子没报。
+	region  string
 	version string
 	until   time.Time
-	// renewPending：这张票刚取回来、且**临期**（pair_remaining_s < openAIGatewayPoolRenewBelow），
-	// 还没被续过。只有取票后紧接着的**第一发**业务请求会摘掉 __oailb 去换一张新 __cflb 回传池子
-	// （见 AttachRoute / gatewayPoolRenew），那一发做完就翻掉，同一张票后续所有请求两件照旧齐发。
-	// 跟着这张 pair 存而不是记全局：取到新票就自然重新置位，换票时也不会把上一张的状态带过来。
-	renewPending bool
+	// since 是这张票进缓存的时刻 = 这条路由 (账号 × 网关) 开始用的时刻，也就是「票龄」
+	// 的起点。半程 state-echo 按它决定「被刷新几次才判降智」（gatewayPoolEchoStrikes）。
+	//
+	// **不能拿 until 推**：until 是池子的交付租约（gwpool 的 DeliverTTL，150 秒），
+	// 和满血窗口（约 183 秒）不是同一个数，也不是同一个起点。
+	//
+	// 零值 ⇒ 票龄算出来是个巨大的数 ⇒ 落到最严那一档（刷新一次就判死）。这正是
+	// 想要的回落方向：缓存里万一有一张没带 since 的票，按老行为办。
+	since time.Time
+	// echoMisses 是**连续**几发业务请求带着活 turn-state 又收到了一张新的。
+	// 读到一次没被刷新就归零，见 gatewayPoolNoteEcho。
+	echoMisses int
 }
 
 // openAICodexCredentialIdentity 解析「凭证域身份」：影子行自己不持凭据，必须按母账号算。
@@ -564,12 +681,22 @@ func gatewayPoolLedgerKey(identity, gateway string) string {
 // 为什么不能只信池子的 used_by_you：池子按它发的 consumer key 认账号，而同一份 Codex 凭据
 // 可能挂在多个账号行、各自配着不同的 key；池子那本账对不上真正被烧掉的那个单位。
 func (s *openAICodexCookieStore) gatewayPoolUsedRecently(identity, gateway string, window time.Duration) bool {
+	_, used := s.gatewayPoolUsedAt(identity, gateway, window)
+	return used
+}
+
+// gatewayPoolUsedAt 同上，但把**什么时候碰的**一起带回来：挑落点时要在「全都碰过」的那一格里
+// 挑碰得最早的那个（见 gatewayPoolPick），光一个 bool 排不出序。
+func (s *openAICodexCookieStore) gatewayPoolUsedAt(identity, gateway string, window time.Duration) (time.Time, bool) {
 	value, ok := s.poolUsed.Load(gatewayPoolLedgerKey(identity, gateway))
 	if !ok {
-		return false
+		return time.Time{}, false
 	}
 	at, ok := value.(time.Time)
-	return ok && time.Since(at) < window
+	if !ok || time.Since(at) >= window {
+		return time.Time{}, false
+	}
+	return at, true
 }
 
 // gatewayPoolMarkUsed 记一笔「这个上游账号碰过这个网关」。
@@ -581,6 +708,42 @@ func (s *openAICodexCookieStore) gatewayPoolMarkUsed(identity, gateway string) {
 		return
 	}
 	s.poolUsed.Store(gatewayPoolLedgerKey(identity, gateway), time.Now())
+}
+
+// gatewayPoolHydrateUsed 把账号行上那份**落库的**落点记录补回内存账本。
+//
+// poolUsed 是进程内存、重启即失，而这本账决定两件事：挑落点时过滤掉哪些候选
+// （gatewayPoolPick），以及裸取时 /cookie 带哪些 exclude。空账本的后果不是「少避开几个」，
+// 是**把刚烧过的网关原样发回来**：
+//
+//	2026-10-02 现场，池子对同一个号说「45 个候选网关都还在 4h 冷却里」，而我们这一发的
+//	gwpool_pair_taken 打的是 excluded=6 —— 那 6 是重启之后重新数起来的。
+//
+// 补的是 openAIGatewayHistoryExtraKey 那条记录，它按账号行记、报的是真相的子集（见那个常量
+// 的注释）⇒ 只会少避、不会错避，正是这个用途要的方向。
+//
+// 时间只往后对齐：内存里那条若更新（这个进程自己刚取的票），不许被落库的旧读数盖回去。
+// 所以每次取票前调一遍是幂等的，不另记「这个账号补过了」。
+func (s *openAICodexCookieStore) gatewayPoolHydrateUsed(account *Account, identity string) {
+	if s == nil || identity == "" {
+		return
+	}
+	rec, ok := readOpenAIGatewayHistory(account)
+	if !ok {
+		return
+	}
+	for gateway, seen := range rec.Seen {
+		if gateway == "" || seen.At.IsZero() {
+			continue
+		}
+		key := gatewayPoolLedgerKey(identity, gateway)
+		if prev, loaded := s.poolUsed.Load(key); loaded {
+			if at, isTime := prev.(time.Time); isTime && !seen.At.After(at) {
+				continue
+			}
+		}
+		s.poolUsed.Store(key, seen.At)
+	}
 }
 
 // gatewayPoolBurnedGateways 列出这个身份在窗口内烧过的网关，**最近烧的在前**，最多 limit 项。
@@ -628,17 +791,27 @@ func (s *openAICodexCookieStore) gatewayPoolBurnedGateways(identity string, wind
 	return out
 }
 
-// gatewayPoolBackoffFor 报告这个身份现在还要停多久不取票（0 = 可以取）。
-func (s *openAICodexCookieStore) gatewayPoolBackoffFor(identity string) time.Duration {
+// gatewayPoolBackoffEntry 是一次退避：到点 + **当初是哪个码让我们退的**。
+//
+// 为什么要留码：退避一开，后面整段时间里业务请求一个池子请求都不发（见 gatewayPoolPair），
+// 可报的只有这个退避本身。只记到点的话 consumer_rejected（要人去改 key）和 all_cooling
+// （等几小时）在退避期里长得一模一样，而 gatewayPoolClientMessage 要靠码分流文案。
+type gatewayPoolBackoffEntry struct {
+	Until time.Time
+	Code  string
+}
+
+// gatewayPoolBackoffFor 报告这个身份现在还要停多久不取票（0 = 可以取），以及当初的码。
+func (s *openAICodexCookieStore) gatewayPoolBackoffFor(identity string) (time.Duration, string) {
 	value, ok := s.poolBackoff.Load(gatewayPoolLedgerIdentity(identity))
 	if !ok {
-		return 0
+		return 0, ""
 	}
-	until, ok := value.(time.Time)
+	entry, ok := value.(gatewayPoolBackoffEntry)
 	if !ok {
-		return 0
+		return 0, ""
 	}
-	return time.Until(until)
+	return time.Until(entry.Until), entry.Code
 }
 
 // gatewayPoolBackoff 按池子的错误码决定要不要停这个身份的取票，并返回「停多久」（0 = 不停）。
@@ -646,7 +819,9 @@ func (s *openAICodexCookieStore) gatewayPoolBackoffFor(identity string) time.Dur
 // 为什么必须分流：原先所有失败一视同仁，客户端的重试环每轮都会在池子侧触发一次发现铸票
 // （池子的闸是每个号 30 分钟一次），N 个账号就是 30 分钟内 N 发白烧的上游请求。
 //
-//	all_cooling / rate_limited  这个身份在池子那边本来就取不到，等 retry_after
+//	all_cooling                 这个身份在**当时那批候选网关**上都还在冷却 ⇒ 退避但**不采信
+//	                            retry_after**，见下面的封顶
+//	rate_limited                池子**铸票**预算满了，和「有没有票给我」无关 ⇒ **不退避**
 //	no_exit                     池子整体故障（出口全熔断），换网关再试只是把同一个错重复一遍
 //	upstream_rejected           池子侧的账号/凭据问题，与我们无关，等
 //	consumer_rejected           我们自己的 consumer key 没被受理（配错 / 被吊销）：重试一万次
@@ -662,8 +837,42 @@ func gatewayPoolBackoff(err error) (time.Duration, string) {
 	}
 	var fallback time.Duration
 	switch refused.Code {
-	case gwpool.CodeAllCooling, gwpool.CodeRateLimited, gwpool.CodeNoExit,
+	case gwpool.CodeAllCooling:
+		// **只有这个码的 retry_after 不是全局事实**，所以单独一支。池子算它用的是
+		// `slot_cooldown`（默认 4h，而那个数按 codex-full-strength-tickets.md 至今没测准）
+		// 减去那一行在**这次那批候选网关**上的已歇时长 ⇒ 它回答的是「在刚才那批网关上你最早
+		// 何时出冷却」，不是「池子在此之前给不了你票」。候选集随时会变：新账号上传、发现新
+		// 网关、保温补票，任何一件都能让答案立刻失效。
+		//
+		// 2026-10-02 现场：据此静默 3h47m，而 22 分钟后池子就有 3 个这个号从没碰过、带着活票
+		// 的网关；期间每一发业务请求都直接 502（fail-closed，绝不回落降智路由）。
+		//
+		// 封顶到 fallback 而不是干脆不退避：真全烧时还是该慢下来。而「别猛敲」池子侧本来就有
+		// 自己的闸——失败会排一次发现铸票，那条队列对每个铸票号 30 分钟才放一发，所以这里敲得
+		// 再勤也烧不出更多上游请求；这一分钟换的只是 HTTP 往返和日志量。
+		if refused.RetryAfter > 0 && refused.RetryAfter < openAIGatewayPoolDefaultBackoff {
+			return refused.RetryAfter, refused.Code // 池子说更短就听它的
+		}
+		return openAIGatewayPoolDefaultBackoff, refused.Code
+	case gwpool.CodeRateLimited:
+		// **一秒都不退避。** 这个码管的是池子的**铸票**预算，不是「它有没有票给我」。
+		//
+		// 池子的闸按 (铸票账号 × 区域) 算，6 发/小时，铸票和 state-echo 共用
+		// （gwpool mint.go 的 spend / VerifyFull）。撞上它只说明「我现在得替你铸、但这个
+		// 号在这个区域铸不动了」——而池子只在一张活票都没有时才铸（SPEC 第 8 节第 3 步）。
+		// 别的托管账号铸出的票、别的区域的票、我们自己 /pair/renew 续活的票，在它说的那
+		// 「一小时」里全都是可交付的。采信那个 retry_after 就是拿**池子内部某个号的配额**
+		// 去停掉**我们所有业务请求**，最长静默一小时，期间每一发聊天直接 502。
+		// 这和 all_cooling 那次（现场静默 3h47m，TestGatewayPoolCapsAllCoolingBackoff）
+		// 是同一个错，只是天花板换成了 1 小时。
+		//
+		// 不退避也不会打出风暴：这个闸是池子进程内的滑动窗口，满了**一发上游都不发**，
+		// 拒绝是即时的，代价只有一次 HTTP 往返。相反，退避期里池子刚补上的票我们拿不到。
+		return 0, refused.Code
+	case gwpool.CodeNoExit,
 		gwpool.CodeUpstreamRejected, gwpool.CodeConsumerRejected:
+		// 这几个的 retry_after 是**全局**的：整池出口熔断、凭据被否决，
+		// 都不随候选网关集变化 ⇒ 照旧采信。
 		fallback = openAIGatewayPoolDefaultBackoff
 	case gwpool.CodeBadRequest:
 		fallback = openAIGatewayPoolBadRequestBackoff
@@ -683,7 +892,23 @@ func gatewayPoolRetriesBare(err error) bool {
 	return backoff == 0 && errors.Is(err, gwpool.ErrNoSlot)
 }
 
-// gatewayPoolPick 挑一个这个身份近期没碰过的网关，返回空串 = 挑不出来，退回裸取（池子自己挑）。
+// gatewayPoolPick 挑这一发该点名哪个落点。空串 = 挑不出来，退回裸取（池子自己挑）。
+//
+// 两级，**先新后旧**：
+//
+//  1. 本地账本在窗口内**没碰过**的候选里，挑池子说最久没人用的那个（LastUsedAt 最早）。
+//     新发现的网关、刚铸出票的网关天然落在这一级，而且 LastUsedAt 是零值 ⇒ 排第一。
+//  2. 全都碰过时**不再退回裸取**，而是挑我们自己**碰得最早**的那个（第二个返回值报真）。
+//
+// 第 2 级是 2026-10-02 加的。原先那一版在这里返回空串裸取，而裸取是把选择权交回池子 ——
+// 池子按它自己那本账挑，而它只认它发过的票。真正要紧的是这个：本地那 4 小时窗口是个**保守
+// 估计**（docs/conventions/codex-full-strength-tickets.md 明说没测准；实测 2h09m 够、24 分钟
+// 不够），所以「全都在窗口内」不等于「全都还降智」—— 碰得最早的那个是最可能已经恢复的那个，
+// 而裸取挑中的可能是刚烧过几分钟的。
+//
+// 第 2 级点名的那个**必须从 exclude 里摘掉**：池子对「点名的网关同时在排除名单里」是按排除办
+// （gwpool internal/sched/sched.go 的注释），不摘就等于没点名。摘了也不会因此发出降智的票 ——
+// 池子自己那条 (消费账号 × 网关) 冷却过滤仍然在，它认得的烧灼它会拒（CoolingError ⇒ all_cooling）。
 //
 // 池子不知道「烧过」是按 (上游账号 × 网关) 算的——它只看自己那本账，所以池子的
 // pair_ready / used_by_you 与本地账本是**且**的关系。
@@ -692,9 +917,9 @@ func (s *openAICodexCookieStore) gatewayPoolPick(
 	pool *gwpool.Client,
 	account *Account,
 	identity string,
-) string {
+) (gateway string, reused bool) {
 	if !account.gatewayPoolSteering() {
-		return "" // 账号明确要求「由池子按调度选」。
+		return "", false // 账号明确要求「由池子按调度选」。
 	}
 	listCtx, cancel := context.WithTimeout(ctx, account.gatewayPoolListTimeout())
 	defer cancel()
@@ -703,24 +928,40 @@ func (s *openAICodexCookieStore) gatewayPoolPick(
 		// 列表是优化不是闸门：池子没加这个端点 / 临时打不开时照常裸取。绝不能因为列不出来
 		// 就让这一发失败——接这个端点之前的行为就是兜底。
 		slog.Debug("gwpool_gateways_unavailable", "account_id", account.ID, "error", err)
-		return ""
+		return "", false
 	}
-	var pick string
-	var pickedAt time.Time
+	// /gateways 只列此刻有活 pair 的网关 ⇒ 列表长度就是池子的可交付网关数。账号卡片拿它当
+	// 「还剩几个落点没用」的分母（见 OpenAIGatewayPoolApplied.PoolLive）。
+	openAIGatewayPoolSinkFrom(ctx).notePoolLive(len(gateways))
+	var fresh, oldest string
+	var freshAt, oldestAt time.Time
 	window := account.gatewayPoolGatewayWindow()
-	for _, gateway := range gateways {
-		if !gateway.PairReady || gateway.UsedByYou {
+	for _, candidate := range gateways {
+		if !candidate.PairReady || candidate.UsedByYou {
 			continue
 		}
-		if s.gatewayPoolUsedRecently(identity, gateway.Name, window) {
+		at, burned := s.gatewayPoolUsedAt(identity, candidate.Name, window)
+		if !burned {
+			// 没碰过：挑池子说**最久没人用**的。零值（池子说没碰过）早于任何时刻，天然最优。
+			if fresh == "" || candidate.LastUsedAt.Before(freshAt) {
+				fresh, freshAt = candidate.Name, candidate.LastUsedAt
+			}
 			continue
 		}
-		// 多个候选时挑**最久没碰**的。零值（池子说没碰过）早于任何时刻，天然最优。
-		if pick == "" || gateway.LastUsedAt.Before(pickedAt) {
-			pick, pickedAt = gateway.Name, gateway.LastUsedAt
+		// 碰过：留一个「我们自己碰得最早」的当第二级兜底。
+		if oldest == "" || at.Before(oldestAt) {
+			oldest, oldestAt = candidate.Name, at
 		}
 	}
-	return pick
+	if fresh != "" {
+		return fresh, false
+	}
+	if oldest != "" {
+		slog.Debug("gwpool_steer_rotates_oldest", "account_id", account.ID,
+			"gateway", oldest, "burned_min_ago", int(time.Since(oldestAt).Minutes()),
+			"reason", "every live candidate is inside the local ledger window; rotating to the one burned longest ago")
+	}
+	return oldest, oldest != ""
 }
 
 // gatewayPoolPair 取该身份当前可用的 pair：窗口内复用缓存，否则向池子要一张。
@@ -741,10 +982,12 @@ func (s *openAICodexCookieStore) gatewayPoolPair(ctx context.Context, account *A
 		return cached, false, nil
 	}
 	// 活票不受退避影响；不同池配置的取票失败互不阻塞。
-	if remaining := s.gatewayPoolBackoffFor(cacheKey); remaining > 0 {
-		slog.Debug("gwpool_backoff_active", "account_id", account.ID, "remaining_s", int(remaining.Seconds()))
+	if remaining, code := s.gatewayPoolBackoffFor(cacheKey); remaining > 0 {
+		slog.Debug("gwpool_backoff_active", "account_id", account.ID, "code", code, "remaining_s", int(remaining.Seconds()))
+		// 保留池子拒绝码与 Retry-After，退避同时按配置隔离。
 		return openAIGatewayPoolPair{}, false, fmt.Errorf(
-			"%w: pool asked this account to back off for another %ds", gwpool.ErrNoSlot, int(remaining.Seconds()))
+			"%w: pool asked this account to back off for another %ds",
+			&gwpool.PoolError{Code: code, RetryAfter: remaining}, int(remaining.Seconds()))
 	}
 	// 租着的那张过了建议窗口 ⇒ 要一张**不同的**网关（force=1）。池子的 valid_for_s 只是建议值
 	// （ttl_is_advisory），换不换由这边判；不带 force 的话池子可能把同一张再发回来。
@@ -761,91 +1004,33 @@ func (s *openAICodexCookieStore) gatewayPoolPair(ctx context.Context, account *A
 		if pair, cached := s.cachedPoolPair(cacheKey); cached == openAIGatewayPoolPairLive {
 			return pair, nil
 		}
+		// 架子上有上一批剩下的票就弹一张，一个池子请求都不发（见 poolSpare / gatewayPoolSparePop）。
+		// 预热循环换票那几轮全靠这一格：它是「标 Stale → 再取一张」，而一批里每张落点都不同
+		// （gatewayPoolTakeBatch 的去重），刚被标 Stale 的那张也是这一批弹出去的
+		// ⇒ 备用票必然是另一个网关，force 要的就是这个。
+		if spare, ok := s.gatewayPoolSparePop(account, cacheKey); ok {
+			took = true
+			s.poolPairs.Store(cacheKey, spare)
+			return spare, nil
+		}
 		callCtx, cancel := context.WithTimeout(fetchCtx, account.gatewayPoolFetchTimeout())
 		defer cancel()
-		// 自己挑落点：池子按它发的 consumer key 记账，认不出「同一份凭据挂在多个账号行上」，
-		// 所以这里按凭证域身份的本地账本再滤一道。挑不出来时 Gateway 为空 = 由池子按调度选
-		// （接 /gateways 之前的行为，永远是兜底）。
-		// 列表与取票同在 singleflight 里 ⇒ 同身份并发只列一次，不另加一层缓存。
-		steer := s.gatewayPoolPick(callCtx, pool, account, identity)
-		request := gwpool.CookieRequest{
-			// Account = 这一发真正要用的那个上游账号（池子的 ?account=）：池子按它记槽位，
-			// 不报就记在 consumer key 上传者的头上。
-			Account: gatewayPoolUpstreamAccountID(identity),
-			Gateway: steer,
-			Force:   force,
-			// 本地账本里还在窗口内的网关：点名时它是多余的（挑的时候已经滤过），
-			// **裸取时它是唯一能把这份知识用上的地方**。
-			Exclude:      s.gatewayPoolBurnedGateways(identity, account.gatewayPoolGatewayWindow(), gwpool.MaxExcludeItems),
-			MinRemaining: openAIGatewayPoolMinRemaining,
-			Wait:         openAIGatewayPoolWait,
-		}
+		var excludeVersions []string
 		// 手里那张转成 stale = 「这张具体的票不行了」。exclude_versions 正是这句话的精确表达，
 		// 比 force（只说「换个网关」）准；两者一起带（force 仍然要，池子据它保证换网关）。
 		if force && cached.version != "" {
-			request.ExcludeVersions = []string{cached.version}
+			excludeVersions = []string{cached.version}
 		}
-		got, err := pool.Cookie(callCtx, request)
-		if steer != "" && gatewayPoolRetriesBare(err) {
-			// 点名的那个在「列表」与「取票」之间被别人租走了。这一发什么都没交付、没烧任何
-			// 槽位，所以退回裸取一次——不然自己挑网关反而把本来能成的请求打成失败。
-			//
-			// **只退一次，绝不能改成循环重试**：裸取的失败意味着池子现在真的一张都没有，
-			// 重试只会在供给见底时把每个业务请求放大成一串池子请求（风暴）。
-			// 「点名失败就换一个候选再点」同理不做：候选都是同一张列表来的，它过期了就全过期。
-			// 该退避的错误码（no_exit 等）走不到这里：换网关只是把同一个错重复一遍。
-			request.Gateway = ""
-			got, err = pool.Cookie(callCtx, request)
-		}
+		batch, err := s.gatewayPoolTakeBatch(callCtx, pool, account, identity, force, excludeVersions,
+			gatewayPoolBatchTickets)
 		if err != nil {
-			// 池子明说了「先别来」就按身份记下来：只对本次请求生效的退避挡不住重试环，
-			// 而每一轮重试都会在池子侧触发一次发现铸票。
-			if backoff, code := gatewayPoolBackoff(err); backoff > 0 {
-				s.poolBackoff.Store(gatewayPoolLedgerIdentity(cacheKey), time.Now().Add(backoff))
-				slog.Warn("gwpool_backoff_started", "account_id", account.ID,
-					"code", code, "backoff_s", int(backoff.Seconds()))
-			}
-			// 刻意**不删**缓存里那张过期的：它是「别再给我这一个」的依据，删掉之后下一发会走
-			// 不带 force / 不带 exclude_versions 的 /cookie，池子可能原样把烧过的那张发回来。
 			return nil, err
 		}
-		// 取到票了 ⇒ 之前那次退避（如果有）已经过去，清掉，不留一个过期的到点值。
-		s.poolBackoff.Delete(gatewayPoolLedgerIdentity(cacheKey))
-		// 池子是外部服务 = 信任边界：只留 __cflb / __oailb，别的名字不往 chatgpt.com 发，
-		// 也保证落库读数（同样是 routePairOf 的产物）与实际出站一致。
-		cookie := routePairOf(strings.Split(got.Cookie, ";"))
-		if cookie == "" {
-			return nil, fmt.Errorf("%w: cookie response carried no route pair", gwpool.ErrPool)
-		}
-		gateway := strings.TrimSpace(got.Gateway)
-		if gateway == "" {
-			// 池子没报网关名就自己从 __oailb 里解——回报必须记**实际注入的那张**。
-			gateway = openAICodexRouteGateway(cookie)
-		}
-		pair := openAIGatewayPoolPair{
-			cookie:  cookie,
-			gateway: gateway,
-			version: got.Version,
-			until:   time.Now().Add(got.ValidFor),
-			// 临期票才置位。池子没报 pair_remaining_s（旧版池子）⇒ 0 ⇒ 不续：少续一张只是回到
-			// 接这个字段之前的行为，而错续会在还没必要的时候改报文形状。
-			renewPending: got.PairRemaining > 0 && got.PairRemaining < openAIGatewayPoolRenewBelow,
-		}
+		pair, _ := batch.next() // 批至少一张（gatewayPoolTakeBatch 的尾判）
 		took = true
 		s.poolPairs.Store(cacheKey, pair)
-		// 记账用**实际拿到的**那个网关名，而不是我们点名的那个：裸取和池子忽略点名时都只能
-		// 从响应里知道落点。
-		s.gatewayPoolMarkUsed(identity, pair.gateway)
-		// 刻意不打 version：它是这张票的身份，和 cookie 本体一样不进日志。
-		slog.Info("gwpool_pair_taken", "account_id", account.ID, "gateway", pair.gateway,
-			"steered_to", steer, "excluded", len(request.Exclude), "valid_for_s", int(got.ValidFor.Seconds()),
-			"verified_full", got.VerifiedFull, "ttl_is_advisory", got.TTLIsAdvisory, "forced", force)
-		// 猎手 pair 模式把票连带的 pair 种回罐里（openai_turn_state_pair.go），而接管后罐里的
-		// __cflb/__oailb 不再出站 ⇒ 它会被静默忽略。只在换 pair 这一刻 warn 一次，不改行为。
-		if account.IsOpenAITurnStatePairModeEnabled() {
-			slog.Warn("gwpool_overrides_turn_state_pair_mode", "account_id", account.ID,
-				"gateway", pair.gateway)
-		}
+		// 备用票与当前票使用相同配置作用域，真实网关消耗仍按上游身份记账。
+		s.gatewayPoolSpareShelve(cacheKey, batch)
 		return pair, nil
 	})
 	if err != nil {
@@ -855,6 +1040,288 @@ func (s *openAICodexCookieStore) gatewayPoolPair(ctx context.Context, account *A
 	// 两个条件都要：shared = 这次结果是别人那一趟取回来的（singleflight 合并）；
 	// took = 闭包真的向池子取了一张（而不是在内层复查时命中了缓存）。
 	return taken, !shared && took, nil
+}
+
+// gatewayPoolTakeFresh 向池子要**一张新票**，并且**不碰 (身份 → pair) 缓存**。
+//
+// 分出来是为了后台预热（openai_gwpool_prewarm.go）：它要在手里那张还 Live、还在服务业务请求的
+// 时候另取一张候选票去验，验出满血才换上去。走 gatewayPoolPair 的话第一句就命中「缓存里还
+// Live」早返回，拿回来的是同一张；而先标 Stale 再取会让紧接着的业务请求落在一张**没验过**的
+// 票上 —— 那正是预热要消灭的那一格。
+//
+// 本地账本（poolUsed）照记：票真的取了、槽位真的烧了，谁取的无关。
+func (s *openAICodexCookieStore) gatewayPoolTakeFresh(
+	ctx context.Context,
+	pool *gwpool.Client,
+	account *Account,
+	identity string,
+	force bool,
+	excludeVersions []string,
+) (openAIGatewayPoolPair, error) {
+	batch, err := s.gatewayPoolTakeBatch(ctx, pool, account, identity, force, excludeVersions, 1)
+	if err != nil {
+		return openAIGatewayPoolPair{}, err
+	}
+	// count=1 ⇒ 恰好一张，没有备用票要还。批至少一张（gatewayPoolTakeBatch 的尾判）⇒ 必中。
+	pair, _ := batch.next()
+	return pair, nil
+}
+
+// gatewayPoolTicketBatch 是一次批量取票的手持库存。
+//
+// **它存在的全部理由是「备用票不许进本地账本」。** 本地账本（poolUsed）记的是「我们碰过这个
+// 落点」，而一张没发出过任何字节的备用票**一个窗口都没烧**。把它记进去的后果是实打实的供给
+// 损失：gatewayPoolPick 会绕开它、exclude 会把它报给池子，于是一个全新的落点被我们自己
+// 锁 4 小时（默认窗口）—— 批量每轮都会多出 N−1 张备用票，这个损失是会累积的。
+//
+// 所以 next() 才记账（调用方马上就要拿它出站），没弹出去的那几张由 releaseSpare() 异步还回
+// 池子、**一个字都不写账本**。反过来「先全记上、用不着的再删」不行：gatewayPoolMarkUsed 是
+// 覆盖写，而这个落点可能一小时前真被碰过（账本是落盘回灌来的，见 gatewayPoolHydrateUsed）
+// ⇒ 删掉等于把一条真实的接触记录擦了，下一发就会去点一个正在烧的落点。
+type gatewayPoolTicketBatch struct {
+	store    *openAICodexCookieStore
+	account  *Account
+	identity string
+	pairs    []openAIGatewayPoolPair
+	idx      int
+	// 取票时那几个读数，只进日志：弹一张就打一行，和单取那条路口径一致。
+	steer    string
+	reused   bool
+	excluded int
+	force    bool
+}
+
+// next 弹一张票并把它记进本地账本。批里空了回 false。
+func (b *gatewayPoolTicketBatch) next() (openAIGatewayPoolPair, bool) {
+	if b == nil || b.idx >= len(b.pairs) {
+		return openAIGatewayPoolPair{}, false
+	}
+	pair := b.pairs[b.idx]
+	b.idx++
+	// 记账用**实际拿到的**那个网关名，而不是我们点名的那个：裸取和池子忽略点名时都只能
+	// 从响应里知道落点。
+	b.store.gatewayPoolMarkUsed(b.identity, pair.gateway)
+	// 刻意不打 version：它是这张票的身份，和 cookie 本体一样不进日志。
+	slog.Info("gwpool_pair_taken", "account_id", b.account.ID, "gateway", pair.gateway,
+		"steered_to", b.steer, "steer_rotated", b.reused, "excluded", b.excluded,
+		"valid_for_s", int(time.Until(pair.until).Seconds()),
+		"forced", b.force, "batch_size", len(b.pairs), "batch_index", b.idx)
+	if b.account.IsOpenAITurnStatePairModeEnabled() {
+		// 猎手 pair 模式把票连带的 pair 种回罐里（openai_turn_state_pair.go），而接管后罐里的
+		// __cflb/__oailb 不再出站 ⇒ 它会被静默忽略。只在换 pair 这一刻 warn 一次，不改行为。
+		slog.Warn("gwpool_overrides_turn_state_pair_mode", "account_id", b.account.ID,
+			"gateway", pair.gateway)
+	}
+	return pair, true
+}
+
+// dropAged 把剩余寿命不够的票丢掉：**不记账本**（没碰过的落点记进去等于白锁一个窗口，见类型
+// 注释），也不还（过了池子的租约 /release 不受理）。
+//
+// 只给架子上的备用票用（gatewayPoolSparePop）。**刚取回来的那一批不过这道闸**：池子的
+// min_remaining 是请求参数、不是它的承诺，而一张只剩几秒的新票仍然能把这一发发出去 ——
+// 在取票路径上按这个门槛判死，等于把一个能成的请求打成硬失败。
+//
+// 门槛用 openAIGatewayPoolMinRemaining，理由与它本身一样：一张票按身份缓存、窗口内所有请求
+// 共用，只剩几秒等于下一发立刻再取一张，而供给是个位数张/小时。
+func (b *gatewayPoolTicketBatch) dropAged() {
+	for b.idx < len(b.pairs) && time.Until(b.pairs[b.idx].until) < openAIGatewayPoolMinRemaining {
+		slog.Debug("gwpool_spare_expired", "account_id", b.account.ID,
+			"gateway", b.pairs[b.idx].gateway)
+		b.idx++
+	}
+}
+
+// releaseSpare 把没弹出去的那几张**异步**还回池子（用户 2026-10-03 定的）。
+//
+// 异步是因为调用方那条路上有客户端在等：还票是 N−1 个 POST /release，各自带
+// gatewayPoolFetchTimeout（默认 25s），同步还等于把批量省下来的往返又赔回去。
+// gatewayPoolRelease 返回的闭包本来就自带 context.Background()（它正是为「业务 ctx 已经死了」
+// 那条路写的），所以 `go` 一下就够，不用另造 ctx。
+//
+// 尽力而为：还失败只有一条 debug 日志。还不回去的代价是池子那边多记一次交付读数
+// （P1 之后它不再据此拒发，见 gwpool 的 sched.burning），不是降智。
+func (b *gatewayPoolTicketBatch) releaseSpare() {
+	if b == nil {
+		return
+	}
+	for _, pair := range b.pairs[b.idx:] {
+		if release := b.store.gatewayPoolRelease(b.account, b.identity, pair); release != nil {
+			go release()
+		}
+	}
+	b.idx = len(b.pairs) // 幂等：defer 和显式调用撞在一起时别还两遍
+}
+
+// gatewayPoolTakeBatch 向池子要**最多 count 张**新票，都不碰 (身份 → pair) 缓存。
+//
+// count ≤ 1 时和老行为逐字一致（query 里不带 count，池子回扁平形状）。
+// 返回的批**至少有一张**：一张都拿不到就是 error。
+func (s *openAICodexCookieStore) gatewayPoolTakeBatch(
+	ctx context.Context,
+	pool *gwpool.Client,
+	account *Account,
+	identity string,
+	force bool,
+	excludeVersions []string,
+	count int,
+) (*gatewayPoolTicketBatch, error) {
+	// 先把落库的落点记录补回内存账本：重启后它是空的，而下面两处（挑落点的过滤、裸取的
+	// exclude）全靠它。不补的话刚烧过的网关会被原样发回来，见 gatewayPoolHydrateUsed。
+	s.gatewayPoolHydrateUsed(account, identity)
+	// 自己挑落点：池子按它发的 consumer key 记账，认不出「同一份凭据挂在多个账号行上」，
+	// 所以这里按凭证域身份的本地账本再滤一道。挑不出来时 Gateway 为空 = 由池子按调度选
+	// （接 /gateways 之前的行为，永远是兜底）。
+	// 列表与取票同在调用方的 singleflight 里 ⇒ 同身份并发只列一次，不另加一层缓存。
+	steer, reused := s.gatewayPoolPick(ctx, pool, account, identity)
+	// 本地账本里还在窗口内的网关：点名时它是多余的（挑的时候已经滤过），
+	// **裸取时它是唯一能把这份知识用上的地方**。
+	exclude := s.gatewayPoolBurnedGateways(identity, account.gatewayPoolGatewayWindow(), gwpool.MaxExcludeItems)
+	if reused {
+		// 第二级点名（全都碰过、轮到碰得最早的那个）：它自己就在这份名单里，而池子对
+		// 「点名的又在排除名单里」是按排除办 ⇒ 不摘掉就等于没点名，白退回裸取。
+		exclude = slices.DeleteFunc(exclude, func(name string) bool { return name == steer })
+	}
+	request := gwpool.CookieRequest{
+		// Account = 这一发真正要用的那个上游账号（池子的 ?account=）：池子按它记槽位，
+		// 不报就记在 consumer key 上传者的头上。
+		Account:         gatewayPoolUpstreamAccountID(identity),
+		Gateway:         steer,
+		Force:           force,
+		Exclude:         exclude,
+		ExcludeVersions: excludeVersions,
+		MinRemaining:    openAIGatewayPoolMinRemaining,
+		Wait:            openAIGatewayPoolWait,
+	}
+	request.Count = count
+	got, err := pool.Cookies(ctx, request)
+	if steer != "" && gatewayPoolRetriesBare(err) {
+		// 点名的那个在「列表」与「取票」之间被别人租走了。这一发什么都没交付、没烧任何
+		// 槽位，所以退回裸取一次——不然自己挑网关反而把本来能成的请求打成失败。
+		//
+		// **只退一次，绝不能改成循环重试**：裸取的失败意味着池子现在真的一张都没有，
+		// 重试只会在供给见底时把每个业务请求放大成一串池子请求（风暴）。
+		// 「点名失败就换一个候选再点」同理不做：候选都是同一张列表来的，它过期了就全过期。
+		// 该退避的错误码（no_exit 等）走不到这里：换网关只是把同一个错重复一遍。
+		request.Gateway = ""
+		got, err = pool.Cookies(ctx, request)
+	}
+	if err != nil {
+		// 池子明说了「先别来」就按身份记下来：只对本次请求生效的退避挡不住重试环，
+		// 而每一轮重试都会在池子侧触发一次发现铸票。
+		if backoff, code := gatewayPoolBackoff(err); backoff > 0 {
+			s.poolBackoff.Store(gatewayPoolLedgerIdentity(openAIGatewayPoolCacheKey(account, identity)),
+				gatewayPoolBackoffEntry{Until: time.Now().Add(backoff), Code: code})
+			slog.Warn("gwpool_backoff_started", "account_id", account.ID,
+				"code", code, "backoff_s", int(backoff.Seconds()))
+		}
+		// 刻意**不删**缓存里那张过期的：它是「别再给我这一个」的依据，删掉之后下一发会走
+		// 不带 force / 不带 exclude_versions 的 /cookie，池子可能原样把烧过的那张发回来。
+		return nil, err
+	}
+	// 取到票了 ⇒ 之前那次退避（如果有）已经过去，清掉，不留一个过期的到点值。
+	s.poolBackoff.Delete(gatewayPoolLedgerIdentity(openAIGatewayPoolCacheKey(account, identity)))
+	batch := &gatewayPoolTicketBatch{
+		store: s, account: account, identity: identity,
+		pairs:  make([]openAIGatewayPoolPair, 0, len(got)),
+		steer:  steer,
+		reused: reused, excluded: len(request.Exclude), force: force,
+	}
+	seen := make(map[string]bool, len(got))
+	for _, one := range got {
+		// 池子是外部服务 = 信任边界：只留 __cflb / __oailb，别的名字不往 chatgpt.com 发，
+		// 也保证落库读数（同样是 routePairOf 的产物）与实际出站一致。
+		cookie := routePairOf(strings.Split(one.Cookie, ";"))
+		if cookie == "" {
+			continue // 这一张没路由对，跳过；一张都不剩才算失败（见下）
+		}
+		gateway := strings.TrimSpace(one.Gateway)
+		if gateway == "" {
+			// 池子没报网关名就自己从 __oailb 里解——回报必须记**实际注入的那张**。
+			gateway = openAICodexRouteGateway(cookie)
+		}
+		// 同一个落点在一批里只留一张。池子承诺每张不同落点，但那是**它的**承诺：
+		// 重了的话第二张的窗口已经被第一张烧掉，当成两张用就是明知故犯发降智。
+		if gateway != "" && seen[gateway] {
+			slog.Warn("gwpool_batch_duplicate_gateway", "account_id", account.ID,
+				"gateway", gateway)
+			continue
+		}
+		seen[gateway] = true
+		now := time.Now()
+		batch.pairs = append(batch.pairs, openAIGatewayPoolPair{
+			cookie:  cookie,
+			gateway: gateway,
+			region:  strings.TrimSpace(one.Region),
+			version: one.Version,
+			until:   now.Add(one.ValidFor),
+			since:   now,
+		})
+	}
+	if len(batch.pairs) == 0 {
+		return nil, fmt.Errorf("%w: cookie response carried no route pair", gwpool.ErrPool)
+	}
+	return batch, nil
+}
+
+// gatewayPoolBatchTickets 是业务路径上一次取几张票（/cookie?count=）。
+//
+// 这个数等于「这一发预计要用几张」，不是「能拿几张」：预热循环按 state-echo 判据一张张试，
+// 实测命中率约 29% ⇒ 期望消耗 1/0.29 ≈ 3.4 张（上限 gatewayPoolWarmTickets，默认 5）。
+// 取 3 的意思是「把期望量一次拿够」——第 2、3 轮一个 HTTP 往返都不打，而取票最坏要
+// gatewayPoolFetchTimeout（默认 25s，池子现铸时真会吃满），三轮就能把 90 秒的预热预算
+// 花在往返上而不是判据上。
+//
+// 没做成账号旋钮：它不是供给闸。多拿的那几张**不是浪费**——满血窗口按
+// (消费账号 × 网关) 的**首次接触**起算，票龄无关（2026-10-02 实测，
+// docs/conventions/codex-full-strength-tickets.md），所以架子上那张对后面的请求一样有效。
+// 真的亏掉只有一种情形：这个身份突然没请求了，架子上的票在池子租约内没人用。
+const gatewayPoolBatchTickets = 3
+
+// gatewayPoolSparePop 从架子上弹一张备用票，**零 HTTP 往返**。
+//
+// LoadAndDelete 把整批**独占**走、再把剩下的放回去：批是个带游标的可变结构，而弹票的并发来源
+// 不止一处（业务路径的 poolFetch 闭包按身份收口，后台预热那条路不在同一个 singleflight 里）。
+// 独占之后游标只有一个 goroutine 在推，不用另加锁。
+//
+// **只在 poolFetch 闭包里调**（而不是在退避闸之前）：同身份的并发请求必须握着同一张票 ——
+// 各弹一张的话 poolPairs 只留得下最后那张，另一张就成了「出过字节却没人记得」的票。
+// 代价是退避期里架子上的票也用不了，而那恰好是最想用它的时候；供给看紧了再说。
+func (s *openAICodexCookieStore) gatewayPoolSparePop(account *Account, identity string) (openAIGatewayPoolPair, bool) {
+	value, ok := s.poolSpare.LoadAndDelete(identity)
+	if !ok {
+		return openAIGatewayPoolPair{}, false
+	}
+	batch, ok := value.(*gatewayPoolTicketBatch)
+	if !ok {
+		return openAIGatewayPoolPair{}, false
+	}
+	// 换成这一发的账号行：架子上那个指针是取票那一发的。账本按凭证域身份记（与账号行无关），
+	// 所以换掉只影响日志口径和还票时用谁的池子配置，而这一发的那个才是对的。
+	batch.account = account
+	batch.dropAged()
+	pair, ok := batch.next()
+	if !ok {
+		return openAIGatewayPoolPair{}, false // 剩下的全快到点了，dropAged 已经丢掉
+	}
+	if batch.idx < len(batch.pairs) {
+		s.poolSpare.Store(identity, batch)
+	}
+	return pair, true
+}
+
+// gatewayPoolSpareShelve 把这一批剩下的票放上架子。
+//
+// LoadOrStore 而不是 Store：覆盖写会把架子上那一批连同它的游标一起丢掉，而那几张票**已经从
+// 池子取出来了**——没人还、也没人用，直接烂在堆上。正常路径走不到这一格（取新批之前先弹过一轮、
+// 弹空时架子上那条记录已经被删），撞上了就把这几张异步还回去。
+func (s *openAICodexCookieStore) gatewayPoolSpareShelve(identity string, batch *gatewayPoolTicketBatch) {
+	if batch == nil || batch.idx >= len(batch.pairs) {
+		return
+	}
+	if _, loaded := s.poolSpare.LoadOrStore(identity, batch); loaded {
+		batch.releaseSpare()
+	}
 }
 
 // gatewayPoolRelease 还票：这一发取了票但**一个字节都没发出去**，把槽位还给池子
@@ -955,9 +1422,8 @@ func openAIGatewayPoolAppliedFromResponse(resp *http.Response) OpenAIGatewayPool
 // gatewayPoolDropPair 按**票号**删掉缓存里那张票。
 //
 // 不按整个结构体比（CompareAndDelete(identity, 手上那份副本)）：取了票之后缓存里那张还会被原地
-// 改（抢走续期名额会翻 renewPending、续期成功会换 cookie），拿旧副本去比会对不上 ⇒ 该删的没删
-// （还票时票已经还了、本地却还拿着它继续出站）。票号唯一标识一张票，对不上说明缓存里已经是
-// 另一张了 —— 那张不该删。
+// 改（判了降智会标 Stale），拿旧副本去比会对不上 ⇒ 该删的没删（还票时票已经还了、本地却还
+// 拿着它继续出站）。票号唯一标识一张票，对不上说明缓存里已经是另一张了 —— 那张不该删。
 func (s *openAICodexCookieStore) gatewayPoolDropPair(identity, version string) {
 	value, ok := s.poolPairs.Load(identity)
 	if !ok {
@@ -968,124 +1434,12 @@ func (s *openAICodexCookieStore) gatewayPoolDropPair(identity, version string) {
 	}
 }
 
-// gatewayPoolClaimRenew 把这张票的续期名额收掉（CAS ⇒ 并发时只有一个人拿到）。
-// 缓存里已经不是这张票了就返回 false：那说明票已经换过，没必要再续手上这张。
-func (s *openAICodexCookieStore) gatewayPoolClaimRenew(identity string, pair openAIGatewayPoolPair) bool {
-	next := pair
-	next.renewPending = false
-	return s.poolPairs.CompareAndSwap(identity, pair, next)
-}
-
-// gatewayPoolRenew 把上游在这一发里新下发的路由对回传池子，续上这张 pair 的寿命。
-//
-// 在 doOpenAIUpstream 拿到响应之后调（罐的 Store 之后）。只有抢到续期名额的那一发会真的做事，
-// 其余的全部在头两道闸上返回 —— 包括没挂 sink 的路径（那种路径本来也取不到票的读数）。
-func (s *openAICodexCookieStore) gatewayPoolRenew(ctx context.Context, account *Account, upstream http.Header) {
-	if s == nil || !s.gatewayPoolTakeover(account) {
-		return
-	}
-	applied := openAIGatewayPoolSinkFrom(ctx).snapshot()
-	// 账号必须对得上：故障转移在同一个 ctx 里换号重试，标记留的是前一个号的
-	// （见 OpenAIGatewayPoolApplied）。票号为空 ⇒ 池子认不出要续哪张。
-	if !applied.Renewing || applied.AccountID != account.ID || applied.Version == "" {
-		return
-	}
-	renewed := openAICodexRoutePairFromSetCookie(upstream)
-	// 自带 ctx：业务响应一返回业务 ctx 就会被取消，而下面每一件事都不能让用户等。
-	// 身份解析也必须用它——影子行要读一次 repo，用业务 ctx 解会在客户端刚好断开的那一瞬失败，
-	// 于是落点闸也跟着不跑了（票留在缓存、真实落点不进账本）。
-	detached := context.WithoutCancel(ctx)
-	identity, err := s.gatewayPoolIdentity(detached, account)
-	if err != nil {
-		return
-	}
-	// 落点闸。续期那一发刻意只送 __cflb ⇒ 上游**必然**回一张新 __oailb，里面就是真实落点。
-	// __cflb 被上游无视时（亲和目标被摘、票已到点）它会按地理重新分配 ⇒ 落点和交付时说的不是
-	// 同一个网关。这时候三件事都不能做：
-	//   · 不回传（池子自己有完整性闸，交回去必然被拒 —— 白跑一趟）；
-	//   · 不换缓存里的 cookie（换了就成了「gateway=142 而 cookie 落 126」的自相矛盾状态，
-	//     满血窗口内后续每一发都继续按 126 出站）；
-	//   · 反而要**删掉**缓存里那张（下一发重新取票）。
-	// 并且必须把**真实落点**记进本地 4h 账本：实烧的是 126，账本里却只有交付时记的 142 ⇒
-	// 这个号以后会向池子要一张 126 的票、以为自己没碰过，拿到的是降智票。
-	// 落点解析复用徽标那条路上同一个函数，不写第二份。
-	//
-	// **这一闸必须排在下面的完整性闸之前**：新 __oailb 在手就意味着落点**可读**，而「落点不符」
-	// 是比「两件齐不齐」更强的信号 —— 两种报文形状正好绕过完整性闸（只补新 __oailb 没有新
-	// __cflb；以及 `__cflb=; Max-Age=0` 清掉亲和 cookie，routePairOf 跳过空值项 ⇒ 等于没有
-	// __cflb），排在后面的话这两格都会在完整性闸提前返回，自相矛盾的缓存照样留下来。
-	if routePairItem(renewed, openAICodexRouteOAILBCookie) != "" {
-		if landed := openAICodexRouteGateway(renewed); landed != applied.Gateway {
-			s.gatewayPoolDropPair(openAIGatewayPoolCacheKey(account, identity), applied.Version)
-			if landed != "" { // 解不出落点（畸形 JWT）同样丢票，但别拿空网关名污染账本的复合键
-				s.gatewayPoolMarkUsed(identity, landed)
-			}
-			slog.Warn("gwpool_pair_rerouted", "account_id", account.ID,
-				"promised", applied.Gateway, "landed", landed)
-			return
-		}
-	}
-	// 落点对上了，再看这组够不够完整。缺哪一件都不续：
-	//   · 没有新 __cflb ⇒ 这一发没续到（回传旧的会让池子以为续上了）；
-	//   · 没有新 __oailb ⇒ 上游什么路由都没下发（那是两件齐发时的常态），而「新 __cflb +
-	//     旧 __oailb」混着用是刻意不做的。
-	// 走到这里说明落点没变（或上游没报落点）⇒ 手里那张还能用，缓存不动。
-	if routePairItem(renewed, openAICodexRouteCFLBCookie) == "" ||
-		routePairItem(renewed, openAICodexRouteOAILBCookie) == "" {
-		return
-	}
-	pool, err := s.poolClient(account)
-	if err != nil {
-		return
-	}
-	timeout := account.gatewayPoolFetchTimeout()
-	version := applied.Version
-	go func() {
-		callCtx, cancel := context.WithTimeout(detached, timeout)
-		defer cancel()
-		next, renewErr := pool.Renew(callCtx, version, renewed)
-		// 池子收不收，本地都换成这组新的两件：新 __cflb 是上游刚发的、比手里那张新，而混着送
-		// （新 __cflb + 旧 __oailb）是刻意不做的。池子收下了就连票号一起换成新的。
-		s.gatewayPoolSwapPair(openAIGatewayPoolCacheKey(account, identity), version, renewed, next)
-		if renewErr != nil {
-			slog.Debug("gwpool_renew_failed", "account_id", account.ID, "gateway", applied.Gateway,
-				"error", renewErr)
-			return
-		}
-		slog.Info("gwpool_pair_renewed", "account_id", account.ID, "gateway", applied.Gateway)
-	}()
-}
-
-// gatewayPoolSwapPair 把缓存里那张票的 cookie 本体换成新的两件（票号非空时一并换）。
-//
-// **until 刻意不动**：续期延长的是「路由钉死」的寿命，不是满血窗口。满血窗口的唯一来源仍然是
-// 池子交付时给的 valid_for_s（见 openAIGatewayPoolPair.until）—— 跟着延长等于让这张票在满血
-// 窗口过了之后继续出站，整个功能的目的就被抵消。
-//
-// 票号对不上就什么都不做：那说明缓存里已经是另一张票了（过期换票 / 还票删掉）。
-func (s *openAICodexCookieStore) gatewayPoolSwapPair(identity, version, cookie, newVersion string) {
-	value, ok := s.poolPairs.Load(identity)
-	if !ok {
-		return
-	}
-	cached, ok := value.(openAIGatewayPoolPair)
-	if !ok || cached.version != version {
-		return
-	}
-	next := cached
-	next.cookie = cookie
-	if newVersion != "" {
-		next.version = newVersion
-	}
-	s.poolPairs.CompareAndSwap(identity, cached, next)
-}
-
 // OpenAIGatewayPoolApplied 是「这一发**真的**把池子那张 pair 注入了出站头」的 per-request 读数，
 // usage_logs 的「已覆写 / 被改派」徽标只认它。
 //
 // 为什么不能回读 pair 缓存（2026-10-02 前就是那样，是个会说假话的实现）：回读只能查「接管开着 +
-// 缓存里有票」，**手上没有 URL** ⇒ 认不出这一发是不是推理面。而默认 all_models=false 时非推理面
-// 的请求落回罐回放（见 AttachRoute），缓存里那张 stale 票又永不删 ⇒ 账号取过一次票之后，每一发
+// 缓存里有票」，**手上没有 URL** ⇒ 认不出这一发是不是推理面。而非推理面的请求落回罐回放
+// （见 AttachRoute），缓存里那张 stale 票又永不删 ⇒ 账号取过一次票之后，每一发
 // 非推理面且记用量的请求（/codex/alpha/search、/codex/images/* 这些）都会落库成「已覆写 + 池子的
 // 网关 + 池子的 cookie」，而出站实际带的是罐里那组。那正好把这张卡片唯一要回答的问题反过来答了。
 //
@@ -1095,10 +1449,24 @@ type OpenAIGatewayPoolApplied struct {
 	AccountID int64
 	Cookie    string
 	Gateway   string
-	Version   string
-	// Renewing：这一发抢到了这张票的续期名额 ⇒ 出站只带了 __cflb，响应回来要把上游新发的那组
-	// 回传池子（gatewayPoolRenew）。只在取票后的第一发、且票临期时为 true。
-	Renewing bool
+	// Region 是池子说的「这张票是哪个大区铸的」，给账号卡片按大区归档落点用。空 = 不知道。
+	Region  string
+	Version string
+	// Verdict 是这一发的 state-echo 读数："" = 没判（判据关着、没送票、非 200）、
+	// openAIGatewayVerdictFull、openAIGatewayVerdictDegraded。
+	//
+	// 挂在这个快照上而不是 sink 上另存一份：一次客户端请求里可能先后落在几个落点上
+	// （queue 档的预热一张张试、故障转移换号重试），而丢弃行各自快照走自己那一份 Applied
+	// ⇒ 每条用量行读到的是它自己那一发的结论。
+	Verdict string
+	// PoolLive 是**池子此刻报的可交付网关数**（/gateways 只列有活 pair 的，所以列表长度
+	// 就是它）。0 = 这一发没问过池子要清单（关了 steering、或者列表打不开）。
+	//
+	// 它是整个池子的读数、不是这一发的，挂在这个快照上纯粹是搭车：账号卡片要拿它当
+	// 「还剩几个落点没用」的分母，而这条已经是「池子对这一发说了什么」通向用量侧的现成
+	// 管道。由 snapshot() 从 sink 合进来，不走 mark() —— 取清单发生在注入之前，让 mark
+	// 覆盖它就等于永远是 0。
+	PoolLive int
 }
 
 // openAIGatewayPoolSink 是 ctx 里承载的那个指针。
@@ -1112,14 +1480,36 @@ type OpenAIGatewayPoolApplied struct {
 type openAIGatewayPoolSink struct {
 	mu      sync.Mutex
 	applied OpenAIGatewayPoolApplied
+	// discarded 是本次请求里被 state-echo 判成降智、整发丢掉的那些上游尝试
+	// （openai_gwpool_state_echo.go）。它们都是**真实发生过的**上游请求，要落可审计的用量行。
+	discarded []OpenAIGatewayPoolDiscardedAttempt
+	// model 是这一发的出站模型名，由 buildUpstreamRequest 在**压缩之前**从明文体里记一笔。
+	//
+	// queue 档的垫话必须用同一个模型（state 绑在 (账号 × 模型 × 这张票) 上），而传输层只拿到
+	// *http.Request —— 而且双开账号的出站体是 zstd，裸解 JSON 必然失败
+	// （compressCodexRequestBody）。所以在还看得见明文的那一层记下来。
+	model string
+	// poolLive 是池子最近一次报的可交付网关数（见 OpenAIGatewayPoolApplied.PoolLive）。
+	// 存在 sink 上而不是 applied 上：取清单发生在注入之前，放进 applied 会被 mark() 覆盖。
+	poolLive int
 }
 
 type openAIGatewayPoolSinkCtxKey struct{}
 
+// openAIGatewayPoolSinkGinKey 是同一个 sink 在 gin 上下文里的键。
+//
+// 为什么要存两份：ctx 那份给出站挂钩点写（AttachRoute 手上没有 gin.Context）；gin 那份给
+// **转发返回之后**的用量侧读 —— 丢弃行要在转发失败时也落（两发都判降智 ⇒ 整条请求失败 ⇒
+// OpenAIForwardResult 恒为 nil，publish 到结果上的读数一条都到不了用量侧）。
+const openAIGatewayPoolSinkGinKey = "openai_gwpool_sink"
+
 // withOpenAIGatewayPoolSink 在转发入口挂一个 sink。**新增一条能打到 chatgpt.com 的转发入口时
 // 要加这一行**，否则那条路上的用量行恒为「没覆写」（安全方向：宁可少报，不许假报）。
-func withOpenAIGatewayPoolSink(ctx context.Context) (context.Context, *openAIGatewayPoolSink) {
+func withOpenAIGatewayPoolSink(ctx context.Context, c *gin.Context) (context.Context, *openAIGatewayPoolSink) {
 	sink := &openAIGatewayPoolSink{}
+	if c != nil {
+		c.Set(openAIGatewayPoolSinkGinKey, sink)
+	}
 	return context.WithValue(ctx, openAIGatewayPoolSinkCtxKey{}, sink), sink
 }
 
@@ -1129,6 +1519,53 @@ func openAIGatewayPoolSinkFrom(ctx context.Context) *openAIGatewayPoolSink {
 	}
 	sink, _ := ctx.Value(openAIGatewayPoolSinkCtxKey{}).(*openAIGatewayPoolSink)
 	return sink
+}
+
+// OpenAIGatewayPoolDiscardedAttempt 是一次「发出去了、响应头到手、被 state-echo 判成降智后整发
+// 丢掉」的上游尝试。
+//
+// Applied 原样带着那一发的注入读数（网关名 + 票号 + 账号）：丢弃行唯一要回答的问题就是「哪个
+// 落点被判降智了」，而用量侧的路由对卡片（routePairInUse）本来就是按这个结构体渲染的 ⇒ 直接复用，
+// 不另加列、不另起一套。
+//
+// **刻意不带上游的 x-request-id。** 从前这里有个 RequestID 字段，注释说它是计费幂等键 ——
+// 后来幂等键改成了用量侧自己定（固定前缀 + 客户端请求 id + attempt 序号，见
+// openai_gateway_usage.go 那段论证），这个字段就再没人读过。而对账也不需要它：
+// 丢弃行里的 Applied 已经带着网关名和票号，池子那边的日志正是按网关记的。
+type OpenAIGatewayPoolDiscardedAttempt struct {
+	Applied OpenAIGatewayPoolApplied
+}
+
+// noteDiscarded 记一次被判降智丢弃的上游尝试。
+func (s *openAIGatewayPoolSink) noteDiscarded(attempt OpenAIGatewayPoolDiscardedAttempt) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.discarded = append(s.discarded, attempt)
+}
+
+// takeDiscardedOpenAIGatewayPoolAttempts 把这次请求的丢弃读数**取走**（读完清空）。
+//
+// 清空而不是只读：用量侧的钩子在成功与失败两条路上都会被调到，而每一条丢弃行只该落一次。
+func takeDiscardedOpenAIGatewayPoolAttempts(c *gin.Context) []OpenAIGatewayPoolDiscardedAttempt {
+	if c == nil {
+		return nil
+	}
+	value, ok := c.Get(openAIGatewayPoolSinkGinKey)
+	if !ok {
+		return nil
+	}
+	sink, _ := value.(*openAIGatewayPoolSink)
+	if sink == nil {
+		return nil
+	}
+	sink.mu.Lock()
+	defer sink.mu.Unlock()
+	taken := sink.discarded
+	sink.discarded = nil
+	return taken
 }
 
 // mark 由 AttachRoute 在**写完 Cookie 头之后**调：写在前面的话「写头失败」也会被记成已注入。
@@ -1141,14 +1578,67 @@ func (s *openAIGatewayPoolSink) mark(applied OpenAIGatewayPoolApplied) {
 	s.applied = applied
 }
 
-// snapshot 读回这一发的标记（出站挂钩点之后、同一个 ctx 上的调用方用，见 gatewayPoolRenew）。
+// noteModel / modelOf 记取这一发的出站模型名（见字段注释）。空串 = 不知道。
+func (s *openAIGatewayPoolSink) noteModel(model string) {
+	if s == nil {
+		return
+	}
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.model = model
+}
+
+func (s *openAIGatewayPoolSink) modelOf() string {
+	if s == nil {
+		return ""
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.model
+}
+
+// noteVerdict 把 state-echo 的结论补到当前标记上（gatewayPoolRouteDegraded 调）。
+//
+// 网关对不上就不记：换票重试时 mark 已经被下一张票覆盖，拿上一发的结论去改它会把结论
+// 记到错的落点上。
+func (s *openAIGatewayPoolSink) noteVerdict(gateway, verdict string) {
+	if s == nil || gateway == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.applied.Gateway != gateway {
+		return
+	}
+	s.applied.Verdict = verdict
+}
+
+// notePoolLive 记下池子这一发报的可交付网关数。0 不覆盖已有值：列表打不开时该保留上一次
+// 问到的数，报 0 会让卡片说「池子一个落点都没有」。
+func (s *openAIGatewayPoolSink) notePoolLive(n int) {
+	if s == nil || n <= 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.poolLive = n
+}
+
+// snapshot 读回本次请求的票据、判定和池供给读数。
 func (s *openAIGatewayPoolSink) snapshot() OpenAIGatewayPoolApplied {
 	if s == nil {
 		return OpenAIGatewayPoolApplied{}
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.applied
+	// 在读的时候合进来，不在 mark 里写：取清单在注入之前，让 mark 覆盖它就恒为 0。
+	applied := s.applied
+	applied.PoolLive = s.poolLive
+	return applied
 }
 
 // publish 把标记落到转发结果上（result 为 nil = 这一发失败了，没有用量行要写）。
@@ -1200,11 +1690,12 @@ func (s *openAICodexCookieStore) AttachRoute(
 	if isWebSocketURL(rawURL) {
 		return nil, ErrGatewayPoolWSIncompatible
 	}
-	// 覆写范围：默认只给 Codex 推理面取票。侧信道（装饰性 GET）、/codex/alpha/search、
+	// 覆写范围**只有 Codex 推理面**，没有开关。侧信道（装饰性 GET）、/codex/alpha/search、
 	// /codex/realtime/calls 这些也打在 chatgpt.com 上，但它们不是推理轮次——给它们取一张票
-	// 等于白烧一个 (上游账号 × 网关) 单位，而供给是个位数张/小时。要回到「所有请求都覆写」
-	// 就开 openai_gwpool_all_models。落回罐回放（而不是不挂 cookie）：这些调用本来就靠罐。
-	if u.Path != openAIGatewayPoolInferencePath && !account.gatewayPoolAllModels() {
+	// 等于白烧一个 (上游账号 × 网关) 单位，而供给是个位数张/小时。
+	// （2026-10-02 删掉了 openai_gwpool_all_models 那个开关：它唯一的用法是把这笔浪费打开。）
+	// 落回罐回放（而不是不挂 cookie）：这些调用本来就靠罐。
+	if u.Path != openAIGatewayPoolInferencePath {
 		s.Attach(account, rawURL, headers)
 		return nil, nil
 	}
@@ -1221,27 +1712,7 @@ func (s *openAICodexCookieStore) AttachRoute(
 	if fresh {
 		release = s.gatewayPoolRelease(account, identity, pair)
 	}
-	// 续期名额：一张临期票只续一次，由**取票后的第一发**业务请求去续。CAS 抢名额 ⇒ 并发时
-	// 只有一个人摘 __oailb，其余照常两件齐发。抢到之后这一发若死在发送前，这张票就不续了
-	// （它的槽位会被还回池子，缓存也会被删，见 gatewayPoolRelease）。
-	renewing := pair.renewPending && s.gatewayPoolClaimRenew(openAIGatewayPoolCacheKey(account, identity), pair)
 	outbound := pair.cookie
-	if renewing {
-		// 这一发**只送 __cflb**：两件齐发时上游什么都不回（2026-10-02 实测 F 组），摘掉 __oailb
-		// 上游才会补发一张新 __cflb（E 组），寿命重新拉满 3600s —— 那是池子自己拿不到、只有业务
-		// 请求能刷出来的东西，所以换回来之后要回传（gatewayPoolRenew）。
-		//
-		// 代价（刻意承担，且**没有单独实测过**）：真实 Codex 客户端是两件齐发
-		// （docs/conventions/codex-real-client-wire-shape.md），这一发的报文形状和它不一样。
-		// 判断安全的依据：路由由 __cflb 钉死，__oailb 只决定响应是否暴露落点
-		// （docs/conventions/codex-full-strength-tickets.md:458-472）；cookie 回放本身与降智
-		// 无关已有约 3k 样本。再加上这里的闸——只有临期票、且只有第一发 ⇒ 常态零偏离。
-		if cflb := routePairItem(pair.cookie, openAICodexRouteCFLBCookie); cflb != "" {
-			outbound = cflb
-		} else {
-			renewing = false // 这张票没有 __cflb：摘了等于裸打（落点不可控），也没什么可续。
-		}
-	}
 	// 只替换这两项：__cf_bm / cf_clearance / _cfuvid 是**本出口自己**拿到的 Cloudflare 令牌，
 	// 丢掉会让 CF 重新发挑战（这和「跨出口回放 __cf_bm 自相矛盾」不是一回事——那说的是别人出口
 	// 铸的值，这里是本出口自己的）。始终 Set：入站客户端的 Cookie 不能漏到出站。
@@ -1254,12 +1725,9 @@ func (s *openAICodexCookieStore) AttachRoute(
 	}
 	headers.Set("Cookie", strings.Join(append(parts, outbound), "; "))
 	// 写完头**之后**才记标记：使用记录那张卡片据此断言「这一发真的注入了」。
-	// Cookie 记的是**这张票的两件**而不是 outbound：续期那一发出站只带了 __cflb，但用量侧要的是
-	// 「这一发用的是哪张票」（而且那一发必有 Set-Cookie ⇒ route_pair 落的是上游新发的那组，
-	// 不会拿这个字段去充数，见 routePairInUse）。
 	openAIGatewayPoolSinkFrom(ctx).mark(OpenAIGatewayPoolApplied{
 		AccountID: account.ID, Cookie: pair.cookie, Gateway: pair.gateway,
-		Version: pair.version, Renewing: renewing,
+		Region: pair.region, Version: pair.version,
 	})
 	return release, nil
 }

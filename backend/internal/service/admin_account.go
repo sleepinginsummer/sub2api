@@ -413,6 +413,9 @@ func normalizeOpenAILongContextBillingUpdateExtra(account *Account, input *Updat
 // Grok media eligibility helpers live in account_grok_media_eligibility.go.
 
 func buildAccountForCreate(input *CreateAccountInput, accountExtra map[string]any) (*Account, error) {
+	if input.Platform == PlatformTypeSafe && input.Type != AccountTypeAPIKey {
+		return nil, errors.New("typesafe accounts only support apikey credentials")
+	}
 	// Probe/session state is system-managed. New accounts always start with automatic refresh disabled.
 	delete(accountExtra, UpstreamBillingProbeEnabledExtraKey)
 	delete(accountExtra, UpstreamBillingRateSyncEnabledExtraKey)
@@ -595,6 +598,9 @@ func (s *adminServiceImpl) UpdateAccount(ctx context.Context, id int64, input *U
 	}
 	// Platform 在更新路径不可变，只需用生效后的 type 复核平台×类型组合。
 	if input.Type != "" {
+		if account.Platform == PlatformTypeSafe && input.Type != AccountTypeAPIKey {
+			return nil, errors.New("typesafe accounts only support apikey credentials")
+		}
 		if err := validateCPRAccountShape(account.Platform, input.Type); err != nil {
 			return nil, err
 		}

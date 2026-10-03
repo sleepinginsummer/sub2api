@@ -17,13 +17,10 @@ package gwpool
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -130,6 +127,10 @@ const (
 	// 项数上限导出：调用方要按它裁自己那本账（裁掉哪些由它定，这里只保证不发非法请求）。
 	MaxExcludeItems   = 64
 	maxExcludeItemLen = 64
+	// MaxCookieCount 是 ?count= 的契约上限（池子的 cookieBatchMax）。超限池子**拒掉整条
+	// 请求**（400，不是钳到 5），所以出站前自己先钳 —— 多要几张的代价是多烧几个槽位，
+	// 而整条被拒的代价是一张都拿不到。导出给调用方算批量大小。
+	MaxCookieCount = 5
 	// min_remaining 的契约钳位区间（池子那边也钳，这里先钳是为了别发一个必然被改写的值）。
 	minRemainingFloor = 30 * time.Second
 	minRemainingCeil  = time.Hour
@@ -149,6 +150,13 @@ const (
 type Pair struct {
 	// Gateway 形如 "unified-142"。
 	Gateway string
+	// Region 是**铸这张票的出口**所属的大区（池子那九个 key 之一，SPEC 第 4 节）。
+	// 空 = 池子没报（老版本池子 / 它自己也反查不到），消费端按「未归类」处理，不要猜：
+	// 网关 = (大区 × 账号)，同一个网关名在不同账号眼里可能来自不同大区，事后反查不出来。
+	//
+	// 它**不是**「这一发会落在哪个大区」—— cflb 跨出口回放会漂（docs 第四节），
+	// 真实落点只有响应里的新 __oailb 说得准。只做读数，不接任何判定。
+	Region string
 	// Cookie 是直接写进出站 Cookie 头的整串 "__cflb=...; __oailb=..."。
 	Cookie string
 	// ValidFor 是**满血窗口**的剩余量（池子的 valid_for_s），不是 cookie 的有效期。
@@ -157,7 +165,7 @@ type Pair struct {
 	// PairRemaining 是**这张 pair 自己**的剩余寿命（池子的 pair_remaining_s = __cflb 的死期
 	// 减现在）。和 ValidFor 是两根轴：ValidFor = min(满血窗口剩余, pair 剩余)，绝大多数时候
 	// 等于那 183 秒的窗口，分不出 pair 还剩 50 分钟还是 8 分钟 ⇒ 判「这张要不要续」只能用这个。
-	// 0 = 池子没报（还没升级）：消费端按**不续**处理（见 openAIGatewayPoolRenewBelow）。
+	// 0 = 池子没报（还没升级）。消费端目前只读它做日志口径，不据此做任何动作。
 	PairRemaining time.Duration
 	// VerifiedFull 是池子交付前自己验过满血。只做读数，消费端不拿它当闸门。
 	VerifiedFull bool
@@ -197,6 +205,16 @@ type CookieRequest struct {
 	// Wait 是愿意等池子现铸多久。池子只在「没有活票 / 池子空」这两种可等待的失败上等。
 	// **它会被钳到本次调用的死线之内**（见 Cookie）：池子还在等、这边先超时等于白等一场。
 	Wait time.Duration
+	// Count 是一次要几张（池子的 ?count=，1..MaxCookieCount）。0 / 1 = 一张，不带这个参数。
+	//
+	// 只有 Cookies 看它；Cookie 恒取一张。要它是为了省往返：验满血那条路是
+	// 「取一张 → 验 → 不满血再取一张」，每轮一个 HTTP 往返，而池子内部可能顺带现铸
+	// （取票超时默认 25s）。一发拿够之后那 N−1 个往返就没了。
+	//
+	// 代价：拿到的每一张都在池子侧烧掉一个 (账号 × 网关) 槽位。**没发出过字节的剩余票
+	// 必须还回去**（Release），不然批量就是把「可能只烧 1 张」变成「必烧 N 张」，
+	// 而供给是个位数张/小时。
+	Count int
 }
 
 // query 把参数编成 /cookie 的查询串。budget 是本次调用还剩多少时间（≤0 = 没有死线）。
@@ -219,6 +237,11 @@ func (r CookieRequest) query(budget time.Duration) url.Values {
 	}
 	if r.MinRemaining > 0 {
 		query.Set("min_remaining", strconv.Itoa(int(clampDuration(r.MinRemaining, minRemainingFloor, minRemainingCeil).Seconds())))
+	}
+	// count 只在真的要多张时才带：带 count=1 会让池子回批量形状（{tickets:[...]}），
+	// 而单取那条路解的是扁平形状。少发一个参数比两边各写一套解析可靠。
+	if r.Count > 1 {
+		query.Set("count", strconv.Itoa(min(r.Count, MaxCookieCount)))
 	}
 	// wait 的两道钳位：契约上限 30s，以及本次调用的剩余预算。后者**必须是代码**而不是注释——
 	// 调用方把 wait 算错（或配了一个更短的取票超时）时，不该出现「池子等 25s、客户端 8s 就断」。
@@ -362,40 +385,134 @@ func (c *Client) Cookie(ctx context.Context, request CookieRequest) (Pair, error
 	if resp.StatusCode != http.StatusOK {
 		return Pair{}, refusal(resp)
 	}
-	var payload struct {
-		Gateway        string `json:"gateway"`
-		Cookie         string `json:"cookie"`
-		ValidForS      int    `json:"valid_for_s"`
-		VerifiedFull   bool   `json:"verified_full"`
-		TTLIsAdvisory  bool   `json:"ttl_is_advisory"`
-		CookieVersion  string `json:"cookie_version"`
-		PairRemainingS int    `json:"pair_remaining_s"`
-	}
+	var payload cookiePayload
 	if err := json.NewDecoder(io.LimitReader(resp.Body, maxResponseBytes)).Decode(&payload); err != nil {
 		return Pair{}, fmt.Errorf("%w: decode cookie response: %w", ErrPool, err)
 	}
-	// 这里是信任边界（外部服务的响应 → 要带着该账号的 Authorization 发给 chatgpt.com 的头）：
-	// 空 cookie 等于裸打（落点不可控），窗口 ≤0 的 pair 本来就过期，控制字符会劈开出站头。
-	// cookie 名字的收口在消费侧（只留 __cflb / __oailb），这里只拦明显畸形。
-	if strings.TrimSpace(payload.Cookie) == "" {
+	return payload.pair()
+}
+
+// Cookies 一次取**最多** request.Count 张票，每张是不同的落点。
+//
+// 语义照池子那边：拿到一张就算成功，凑不满照样成功（返回的切片短一点）。调用方必须按
+// len(返回值) 办事，别按 Count 办 —— 这是「少等」而不是「保量」的特性。
+//
+// Count ≤ 1 时直接走 Cookie：少发一个参数，响应也是扁平形状。
+//
+// **老池子兼容是承重的，不是防御性检查。** 没升级的池子会把 ?count= 当未知参数静默忽略、
+// 回扁平形状（线上 2026-10-03 那个构建就是）。只解 {tickets:[...]} 的版本会把它读成
+// 「0 张票」⇒ 明明交付成功、槽位真烧了，调用方却当失败重试 ⇒ 每发业务请求白烧一个槽位。
+// 所以这里两种形状一起解：tickets 为空而扁平那份有 cookie ⇒ 按一张处理。
+func (c *Client) Cookies(ctx context.Context, request CookieRequest) ([]Pair, error) {
+	if c == nil {
+		return nil, fmt.Errorf("%w: client is nil", ErrPool)
+	}
+	if request.Count <= 1 {
+		pair, err := c.Cookie(ctx, request)
+		if err != nil {
+			return nil, err
+		}
+		return []Pair{pair}, nil
+	}
+	var budget time.Duration
+	if deadline, ok := ctx.Deadline(); ok {
+		budget = time.Until(deadline)
+	}
+	endpoint := c.endpoint("cookie")
+	if encoded := request.query(budget).Encode(); encoded != "" {
+		endpoint += "?" + encoded
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, fmt.Errorf("%w: build cookie request: %w", ErrPool, err)
+	}
+	resp, err := c.do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+	}()
+	if resp.StatusCode != http.StatusOK {
+		return nil, refusal(resp)
+	}
+	// 内嵌 cookiePayload：批量形状的 tickets[] 和扁平形状在同一个对象上一起解出来。
+	var payload struct {
+		cookiePayload
+		Tickets []cookiePayload `json:"tickets"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxResponseBytes)).Decode(&payload); err != nil {
+		return nil, fmt.Errorf("%w: decode cookie response: %w", ErrPool, err)
+	}
+	raw := payload.Tickets
+	if len(raw) == 0 {
+		raw = []cookiePayload{payload.cookiePayload} // 老池子：忽略了 count，回的是一张
+	}
+	// 钳住张数：池子最多给 MaxCookieCount 张，更多只可能来自畸形响应，而每一项都要进出站头。
+	if len(raw) > MaxCookieCount {
+		raw = raw[:MaxCookieCount]
+	}
+	pairs := make([]Pair, 0, len(raw))
+	for i, item := range raw {
+		pair, err := item.pair()
+		if err != nil {
+			// **已经拿到的那几张照用。** 整批丢掉等于把真交付了的槽位白烧掉，而池子那边
+			// 已经记了账；一张都没解出来才算失败。
+			if len(pairs) == 0 && i == len(raw)-1 {
+				return nil, err
+			}
+			continue
+		}
+		pairs = append(pairs, pair)
+	}
+	if len(pairs) == 0 {
+		return nil, fmt.Errorf("%w: cookie response carried no usable ticket", ErrPool)
+	}
+	return pairs, nil
+}
+
+// cookiePayload 是 /cookie 一张票的线上形状。**批量响应里的每一项是同一个形状**
+// （池子的 batchResponse.tickets[]），所以单取和批量共用这一份解析与校验 —— 分两份写
+// 必然走散，而走散的那一半是信任边界。
+type cookiePayload struct {
+	Gateway        string `json:"gateway"`
+	Region         string `json:"region"`
+	Cookie         string `json:"cookie"`
+	ValidForS      int    `json:"valid_for_s"`
+	VerifiedFull   bool   `json:"verified_full"`
+	TTLIsAdvisory  bool   `json:"ttl_is_advisory"`
+	CookieVersion  string `json:"cookie_version"`
+	PairRemainingS int    `json:"pair_remaining_s"`
+}
+
+// pair 校验并转成 Pair。
+//
+// 这里是信任边界（外部服务的响应 → 要带着该账号的 Authorization 发给 chatgpt.com 的头）：
+// 空 cookie 等于裸打（落点不可控），窗口 ≤0 的 pair 本来就过期，控制字符会劈开出站头。
+// cookie 名字的收口在消费侧（只留 __cflb / __oailb），这里只拦明显畸形。
+func (p cookiePayload) pair() (Pair, error) {
+	if strings.TrimSpace(p.Cookie) == "" {
 		return Pair{}, fmt.Errorf("%w: cookie response carried no cookie", ErrPool)
 	}
-	if strings.ContainsFunc(payload.Cookie, func(r rune) bool { return r < 0x20 || r == 0x7f }) {
+	if strings.ContainsFunc(p.Cookie, func(r rune) bool { return r < 0x20 || r == 0x7f }) {
 		return Pair{}, fmt.Errorf("%w: cookie response carried control characters", ErrPool)
 	}
-	if payload.ValidForS <= 0 {
+	if p.ValidForS <= 0 {
 		return Pair{}, fmt.Errorf("%w: cookie response carried a non-positive valid_for_s", ErrPool)
 	}
 	return Pair{
-		Gateway:       sanitizeOpaque(payload.Gateway, maxGatewayLen),
-		Cookie:        strings.TrimSpace(payload.Cookie),
-		ValidFor:      clampDuration(time.Duration(payload.ValidForS)*time.Second, 0, maxValidFor),
-		VerifiedFull:  payload.VerifiedFull,
-		TTLIsAdvisory: payload.TTLIsAdvisory,
-		Version:       sanitizeOpaque(payload.CookieVersion, maxVersionLen),
+		Gateway: sanitizeOpaque(p.Gateway, maxGatewayLen),
+		// 同样过 sanitizeOpaque：池子的响应是信任边界，这个串会进账号 extra 和前端。
+		Region:        sanitizeOpaque(p.Region, maxGatewayLen),
+		Cookie:        strings.TrimSpace(p.Cookie),
+		ValidFor:      clampDuration(time.Duration(p.ValidForS)*time.Second, 0, maxValidFor),
+		VerifiedFull:  p.VerifiedFull,
+		TTLIsAdvisory: p.TTLIsAdvisory,
+		Version:       sanitizeOpaque(p.CookieVersion, maxVersionLen),
 		// 和 ValidFor 同样钳进 [0, maxValidFor]：缺失/负数 ⇒ 0 ⇒ 消费端不续（安全方向），
 		// 报一个大数被钳到 3900s 仍然远在续期阈值之上 ⇒ 同样不续。
-		PairRemaining: clampDuration(time.Duration(payload.PairRemainingS)*time.Second, 0, maxValidFor),
+		PairRemaining: clampDuration(time.Duration(p.PairRemainingS)*time.Second, 0, maxValidFor),
 	}, nil
 }
 
@@ -435,81 +552,6 @@ func (c *Client) Release(ctx context.Context, version string) error {
 		return fmt.Errorf("%w: release returned HTTP %d", ErrPool, resp.StatusCode)
 	}
 	return nil
-}
-
-// Renew 把这一发从上游换回来的**新路由对**回传池子，让它续上这张 pair 的寿命。
-//
-// 为什么只有消费端能做这件事：__cflb 的 3600s 寿命只有**业务请求**能刷新，而刷新的前提是这一发
-// 不带 __oailb（两件齐发时上游什么都不回 —— 2026-10-02 实测 F 组）。池子自己手上没有业务请求，
-// 刷不出来。
-//
-// 回传的是**事实**（一串 cookie），不是判断。别往这个 body 里加满血/降智/质量字段：转发路径上
-// 没有可信的降智判据，带这类字段的 /touch 端点 10-01 就是因为这个被删掉的。
-//
-// 返回池子给**续期后那张票**的新 cookie_version（池子没换票号时为空串，调用方留用旧的）。
-// 调用方把它当**尽力而为**：失败只记日志，不影响业务请求。
-func (c *Client) Renew(ctx context.Context, version, cookie string) (string, error) {
-	if c == nil {
-		return "", fmt.Errorf("%w: client is nil", ErrPool)
-	}
-	version = sanitizeOpaque(version, maxVersionLen)
-	cookie = strings.TrimSpace(cookie)
-	if version == "" || cookie == "" {
-		return "", nil // 没有票号就没法指认续的是哪张；没有新 cookie 就没什么可续。
-	}
-	body, err := json.Marshal(map[string]string{"cookie_version": version, "cookie": cookie})
-	if err != nil {
-		return "", fmt.Errorf("%w: build renew request: %w", ErrPool, err)
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint("pair/renew"), bytes.NewReader(body))
-	if err != nil {
-		return "", fmt.Errorf("%w: build renew request: %w", ErrPool, err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := c.do(req)
-	if err != nil {
-		return "", err
-	}
-	defer func() {
-		_, _ = io.Copy(io.Discard, resp.Body)
-		_ = resp.Body.Close()
-	}()
-	if resp.StatusCode != http.StatusOK {
-		return "", refusal(resp)
-	}
-	var payload struct {
-		OK            bool   `json:"ok"`
-		CookieVersion string `json:"cookie_version"`
-	}
-	if err := json.NewDecoder(io.LimitReader(resp.Body, maxResponseBytes)).Decode(&payload); err != nil {
-		return "", fmt.Errorf("%w: decode renew response: %w", ErrPool, err)
-	}
-	// 200 但 ok=false 是池子明说「没续上」：当失败处理，别把一个没生效的续期记成成功。
-	// valid_for_s 刻意不读：续期延长的是**路由钉死**的寿命，不是满血窗口，而本地到点只能来自
-	// 交付时的 valid_for_s（见消费端 openAIGatewayPoolPair.until）。
-	if !payload.OK {
-		return "", fmt.Errorf("%w: renew was not accepted", ErrPool)
-	}
-	// **信任边界**：票号是我们之后用来还票（/release）和弃票（exclude_versions）的身份，而响应
-	// 是外部输入 —— 池子（或冒充它的东西）回一个属于**别人那张在用票**的票号，之后两个动作就全
-	// 打在别人头上了。票号按契约是 sha256(cookie) 的前 12 位十六进制、确定性可本地复算
-	// （SPEC 第 10 节），所以这里直接复算比对。
-	// 不符就**当池子没换票号**（留用旧的）而不是整次失败：续期本身已经生效了，而旧票号至少
-	// 还是我们自己那张票的身份。池子那边若对 cookie 做了归一化（空格/顺序），这条也会退到这个
-	// 安全方向上。
-	next := sanitizeOpaque(payload.CookieVersion, maxVersionLen)
-	if next != "" && !strings.EqualFold(next, cookieVersionOf(cookie)) {
-		// 票号与 cookie 本体同级：一个字都不进日志。
-		slog.Warn("gwpool_renew_version_mismatch")
-		return "", nil
-	}
-	return next, nil
-}
-
-// cookieVersionOf 按契约复算票号：sha256(cookie) 的前 12 位十六进制。
-func cookieVersionOf(cookie string) string {
-	sum := sha256.Sum256([]byte(cookie))
-	return hex.EncodeToString(sum[:])[:12]
 }
 
 // refusal 把非 200 的响应读成 *PoolError。

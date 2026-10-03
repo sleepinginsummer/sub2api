@@ -182,7 +182,12 @@ export default {
         codexCli: 'Codex CLI',
         codexCliWs: 'Codex CLI (WebSocket)',
         grokCli: 'Grok CLI',
+        systemOne: 'System One',
         opencode: 'OpenCode',
+      },
+      typesafe: {
+        description: 'Call Jev through the native TypeSafe System One endpoint.',
+        note: 'System One is non-streaming and is not compatible with Chat Completions, Responses, Claude Code, or Codex clients.',
       },
       antigravity: {
         description: 'Configure API access for Antigravity group. Select the configuration method based on your client.',
@@ -401,6 +406,7 @@ export default {
     cyber: 'Cyber',
     live: 'Live',
     probe: 'Hunter probe',
+    gwpoolDegraded: 'Degraded (dropped)',
     unknown: 'Unknown',
     in: 'In',
     out: 'Out',

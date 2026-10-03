@@ -2570,7 +2570,7 @@
              配置全在账号级：池子的 consumer key 是按账号发的。 -->
         <div
           v-if="accountSupportsGatewayPool"
-          class="space-y-3 border-t border-gray-200 pt-4 dark:border-dark-600"
+          class="space-y-3 rounded-lg border border-gray-200 p-4 dark:border-dark-600"
           data-testid="edit-openai-gwpool-section"
         >
           <div class="flex items-center justify-between gap-4">
@@ -2621,20 +2621,6 @@
             </div>
             <div class="flex items-center justify-between gap-4">
               <div class="min-w-0">
-                <label class="input-label mb-0 text-xs">{{ t('admin.accounts.openai.gwpoolAllModels') }}</label>
-                <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">
-                  {{ t('admin.accounts.openai.gwpoolAllModelsDesc') }}
-                </p>
-              </div>
-              <input
-                v-model="openAIGwpoolAllModels"
-                data-testid="edit-openai-gwpool-all-models"
-                type="checkbox"
-                class="h-4 w-4 flex-shrink-0 rounded border-gray-300 text-primary-600 focus:ring-primary-500"
-              />
-            </div>
-            <div class="flex items-center justify-between gap-4">
-              <div class="min-w-0">
                 <label class="input-label mb-0 text-xs">{{ t('admin.accounts.openai.gwpoolSteering') }}</label>
                 <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">
                   {{ t('admin.accounts.openai.gwpoolSteeringDesc') }}
@@ -2646,6 +2632,31 @@
                 type="checkbox"
                 class="h-4 w-4 flex-shrink-0 rounded border-gray-300 text-primary-600 focus:ring-primary-500"
               />
+            </div>
+            <!-- 后台预热：缺省即关（它在没有客户端等着的时候自己花票）。 -->
+            <div class="flex items-center justify-between gap-4">
+              <div class="min-w-0">
+                <label class="input-label mb-0 text-xs">{{ t('admin.accounts.openai.gwpoolPrewarm') }}</label>
+                <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">
+                  {{ t('admin.accounts.openai.gwpoolPrewarmDesc') }}
+                </p>
+              </div>
+              <input
+                v-model="openAIGwpoolPrewarm"
+                data-testid="edit-openai-gwpool-prewarm"
+                type="checkbox"
+                class="h-4 w-4 flex-shrink-0 rounded border-gray-300 text-primary-600 focus:ring-primary-500"
+              />
+            </div>
+            <!-- 降智防护**没有开关了**（2026-10-03）：接了池子就一律「业务请求只落在验过满血
+                 的槽上」。原来那条三档梯子（off/cut/queue）删了，说明留着 —— 这一档会花票，
+                 运营方得知道钱花在哪。 -->
+            <div>
+              <p class="input-label text-xs">{{ t('admin.accounts.openai.gwpoolGuard') }}</p>
+              <p class="input-hint" data-testid="edit-openai-gwpool-guard-hint">
+                {{ t('admin.accounts.openai.gwpoolGuardDescs.queue') }}
+              </p>
+              <p class="input-hint">{{ t('admin.accounts.openai.gwpoolGuardDesc') }}</p>
             </div>
             <div>
               <p class="input-label text-xs">{{ t('admin.accounts.openai.gwpoolAdvanced') }}</p>
@@ -2672,7 +2683,7 @@
                     min="1"
                     max="86400"
                     step="1"
-                    placeholder="8"
+                    placeholder="25"
                     class="input text-xs"
                     data-testid="edit-openai-gwpool-fetch-timeout"
                     :title="t('admin.accounts.openai.gwpoolFetchTimeoutDesc')"
@@ -2690,6 +2701,20 @@
                     class="input text-xs"
                     data-testid="edit-openai-gwpool-list-timeout"
                     :title="t('admin.accounts.openai.gwpoolListTimeoutDesc')"
+                  />
+                </div>
+                <div>
+                  <label class="input-label text-xs">{{ t('admin.accounts.openai.gwpoolWarmTickets') }}</label>
+                  <input
+                    v-model.number="openAIGwpoolWarmTickets"
+                    type="number"
+                    min="1"
+                    max="8"
+                    step="1"
+                    placeholder="5"
+                    class="input text-xs"
+                    data-testid="edit-openai-gwpool-warm-tickets"
+                    :title="t('admin.accounts.openai.gwpoolWarmTicketsDesc')"
                   />
                 </div>
               </div>
@@ -4053,13 +4078,22 @@ const openAIGwpoolBaseURL = ref('')
 // 输入框恒为空：后端把已存的 key 脱敏成 true，页面从不回显原值。留空 = 不修改。
 const openAIGwpoolConsumerKey = ref('')
 const openAIGwpoolConsumerKeySaved = ref(false)
-const openAIGwpoolAllModels = ref(false)
 // 缺省即开，与后端 gatewayPoolSteering 同口径（只有显式 false 才关）。
 const openAIGwpoolSteering = ref(true)
-// 三个「秒」旋钮：null = 留空 = 用后端默认值（4h / 8s / 2s），不往 extra 里写键。
+// 后台预热缺省即关，与后端 gatewayPoolPrewarmEnabled 同口径（只有显式 true 才开）。
+const openAIGwpoolPrewarm = ref(false)
+// 降智防护**没有档位了**（2026-10-03）：三个老键 openai_gwpool_guard /
+// openai_gwpool_state_echo / openai_gwpool_degraded_retries 都不再读也不再写，页面上那个
+// select 一起删了。存量行里留着它们是无害的死键 —— 但别再接回来，后端也不读了。
+// 续期缺省即关：那一发要摘掉 __oailb 出站，是对真实 Codex 报文形状的偏离，而且从没单独实测过。
+// 三个「秒」旋钮：null = 留空 = 用后端默认值（4h / 25s / 2s），不往 extra 里写键。
+// 占位符要和后端那三个常量一致 —— 它展示的就是「留空会用什么」。
 const openAIGwpoolGatewayWindow = ref<number | null>(null)
 const openAIGwpoolFetchTimeout = ref<number | null>(null)
 const openAIGwpoolListTimeout = ref<number | null>(null)
+// 一轮预热最多试几张票。null = 留空 = 用后端默认值 5，不往 extra 里写键。
+// 后端封顶 8（gatewayPoolWarmMaxTicketsCeiling），越界回默认值。
+const openAIGwpoolWarmTickets = ref<number | null>(null)
 const readGwpoolSeconds = (value: unknown): number | null =>
   typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : null
 
@@ -4442,6 +4476,7 @@ const defaultBaseUrl = computed(() => {
   if (props.account?.platform === 'openai') return 'https://api.openai.com'
   if (props.account?.platform === 'gemini') return 'https://generativelanguage.googleapis.com'
   if (props.account?.platform === 'grok') return 'https://api.x.ai/v1'
+  if (props.account?.platform === 'typesafe') return 'https://api.typesafe.ai'
   // CN 供应商：按当前模式/协议回落到官方预设（清空输入框提交时使用），
   // 不能落到 anthropic 默认值（会被当 CC base 拼出错误端点）。
   if (
@@ -4611,12 +4646,15 @@ const syncFormFromAccount = (newAccount: Account | null) => {
 	// 后端脱敏成 true = 配过；原值不会下发，所以输入框一律从空开始。
 	openAIGwpoolConsumerKeySaved.value = extra?.openai_gwpool_consumer_key === true
 	openAIGwpoolConsumerKey.value = ''
-	openAIGwpoolAllModels.value = extra?.openai_gwpool_all_models === true
 	// 自己挑落点缺省即开：只有显式 false 才算关（与后端同口径）。
 	openAIGwpoolSteering.value = extra?.openai_gwpool_steering !== false
+	// 后台预热缺省即关：只有显式 true 才算开（与后端同口径）。
+	openAIGwpoolPrewarm.value = extra?.openai_gwpool_prewarm === true
+	// 续期缺省即关：只有显式 true 才算开（与后端 gatewayPoolRenew 同口径）。
 	openAIGwpoolGatewayWindow.value = readGwpoolSeconds(extra?.openai_gwpool_gateway_window_s)
 	openAIGwpoolFetchTimeout.value = readGwpoolSeconds(extra?.openai_gwpool_fetch_timeout_s)
 	openAIGwpoolListTimeout.value = readGwpoolSeconds(extra?.openai_gwpool_list_timeout_s)
+	openAIGwpoolWarmTickets.value = readGwpoolSeconds(extra?.openai_gwpool_warm_tickets)
 	openAIImagesUrlToB64JsonEnabled.value = extra?.images_url_to_b64_json === true
 	autoPause5hThreshold.value = typeof extra?.auto_pause_5h_threshold === 'number' ? extra.auto_pause_5h_threshold * 100 : null
 	autoPause7dThreshold.value = typeof extra?.auto_pause_7d_threshold === 'number' ? extra.auto_pause_7d_threshold * 100 : null
@@ -4909,6 +4947,8 @@ const syncFormFromAccount = (newAccount: Account | null) => {
           ? 'https://generativelanguage.googleapis.com'
           : newAccount.platform === 'grok'
             ? 'https://api.x.ai/v1'
+            : newAccount.platform === 'typesafe'
+              ? 'https://api.typesafe.ai'
             : newAccount.platform === 'kimi' ||
                 newAccount.platform === 'zhipu' ||
                 newAccount.platform === 'deepseek' ||
@@ -6221,22 +6261,36 @@ const handleSubmit = async () => {
         if (gwpoolConsumerKey) {
           newExtra.openai_gwpool_consumer_key = gwpoolConsumerKey
         }
-        if (openAIGwpoolAllModels.value) {
-          newExtra.openai_gwpool_all_models = true
-        } else {
-          delete newExtra.openai_gwpool_all_models
-        }
+        // 这两个键 2026-10-02 删掉了（覆写范围恒为推理面；续期只会把票换到同大区的另一个
+        // 网关）。保存时顺手清掉老账号 extra 里的残留，别让一个没人读的键留在库里。
+        delete newExtra.openai_gwpool_all_models
+        delete newExtra.openai_gwpool_renew
         // 自己挑落点缺省即开：只有关掉时才落键，省得 extra 里堆默认项（后端也只认显式 false）。
         if (openAIGwpoolSteering.value) {
           delete newExtra.openai_gwpool_steering
         } else {
           newExtra.openai_gwpool_steering = false
         }
-        // 三个「秒」旋钮：留空 / 非正数 = 用后端默认值，所以不落键。
+        // 后台预热缺省即关：只有开着时才落键（后端也只认显式 true）。
+        if (openAIGwpoolPrewarm.value) {
+          newExtra.openai_gwpool_prewarm = true
+        } else {
+          delete newExtra.openai_gwpool_prewarm
+        }
+        // 降智防护的三个档位键 2026-10-03 全删了（接了池子就一律验满血才放行），保存时顺手
+        // 把残留清掉。**刻意不再「同步写一份老键」**：那是为回滚到只认老键的后端留的后路，
+        // 而现在没有哪一档可退 —— 留着反而会让回滚后的后端把一个本该验满血的号读成 off。
+        delete newExtra.openai_gwpool_guard
+        delete newExtra.openai_gwpool_state_echo
+        delete newExtra.openai_gwpool_degraded_retries
+        // 三个「秒」旋钮 + 试票张数：留空 / 非正数 = 用后端默认值，所以不落键。
+        // 试票张数后端还封了个 8 的上限，越界同样回默认值 —— 这里不另做钳位，让后端那一处
+        // 当唯一真源（前端 input 的 max 只是提示，管理 API 和批量导入绕得过去）。
         for (const [key, value] of [
           ['openai_gwpool_gateway_window_s', openAIGwpoolGatewayWindow.value],
           ['openai_gwpool_fetch_timeout_s', openAIGwpoolFetchTimeout.value],
-          ['openai_gwpool_list_timeout_s', openAIGwpoolListTimeout.value]
+          ['openai_gwpool_list_timeout_s', openAIGwpoolListTimeout.value],
+          ['openai_gwpool_warm_tickets', openAIGwpoolWarmTickets.value]
         ] as const) {
           if (typeof value === 'number' && Number.isFinite(value) && value > 0) {
             newExtra[key] = Math.floor(value)

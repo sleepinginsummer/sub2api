@@ -15,15 +15,19 @@ func TestGatewayPoolHTTPRouteSnapshotSurvivesSharedSinkOverwrite(t *testing.T) {
 	pool := newGwpoolFakePool(t, gwpoolTestPairCookie(t, "unified-142"), 150)
 	account := pool.account(1)
 	svc := &OpenAIGatewayService{httpUpstream: &cookieRecordingUpstream{}}
-	ctx, sink := withOpenAIGatewayPoolSink(context.Background())
+	ctx, sink := withOpenAIGatewayPoolSink(context.Background(), nil)
+	sink.notePoolLive(4)
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, gwpoolTestURL, strings.NewReader("{}"))
 	require.NoError(t, err)
-	response, err := svc.doOpenAIUpstream(request, "", account)
+	request.Header.Set(openAICodexTurnStateHeader, gwpoolEchoLiveTicket)
+	response, _, err := svc.doOpenAIUpstreamOnce(request, "", account)
 	require.NoError(t, err)
 	defer func() { require.NoError(t, response.Body.Close()) }()
 	frozen := openAIGatewayPoolAppliedFromResponse(response)
 	require.Equal(t, "tkt-1", frozen.Version)
 	require.Equal(t, "unified-142", frozen.Gateway)
+	require.Equal(t, 4, frozen.PoolLive, "验满血阶段的池供给读数必须保留到业务响应")
+	require.Equal(t, "full", frozen.Verdict, "必须冻结响应后的 state-echo 判定")
 
 	// 模拟同账号的另一发在首发完成记账前取得不同路由和票号。
 	sink.mark(OpenAIGatewayPoolApplied{

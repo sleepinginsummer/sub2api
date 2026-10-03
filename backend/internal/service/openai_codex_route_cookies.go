@@ -60,17 +60,6 @@ func routePairOf(candidates []string) string {
 	return strings.Join(out, "; ")
 }
 
-// routePairItem 从 routePairOf 的产物里取出一项（"name=value"，没有这一项就返回空串）。
-func routePairItem(pair, name string) string {
-	for _, item := range strings.Split(pair, ";") {
-		item = strings.TrimSpace(item)
-		if itemName, _, _ := strings.Cut(item, "="); itemName == name {
-			return item
-		}
-	}
-	return ""
-}
-
 // Set-Cookie 一行一对，属性段（Path/Max-Age/...）在第一个 ";" 之后，丢掉。
 func openAICodexRoutePairFromSetCookie(h http.Header) string {
 	var candidates []string
@@ -194,8 +183,32 @@ func usageCodexRoutePairOverriddenPtr(account *Account, fromPool bool) *bool {
 	return &fromPool
 }
 
-// usageCodexRoutePairPoolGatewayPtr 记池子交付时说的那个网关：与 route_gateway 比对就知道注入
-// 被不被上游接受（见 routePairInUse）。没走池子 / 池子没报出网关名时为 nil。
+// usageCodexRouteRegion 判这一发的落点能不能归到池子说的那个大区上。
+//
+// 只有「池子说的网关 == 这一发实际在用的网关」时才算：不一致说明上游把这一发改派走了
+// （见 routePairInUse），池子那个大区讲的是另一个网关的事，记上去会把落点归到错的大区，
+// 于是账号卡片上「这个号在哪个大区还有没烧过的落点」直接答错。宁可留空（显示未归类）。
+func usageCodexRouteRegion(poolGateway, inUseGateway, region string) string {
+	if !usageCodexRouteLandedOnPoolGateway(poolGateway, inUseGateway) {
+		return ""
+	}
+	return strings.TrimSpace(region)
+}
+
+// usageCodexRouteLandedOnPoolGateway 是上面那道判断本身。抽出来是因为 state-echo 的判定读数
+// （openAIGatewaySeen.Verdict）要用**同一个**谓词：判据问的也是池子那个网关，改派时同样不能
+// 把结论挂到实际落点上。两处各写一份的话只在「名字两边没有空白」时同义。
+func usageCodexRouteLandedOnPoolGateway(poolGateway, inUseGateway string) bool {
+	poolGateway = strings.TrimSpace(poolGateway)
+	return poolGateway != "" && poolGateway == strings.TrimSpace(inUseGateway)
+}
+
+// usageCodexRoutePairPoolGatewayPtr 记池子交付时说的那个网关。没走池子 / 池子没报出网关名时为 nil。
+//
+// 和 route_gateway 比对**只能单向**读：两者不同 ⇒ 上游下发了新 __oailb 把这一发改派走了，
+// 注入被拒（这是真观测）。两者相同 ⇒ 上游什么都没回、route_gateway 读的就是我们自己发出去
+// 那张 ⇒ **没有观测到落点**，不是「注入被接受」的确认。健康请求本来就一个 cookie 都不回，
+// 所以那条「相同即接受」的读法恒为真、无法证伪（见 UsageLog.RouteGateway）。
 func usageCodexRoutePairPoolGatewayPtr(gateway string) *string {
 	gateway = strings.TrimSpace(gateway)
 	if gateway == "" {

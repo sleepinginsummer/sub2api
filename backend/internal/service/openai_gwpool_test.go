@@ -48,6 +48,10 @@ const (
 	// gwpoolTestAccountQuery 是每次问池子都会带的那一段：一把 consumer key 能替多个上游账号取票，
 	// 槽位必须记在**这一发真正要用的那个上游账号**上（身份串里的 chatgpt_account_id）。
 	gwpoolTestAccountQuery = "account=acc-a"
+	// gwpoolTestCookieQuery 是业务路径上 /cookie 必带的那一段。count 来自
+	// gatewayPoolBatchTickets：一次取够期望用量，剩下的上架（poolSpare）。
+	// 和 gwpoolTestAccountQuery 分开写是因为 /gateways 不带 count。
+	gwpoolTestCookieQuery = gwpoolTestAccountQuery + "&count=3"
 )
 
 // gwpoolFakeGateway 是假池子 /gateways 里的一项，字段名与池子契约一致。
@@ -95,6 +99,10 @@ type gwpoolFakePool struct {
 	// （用来复现「取到票之后、发送之前客户端就走了」）。
 	omitVersion bool
 	onCookie    func()
+	// batchGateways 非空 = 这个池子认 count，回 {tickets:[...]} 那个形状，每张一个落点。
+	// 默认空 ⇒ **不管带不带 count 都回扁平那一张**，也就是线上那台老池子（d6edc7e）的行为
+	// —— 本文件其余用例因此全是老池子兼容的回归测试。
+	batchGateways []string
 }
 
 func newGwpoolFakePool(t *testing.T, cookie string, validForS int) *gwpoolFakePool {
@@ -129,6 +137,23 @@ func newGwpoolFakePool(t *testing.T, cookie string, validForS int) *gwpoolFakePo
 			cookie := fake.cookie
 			if forced && fake.forceCookie != "" {
 				cookie = fake.forceCookie
+			}
+			if want, _ := strconv.Atoi(r.URL.Query().Get("count")); want > 1 && len(fake.batchGateways) > 0 {
+				tickets := make([]string, 0, want)
+				for i, name := range fake.batchGateways {
+					if i >= want {
+						break
+					}
+					tickets = append(tickets, `{"gateway":"`+name+`","cookie":"`+
+						gwpoolTestPairCookie(t, name)+`","valid_for_s":`+strconv.Itoa(fake.validForS)+
+						`,"verified_full":true,"ttl_is_advisory":true,"cookie_version":"tkt-`+name+`"}`)
+				}
+				_, _ = io.WriteString(w, `{"tickets":[`+strings.Join(tickets, ",")+
+					`],"count":`+strconv.Itoa(len(tickets))+`,"want":`+strconv.Itoa(want)+`}`)
+				if fake.onCookie != nil {
+					fake.onCookie()
+				}
+				return
 			}
 			gateway := fake.gateway
 			if steered := r.URL.Query().Get("gateway"); steered != "" {
@@ -215,6 +240,10 @@ func newGwpoolFakePool(t *testing.T, cookie string, validForS int) *gwpoolFakePo
 }
 
 // configure 把这个假池子的地址与 consumer key 写进账号 extra。
+//
+// **不再钉档位**：降智防护的档位 2026-10-03 删了，预热现在是无条件的。这个文件里的用例测的是
+// 取票/还票/注入协议，它们直接调 AttachRoute / gatewayPoolPair，走不到预热那条路（预热的入口
+// 只有 doOpenAIUpstream）。少数走转发入口的用例自己负责把预热那条路也配出来。
 func (f *gwpoolFakePool) configure(accounts ...*Account) {
 	for _, acct := range accounts {
 		acct.Extra[openAIGatewayPoolBaseURLExtraKey] = f.baseURL
@@ -291,18 +320,6 @@ func gwpoolCookieVersion(cookie string) string {
 	return hex.EncodeToString(sum[:])[:12]
 }
 
-// nextRenew 取下一次 POST /pair/renew 的请求体（续期是异步的，这里顺带当同步点用）。
-func (f *gwpoolFakePool) nextRenew(t *testing.T) string {
-	t.Helper()
-	select {
-	case body := <-f.renewBodies:
-		return body
-	case <-time.After(3 * time.Second):
-		t.Fatal("没有回传续期")
-		return ""
-	}
-}
-
 // attachRoute 调 AttachRoute 并丢掉还票闭包：这组用例关心的是出站 cookie 与错误。
 // 还票本身在 TestGatewayPoolReleases* 里单独测。
 func attachRoute(
@@ -326,7 +343,7 @@ func attachRouteApplied(
 	headers http.Header,
 ) OpenAIGatewayPoolApplied {
 	t.Helper()
-	ctx, sink := withOpenAIGatewayPoolSink(context.Background())
+	ctx, sink := withOpenAIGatewayPoolSink(context.Background(), nil)
 	_, err := store.AttachRoute(ctx, account, rawURL, headers)
 	require.NoError(t, err)
 	result := &OpenAIForwardResult{}
@@ -338,6 +355,100 @@ func attachRouteApplied(
 func gwpoolTestPairCookie(t *testing.T, gateway string) string {
 	t.Helper()
 	return "__cflb=pool-lb; __oailb=" + routeCookieTestOailb(t, "chat.gateway."+gateway+".api.openai.com")
+}
+
+// ---------------------------------------------------------------------------
+// 批量取票 + 备用票架子（/cookie?count=，poolSpare）
+// ---------------------------------------------------------------------------
+
+// 一次取够、换票那几轮**一个 HTTP 往返都不打**。
+//
+// 这是整件事的目的：预热循环的形状是「标 Stale → 再取一张」，而取票最坏吃满
+// gatewayPoolFetchTimeout（默认 25s，池子现铸时真会到），三轮就把 90 秒的预热预算
+// 花在往返上。弹架子是纯内存操作。
+func TestGatewayPoolBatchServesRotationFromTheSpareShelf(t *testing.T) {
+	fake := newGwpoolFakePool(t, "", 150)
+	fake.batchGateways = []string{"unified-11", "unified-22", "unified-33"}
+	store := &openAICodexCookieStore{}
+	acct := fake.account(1)
+
+	first := http.Header{}
+	require.NoError(t, attachRoute(context.Background(), store, acct, gwpoolTestURL, first))
+	require.Equal(t, gwpoolTestPairCookie(t, "unified-11"), first.Get("Cookie"), "先用批里第一张")
+	require.EqualValues(t, 1, fake.hits.Load())
+	require.Contains(t, fake.nextQuery(t), "count=3")
+
+	// 架子上那两张**不进本地账本**：没碰过的落点记进去等于把一个全新的单元自己锁 4 小时。
+	for _, spare := range []string{"unified-22", "unified-33"} {
+		require.False(t, store.gatewayPoolUsedRecently(gwpoolTestIdentity, spare, time.Hour),
+			"备用票还没出过字节，不许记账本: %s", spare)
+	}
+
+	// 换票两轮：都从架子上弹，池子一次都不再被打。
+	for _, want := range []string{"unified-22", "unified-33"} {
+		cacheKey := openAIGatewayPoolCacheKey(acct, gwpoolTestIdentity)
+		cached, _ := store.cachedPoolPair(cacheKey)
+		store.gatewayPoolMarkStale(cacheKey, cached.version, cached.gateway)
+		rotated := http.Header{}
+		require.NoError(t, attachRoute(context.Background(), store, acct, gwpoolTestURL, rotated))
+		require.Equal(t, gwpoolTestPairCookie(t, want), rotated.Get("Cookie"))
+		require.EqualValues(t, 1, fake.hits.Load(), "换到 %s 不许再敲池子", want)
+		require.True(t, store.gatewayPoolUsedRecently(gwpoolTestIdentity, want, time.Hour),
+			"弹出去的那张要记账本: %s", want)
+	}
+
+	// 架子空了 ⇒ 第四轮才真的再取一批。
+	cacheKey := openAIGatewayPoolCacheKey(acct, gwpoolTestIdentity)
+	cached, _ := store.cachedPoolPair(cacheKey)
+	store.gatewayPoolMarkStale(cacheKey, cached.version, cached.gateway)
+	require.NoError(t, attachRoute(context.Background(), store, acct, gwpoolTestURL, http.Header{}))
+	require.EqualValues(t, 2, fake.hits.Load(), "架子空了才再取")
+	require.Contains(t, fake.nextQuery(t), "force=1", "再取仍然要点明换网关")
+}
+
+// 架子上躺过头的备用票直接丢：不记账本、不还、也不拿出去用。
+//
+// 丢而不用：一张票按身份缓存、窗口内所有请求共用，只剩几秒等于下一发立刻再取一张
+// （openAIGatewayPoolMinRemaining 的口径）。**不记账本**同上。
+func TestGatewayPoolBatchDropsAgedSpares(t *testing.T) {
+	// valid_for_s=30 < openAIGatewayPoolMinRemaining(60) ⇒ 一取回来备用票就已经过门槛。
+	// 第一张照常用（取票路径不过这道闸：min_remaining 是请求参数、不是池子的承诺）。
+	fake := newGwpoolFakePool(t, "", 30)
+	fake.batchGateways = []string{"unified-11", "unified-22", "unified-33"}
+	store := &openAICodexCookieStore{}
+	acct := fake.account(1)
+
+	first := http.Header{}
+	require.NoError(t, attachRoute(context.Background(), store, acct, gwpoolTestURL, first))
+	require.Equal(t, gwpoolTestPairCookie(t, "unified-11"), first.Get("Cookie"),
+		"剩余寿命不够也要把这一发发出去，不许判死")
+
+	cacheKey := openAIGatewayPoolCacheKey(acct, gwpoolTestIdentity)
+	cached, _ := store.cachedPoolPair(cacheKey)
+	store.gatewayPoolMarkStale(cacheKey, cached.version, cached.gateway)
+	require.NoError(t, attachRoute(context.Background(), store, acct, gwpoolTestURL, http.Header{}))
+	require.EqualValues(t, 2, fake.hits.Load(), "架子上全过门槛 ⇒ 老老实实再取一批")
+	for _, spare := range []string{"unified-22", "unified-33"} {
+		require.False(t, store.gatewayPoolUsedRecently(gwpoolTestIdentity, spare, time.Hour),
+			"丢掉的备用票不许留在账本里: %s", spare)
+	}
+	require.EqualValues(t, 0, fake.releaseHits.Load(), "过了池子租约还不回去，别白打一发 /release")
+}
+
+// 老池子（线上那台 d6edc7e）**不认 count**：它把未知参数静默忽略、回扁平那一张。
+//
+// 这条必须钉死：按批量形状解析的客户端会把那次响应读成「0 张票」，而槽位是真烧了。
+func TestGatewayPoolBatchFallsBackWhenPoolIgnoresCount(t *testing.T) {
+	fake := newGwpoolFakePool(t, gwpoolTestPairCookie(t, "unified-142"), 150) // batchGateways 为空 = 老池子
+	store := &openAICodexCookieStore{}
+
+	headers := http.Header{}
+	require.NoError(t, attachRoute(context.Background(), store, fake.account(1), gwpoolTestURL, headers))
+	require.Equal(t, gwpoolTestPairCookie(t, "unified-142"), headers.Get("Cookie"))
+	pair, state := store.cachedPoolPair(openAIGatewayPoolCacheKey(fake.account(1), gwpoolTestIdentity))
+	require.Equal(t, openAIGatewayPoolPairLive, state)
+	require.Equal(t, "unified-142", pair.gateway)
+	require.EqualValues(t, 0, fake.releaseHits.Load(), "只有一张，没有备用票要还")
 }
 
 // ---------------------------------------------------------------------------
@@ -464,7 +575,7 @@ func TestDoOpenAIUpstreamGatewayPoolReplacesOnlyRouteCookies(t *testing.T) {
 	for range 3 {
 		req, err := http.NewRequest(http.MethodPost, gwpoolTestURL, strings.NewReader("{}"))
 		require.NoError(t, err)
-		resp, err := svc.doOpenAIUpstream(req, "", acct)
+		resp, err := gwpoolRunOnce(svc, req, acct)
 		require.NoError(t, err)
 		_ = resp.Body.Close()
 	}
@@ -495,7 +606,7 @@ func TestGatewayPoolNeverReportsTouch(t *testing.T) {
 	for range 2 {
 		req, err := http.NewRequest(http.MethodPost, gwpoolTestURL, strings.NewReader("{}"))
 		require.NoError(t, err)
-		resp, err := svc.doOpenAIUpstream(req, "", acct)
+		resp, err := gwpoolRunOnce(svc, req, acct)
 		require.NoError(t, err)
 		_ = resp.Body.Close()
 	}
@@ -585,6 +696,10 @@ func TestOpenAIWSIngressBridgesGatewayPoolAccountToHTTP(t *testing.T) {
 	poolCookie := gwpoolTestPairCookie(t, "unified-142")
 	fake := newGwpoolFakePool(t, poolCookie, 150)
 	fake.configure(account)
+	// 预热 2026-10-03 起无条件跑在 doOpenAIUpstream 里，而这个假上游只有**一个**响应体
+	// （一个 strings.Reader）：让垫话先把它读空，桥那一发就只剩 EOF。测的是 WS→HTTP 的桥，
+	// 不是预热，所以先塞一张已验满血的票把预热那条快路点亮。
+	gwpoolEchoSeedVerified(t, svc, account)
 	dialer := &codexWSStagedDialer{conns: []openAIWSClientConn{&openAIWSCaptureConn{}}}
 	svc.openaiWSPassthroughDialer = dialer
 
@@ -892,7 +1007,7 @@ func TestGatewayPoolForcesRotationAfterWindow(t *testing.T) {
 	headers := http.Header{}
 	require.NoError(t, attachRoute(context.Background(), store, acct, gwpoolTestURL, headers))
 	require.Equal(t, first, headers.Get("Cookie"))
-	require.Equal(t, gwpoolTestAccountQuery, fake.nextQuery(t), "正常路径不带 force")
+	require.Equal(t, gwpoolTestCookieQuery, fake.nextQuery(t), "正常路径不带 force")
 
 	// 把窗口拨到过去，模拟 valid_for_s 到点。
 	store.poolPairs.Store(openAIGatewayPoolCacheKey(acct, gwpoolTestIdentity), openAIGatewayPoolPair{
@@ -903,7 +1018,7 @@ func TestGatewayPoolForcesRotationAfterWindow(t *testing.T) {
 	require.Equal(t, fake.forceCookie, rotated.Get("Cookie"), "到期后要换成池子新给的那张")
 	// force 说「换个网关」，exclude_versions 说「这张具体的票不行」，exclude 是本地账本里还在
 	// 窗口内的那些 —— 三样一起带，池子才知道换什么、避开什么。
-	require.Equal(t, gwpoolTestAccountQuery+"&exclude=unified-142&exclude_versions=tkt-1&force=1",
+	require.Equal(t, gwpoolTestCookieQuery+"&exclude=unified-142&exclude_versions=tkt-1&force=1",
 		fake.nextQuery(t))
 	require.EqualValues(t, 2, fake.hits.Load())
 }
@@ -926,7 +1041,7 @@ func TestGatewayPoolForceNoSlotFailsClosed(t *testing.T) {
 		err := attachRoute(context.Background(), store, acct, gwpoolTestURL, headers)
 		require.ErrorIs(t, err, gwpool.ErrNoSlot)
 		require.Empty(t, headers.Get("Cookie"), "失败时一个 cookie 都不许写出去")
-		require.Equal(t, gwpoolTestAccountQuery+"&exclude_versions=tkt-stale&force=1",
+		require.Equal(t, gwpoolTestCookieQuery+"&exclude_versions=tkt-stale&force=1",
 			fake.nextQuery(t), "过期那张还在缓存里，下一发仍要换、仍要点名排除它")
 	}
 	require.EqualValues(t, 2, fake.hits.Load(), "一次失败一次请求，不许自动重试")
@@ -950,7 +1065,7 @@ func TestGatewayPoolPicksUnburntGateway(t *testing.T) {
 	headers := http.Header{}
 	require.NoError(t, attachRoute(context.Background(), store, fake.account(1), gwpoolTestURL, headers))
 	require.Equal(t, poolCookie, headers.Get("Cookie"))
-	require.Equal(t, gwpoolTestAccountQuery+"&gateway=unified-167", fake.nextQuery(t), "必须点名，而不是让池子随便给")
+	require.Equal(t, gwpoolTestCookieQuery+"&gateway=unified-167", fake.nextQuery(t), "必须点名，而不是让池子随便给")
 	require.Equal(t, gwpoolTestAccountQuery, <-fake.listQueries,
 		"列网关也要报上游账号，否则 used_by_you 是上传者的历史")
 	require.EqualValues(t, 1, fake.listHits.Load(), "一次取票只列一次网关")
@@ -970,14 +1085,14 @@ func TestGatewayPoolPicksLeastRecentlyUsedCandidate(t *testing.T) {
 				{Name: "unified-183", PairReady: true, LastUsedAt: "2026-10-01T06:00:00Z"},
 				{Name: "unified-165", PairReady: true, LastUsedAt: "2026-10-01T11:00:00Z"},
 			},
-			want: gwpoolTestAccountQuery + "&gateway=unified-183",
+			want: gwpoolTestCookieQuery + "&gateway=unified-183",
 		},
 		"从没碰过的优先": {
 			gateways: []gwpoolFakeGateway{
 				{Name: "unified-167", PairReady: true, LastUsedAt: "2026-10-01T06:00:00Z"},
 				{Name: "unified-183", PairReady: true},
 			},
-			want: gwpoolTestAccountQuery + "&gateway=unified-183",
+			want: gwpoolTestCookieQuery + "&gateway=unified-183",
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -1007,22 +1122,47 @@ func TestGatewayPoolFallsBackToBareTakeWhenListUnavailable(t *testing.T) {
 			headers := http.Header{}
 			require.NoError(t, attachRoute(context.Background(), store, fake.account(1), gwpoolTestURL, headers))
 			require.Equal(t, poolCookie, headers.Get("Cookie"), "列不出来也必须照常拿到票")
-			require.Equal(t, gwpoolTestAccountQuery, fake.nextQuery(t), "退回裸取：不带 gateway")
+			require.Equal(t, gwpoolTestCookieQuery, fake.nextQuery(t), "退回裸取：不带 gateway")
 			require.EqualValues(t, 1, fake.listHits.Load())
 			require.EqualValues(t, 1, fake.hits.Load())
 		})
 	}
 }
 
-// 一个候选都挑不出来（池子侧全烧过 / 没活 pair，加上本地账本排掉的那个）⇒ 同样裸取。
-func TestGatewayPoolFallsBackToBareTakeWhenEveryCandidateIsBurnt(t *testing.T) {
+// 有活 pair 的候选**全在本地账本窗口里** ⇒ 不再裸取，而是轮到「我们自己碰得最早」的那个，
+// 并且**把它从 exclude 里摘掉**（池子对「点名的又在排除名单里」是按排除办，不摘等于没点名）。
+//
+// 为什么不裸取：裸取是把选择权交回池子，而本地那 4 小时窗口是个保守估计
+// （docs/conventions/codex-full-strength-tickets.md 明说没测准）—— 「全都在窗口内」不等于
+// 「全都还降智」，碰得最早的那个是最可能已经恢复的。真没恢复也不会发出降智的票：池子自己那条
+// (消费账号 × 网关) 冷却过滤还在，它认得的烧灼它会拒。
+func TestGatewayPoolRotatesToTheOldestBurntCandidateInsteadOfBareTake(t *testing.T) {
+	poolCookie := gwpoolTestPairCookie(t, "unified-142")
+	fake := newGwpoolFakePool(t, poolCookie, 150)
+	fake.listGateways = []gwpoolFakeGateway{
+		{Name: "unified-126", PairReady: true, UsedByYou: true}, // 池子说这张是你自己正拿着的
+		{Name: "unified-195"},                  // 没活 pair
+		{Name: "unified-167", PairReady: true}, // 本地 1 分钟前碰过
+		{Name: "unified-84", PairReady: true},  // 本地 3 小时前碰过 ⇒ 轮到它
+	}
+	store := &openAICodexCookieStore{}
+	store.poolUsed.Store(gatewayPoolLedgerKey(gwpoolTestIdentity, "unified-167"), time.Now().Add(-time.Minute))
+	store.poolUsed.Store(gatewayPoolLedgerKey(gwpoolTestIdentity, "unified-84"), time.Now().Add(-3*time.Hour))
+
+	headers := http.Header{}
+	require.NoError(t, attachRoute(context.Background(), store, fake.account(1), gwpoolTestURL, headers))
+	require.Equal(t, poolCookie, headers.Get("Cookie"))
+	require.Equal(t, gwpoolTestCookieQuery+"&exclude=unified-167&gateway=unified-84", fake.nextQuery(t),
+		"点名碰得最早那个，并把它自己从 exclude 里摘掉；别的烧过的照旧带着")
+}
+
+// 一个有活 pair 的候选都没有（池子侧全烧过 / 没活 pair）⇒ 仍然裸取，账本带成 exclude。
+func TestGatewayPoolFallsBackToBareTakeWhenNothingIsSteerable(t *testing.T) {
 	poolCookie := gwpoolTestPairCookie(t, "unified-142")
 	fake := newGwpoolFakePool(t, poolCookie, 150)
 	fake.listGateways = []gwpoolFakeGateway{
 		{Name: "unified-126", PairReady: true, UsedByYou: true},
 		{Name: "unified-195"},
-		// 池子还认为这个可用，但本地账本里 4 小时内碰过（下面种进去）。
-		{Name: "unified-167", PairReady: true},
 	}
 	store := &openAICodexCookieStore{}
 	store.gatewayPoolMarkUsed(gwpoolTestIdentity, "unified-167")
@@ -1030,7 +1170,7 @@ func TestGatewayPoolFallsBackToBareTakeWhenEveryCandidateIsBurnt(t *testing.T) {
 	headers := http.Header{}
 	require.NoError(t, attachRoute(context.Background(), store, fake.account(1), gwpoolTestURL, headers))
 	require.Equal(t, poolCookie, headers.Get("Cookie"), "挑不出来也要拿到票，落点交给池子")
-	require.Equal(t, gwpoolTestAccountQuery+"&exclude=unified-167", fake.nextQuery(t),
+	require.Equal(t, gwpoolTestCookieQuery+"&exclude=unified-167", fake.nextQuery(t),
 		"挑不出来就不许点名，但账本要带成 exclude —— 裸取恰恰是最需要它的时候")
 }
 
@@ -1085,7 +1225,7 @@ func TestGatewayPoolLedgerIsKeyedByCredentialIdentityNotRowID(t *testing.T) {
 	// 行 1 取票：167 从没碰过 ⇒ 挑它，并记进账本。
 	headers := http.Header{}
 	require.NoError(t, attachRoute(context.Background(), store, fake.account(1), gwpoolTestURL, headers))
-	require.Equal(t, gwpoolTestAccountQuery+"&gateway=unified-167", fake.nextQuery(t))
+	require.Equal(t, gwpoolTestCookieQuery+"&gateway=unified-167", fake.nextQuery(t))
 	require.True(t, store.gatewayPoolUsedRecently(gwpoolTestIdentity, "unified-167", time.Hour))
 
 	// 把缓存那张拨到过期，逼下一发重新取票（否则同身份直接复用窗口内那张）。
@@ -1096,7 +1236,7 @@ func TestGatewayPoolLedgerIsKeyedByCredentialIdentityNotRowID(t *testing.T) {
 	rotated := http.Header{}
 	require.NoError(t, attachRoute(context.Background(), store, fake.account(35), gwpoolTestURL, rotated))
 	require.Equal(t, second, rotated.Get("Cookie"))
-	require.Equal(t, gwpoolTestAccountQuery+"&exclude=unified-167&force=1&gateway=unified-183",
+	require.Equal(t, gwpoolTestCookieQuery+"&exclude=unified-167&force=1&gateway=unified-183",
 		fake.nextQuery(t), "另一个本地行不许再去碰 167：点名避开它，exclude 也要带上它")
 
 	// 同一个 chatgpt_account_id、另一个 chatgpt_user_id（例如工作区里的第二个人）：对 OpenAI
@@ -1107,14 +1247,14 @@ func TestGatewayPoolLedgerIsKeyedByCredentialIdentityNotRowID(t *testing.T) {
 	require.NotEqual(t, gwpoolTestIdentity, openAIGatewayPoolAccountKey(sameAccountOtherUser),
 		"前提：它是另一个凭证域身份，所以共用账本只能来自账号粒度的收敛")
 	require.NoError(t, attachRoute(context.Background(), store, sameAccountOtherUser, gwpoolTestURL, http.Header{}))
-	require.Equal(t, gwpoolTestAccountQuery+"&exclude=unified-167,unified-183&gateway=unified-165", fake.nextQuery(t),
+	require.Equal(t, gwpoolTestCookieQuery+"&exclude=unified-167,unified-183&gateway=unified-165", fake.nextQuery(t),
 		"同账号另一个 user 不许再去碰 167 / 183")
 
 	// 另一个上游账号是另一本账，不受影响，照样挑 167。
 	other := fake.account(37)
 	other.Credentials = map[string]any{"chatgpt_account_id": "acc-b", "chatgpt_user_id": "user-b"}
 	require.NoError(t, attachRoute(context.Background(), store, other, gwpoolTestURL, http.Header{}))
-	require.Equal(t, "account=acc-b&gateway=unified-167", fake.nextQuery(t),
+	require.Equal(t, "account=acc-b&count=3&gateway=unified-167", fake.nextQuery(t),
 		"另一个上游账号：报自己的 account，且不受别人那本账影响")
 }
 
@@ -1157,7 +1297,10 @@ func TestDoOpenAIUpstreamGatewayPoolNoSlotFailsClosed(t *testing.T) {
 	// 罐里有一张能回放的 pair：也不许用。
 	svc.codexCookies.Store(acct, gwpoolTestURL, codexCookieUpstreamResponse())
 
-	req, err := http.NewRequest(http.MethodPost, gwpoolTestURL, strings.NewReader("{}"))
+	// 体里必须带 model：预热现在无条件跑（档位 2026-10-03 删了），读不出 model 会先死在
+	// errOpenAIGatewayPoolWarmNoModel 上，根本走不到池子 —— 那就测不到这条用例要测的东西。
+	// 带上之后预热自己去取票、撞上 503，错误原样抛出来，和它要钉的失败形态是同一个。
+	req, err := http.NewRequest(http.MethodPost, gwpoolTestURL, strings.NewReader(gwpoolEchoBody1))
 	require.NoError(t, err)
 	resp, err := svc.doOpenAIUpstream(req, "", acct)
 	require.ErrorIs(t, err, gwpool.ErrNoSlot)
@@ -1417,10 +1560,9 @@ func TestGatewayPoolInferencePathMatchesCodexURL(t *testing.T) {
 		"chatgptCodexURL=%s", chatgptCodexURL)
 }
 
-// 默认只给 Codex 推理面覆写：侧信道（装饰性 GET）、/codex/alpha/search 这些也打在 chatgpt.com
-// 上，给它们取票等于白烧一个 (上游账号 × 网关) 单位。开 openai_gwpool_all_models 回到
-// 「所有 chatgpt.com 请求都覆写」。
-func TestAttachRouteOnlyOverridesInferenceFaceByDefault(t *testing.T) {
+// **只给 Codex 推理面覆写，没有开关**：侧信道（装饰性 GET）、/codex/alpha/search 这些也打在
+// chatgpt.com 上，给它们取票等于白烧一个 (上游账号 × 网关) 单位，而供给是个位数张/小时。
+func TestAttachRouteOnlyOverridesInferenceFace(t *testing.T) {
 	poolCookie := gwpoolTestPairCookie(t, "unified-142")
 	fake := newGwpoolFakePool(t, poolCookie, 150)
 	store := &openAICodexCookieStore{}
@@ -1446,13 +1588,13 @@ func TestAttachRouteOnlyOverridesInferenceFaceByDefault(t *testing.T) {
 	require.Contains(t, headers.Get("Cookie"), poolCookie)
 	require.Equal(t, int64(1), fake.hits.Load())
 
-	// 开关打开：非推理面也覆写（接这个开关之前的行为）。
-	acct.Extra[openAIGatewayPoolAllModelsExtraKey] = true
+	// 取过票之后再打非推理面：缓存里有票也不许用，照样落回罐。
 	headers = http.Header{}
 	require.NoError(t, attachRoute(context.Background(), store, acct,
 		"https://chatgpt.com/backend-api/codex/alpha/search", headers))
-	require.Contains(t, headers.Get("Cookie"), poolCookie)
-	require.Equal(t, int64(1), fake.hits.Load(), "窗口内复用同一张，不该再取一次")
+	require.Contains(t, headers.Get("Cookie"), "__oailb=jwt-1")
+	require.NotContains(t, headers.Get("Cookie"), poolCookie)
+	require.Equal(t, int64(1), fake.hits.Load(), "非推理面一张票都不许取")
 }
 
 // 四个旋钮的默认值必须等于接它们之前的写死值；配坏了（0 / 负数 / 非数字）也回默认，
@@ -1463,7 +1605,6 @@ func TestGatewayPoolAccountKnobDefaults(t *testing.T) {
 	require.Equal(t, openAIGatewayPoolListTimeout, bare.gatewayPoolListTimeout())
 	require.Equal(t, openAIGatewayPoolGatewayWindow, bare.gatewayPoolGatewayWindow())
 	require.True(t, bare.gatewayPoolSteering(), "自己挑落点缺省即开")
-	require.False(t, bare.gatewayPoolAllModels())
 
 	// 超大值也算配坏：time.Duration 是纳秒级 int64，秒数到 1e10 就乘溢出成**负数** ⇒
 	// 本地账本整体静默失效（gatewayPoolUsedRecently 恒 false），与「窗口越大越严」正好相反；
@@ -1487,7 +1628,6 @@ func TestGatewayPoolAccountKnobDefaults(t *testing.T) {
 		openAIGatewayPoolListTimeoutExtraKey:   float64(5), // jsonb 解出来是 float64
 		openAIGatewayPoolGatewayWindowExtraKey: 7200,
 		openAIGatewayPoolSteeringExtraKey:      false,
-		openAIGatewayPoolAllModelsExtraKey:     true,
 	}}
 	require.Equal(t, 20*time.Second, tuned.gatewayPoolFetchTimeout())
 	require.Equal(t, 5*time.Second, tuned.gatewayPoolListTimeout())
@@ -1498,7 +1638,6 @@ func TestGatewayPoolAccountKnobDefaults(t *testing.T) {
 	}}
 	require.Equal(t, 24*time.Hour, atCap.gatewayPoolGatewayWindow())
 	require.False(t, tuned.gatewayPoolSteering())
-	require.True(t, tuned.gatewayPoolAllModels())
 
 	// 只有显式 false 才关掉「自己挑落点」：写错类型不能把它关掉（那会静默改变调度行为）。
 	require.True(t, (&Account{Extra: map[string]any{openAIGatewayPoolSteeringExtraKey: "false"}}).gatewayPoolSteering())
@@ -1517,6 +1656,55 @@ func TestGatewayPoolSteeringOffSkipsGatewayListing(t *testing.T) {
 	require.Equal(t, int64(1), fake.hits.Load())
 	require.Zero(t, fake.listHits.Load(), "关掉自己挑落点就不该列网关")
 	require.NotContains(t, fake.nextQuery(t), "gateway=", "不许点名")
+}
+
+// 2026-10-02 现场：池子回 consumer_rejected（"需要本账号的 key"，owner 一拆 key 就换了），
+// 客户端收到的却是「网关池当前没有满血槽位……稍后重试即可」。此刻池子有 51 个空闲网关、
+// 51 张活票，一个槽位都不缺——文案把「要人去改配置」说成了「供给不够，等等再来」，
+// 而后面 300 秒退避期里每一发都是同一句，运维对着它查不出是 key 的问题。
+//
+// 根因：pkg/gwpool 把 11 个错误码**全部** Unwrap 到 ErrNoSlot，于是 gatewayPoolClientMessage
+// 的判序里 ErrNoSlot 先命中，gatewayPoolUnavailableClientMsg（原文就带「检查账号的池子地址与
+// consumer key」）永远够不着。分流线按**「重试会不会好」**划，不按谁的责任。
+func TestGatewayPoolClientMessageSplitsHopelessCodes(t *testing.T) {
+	msg := func(code string) string {
+		return gatewayPoolClientMessage(gatewayPoolClientError(
+			fmt.Errorf("take: %w", &gwpool.PoolError{Code: code, Status: http.StatusServiceUnavailable})))
+	}
+	// 重试不会好：要人去改 key / 改参数。
+	for _, code := range []string{gwpool.CodeConsumerRejected, gwpool.CodeBadRequest} {
+		require.Contains(t, msg(code), "网关池不可用或配置有误", code)
+	}
+	// 会自愈：「稍后重试即可」对它们是**对的**，不要改。
+	for _, code := range []string{
+		gwpool.CodeAllCooling, gwpool.CodeNoLivePair, gwpool.CodeNoGateway, gwpool.CodeMintFailed,
+		gwpool.CodeRateLimited, gwpool.CodeNoExit, gwpool.CodePublicClosed, gwpool.CodeUpstreamRejected,
+	} {
+		require.Contains(t, msg(code), "网关池当前没有满血槽位", code)
+	}
+	// 没报码（池子回了集合外的值）⇒ 仍按供给不足，别凭空升级成「你配错了」。
+	require.Contains(t, msg(""), "网关池当前没有满血槽位")
+}
+
+// 退避期间的那一发也要说得出原因：原来退避错误是裸的 fmt.Errorf(ErrNoSlot)，
+// 码在 gwpool_backoff_started 那一行之后就丢了，于是 300 秒里全报「没有满血槽位」。
+func TestGatewayPoolBackoffErrorCarriesCode(t *testing.T) {
+	store := &openAICodexCookieStore{}
+	const identity = "acct-1"
+	fake := newGwpoolFakePool(t, gwpoolTestPairCookie(t, "unified-142"), 150)
+	account := fake.account(1)
+	cacheKey := openAIGatewayPoolCacheKey(account, identity)
+	store.poolBackoff.Store(gatewayPoolLedgerIdentity(cacheKey),
+		gatewayPoolBackoffEntry{Until: time.Now().Add(5 * time.Minute), Code: gwpool.CodeConsumerRejected})
+
+	remaining, code := store.gatewayPoolBackoffFor(cacheKey)
+	require.Greater(t, remaining, 4*time.Minute)
+	require.Equal(t, gwpool.CodeConsumerRejected, code)
+
+	_, _, err := store.gatewayPoolPair(context.Background(), account, identity)
+	require.ErrorIs(t, err, gwpool.ErrNoSlot, "退避仍然是「这一发没拿到票」")
+	require.Contains(t, gatewayPoolClientMessage(gatewayPoolClientError(err)), "网关池不可用或配置有误",
+		"退避期里也要指向 consumer key，不能继续说槽位不够")
 }
 
 // 池子侧失败的报错要能看懂（双语单串，转发面没有 i18n 协商通道），同时必须保住两件事：

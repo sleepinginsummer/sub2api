@@ -13,9 +13,40 @@ func (s *OpenAIGatewayService) SetPluginManager(manager *PluginManager) {
 
 // doOpenAIUpstream 只在 OpenAI OAuth 能力绑定已启用时把真实请求交给插件。
 // 插件返回标准 http.Response，响应解析、错误映射、SSE 和计费仍由现有核心链处理。
+//
+// 这里还夹着 state-echo 降智判据（openai_gwpool_state_echo.go）。判定点落在这一层是因为它同时
+// 满足两个条件：响应头已经到手，而调用方还一个字节都没往下游写（调用方要等这个函数返回才开始
+// 解析响应）。所以「截断」在这里是干净的，不会留一个半截的 SSE 流。
 func (s *OpenAIGatewayService) doOpenAIUpstream(request *http.Request, proxyURL string, account *Account) (*http.Response, error) {
-	if err := requireOpenAIProxyBinding(account, proxyURL); err != nil {
+	// 业务请求只落在**验过满血**的槽上。判据跑在这一发之前、用便宜的垫话，所以用户的请求不会是
+	// 那个去试网关的人（openai_gwpool_warm.go）。验不出来就把错误往上抛，**绝不降级放行**。
+	// 没有档位可关：2026-10-03 删了（见 openai_gwpool_state_echo.go 文件头）。
+	if err := s.gatewayPoolWarmUp(request, proxyURL, account); err != nil {
 		return nil, err
+	}
+	resp, degraded, err := s.doOpenAIUpstreamOnce(request, proxyURL, account)
+	if !degraded {
+		return resp, err
+	}
+	// 判到降智就**只截断**，不在这里换票重发：重发走 AttachRoute 换一张没验过的票就把用户的
+	// prompt 打出去，而判据对首轮请求结构性失效（没送 turn-state ⇒ 没有回声），所以「客户端
+	// 无感」实际是「降智静默交付」。
+	// 当前 pair 已标 Stale ⇒ 下一发客户端请求的 AttachRoute 自然带 force=1 换网关。
+	s.dropDegradedGatewayPoolRoute(request, resp, account)
+	return nil, errOpenAIGatewayPoolRouteDegraded
+}
+
+// doOpenAIUpstreamOnce 发一发上游，并把 state-echo 判据跑在 Store **之前**。
+//
+// 顺序是承重的：判到降智这张票就不要了，再去 Store 它的 Set-Cookie 等于给一条已经废掉的
+// 路由延命。
+func (s *OpenAIGatewayService) doOpenAIUpstreamOnce(
+	request *http.Request,
+	proxyURL string,
+	account *Account,
+) (*http.Response, bool, error) {
+	if err := requireOpenAIProxyBinding(account, proxyURL); err != nil {
+		return nil, false, err
 	}
 	// ChatGPT cookie 回放（openai_codex_cookies.go）：出站前带上该账号罐里的 cookie，拿到响应
 	// 后收 Set-Cookie。插件路径与直连路径都经过这里，两条路一致。
@@ -27,11 +58,13 @@ func (s *OpenAIGatewayService) doOpenAIUpstream(request *http.Request, proxyURL 
 	}
 	// 每个实际 HTTP 请求单独冻结票据，避免同一转发上下文中的侧信道或重试覆盖读数。
 	parentSink := openAIGatewayPoolSinkFrom(request.Context())
-	requestCtx, poolSink := withOpenAIGatewayPoolSink(request.Context())
+	requestCtx, poolSink := withOpenAIGatewayPoolSink(request.Context(), nil)
+	poolSink.noteModel(parentSink.modelOf())
+	poolSink.notePoolLive(parentSink.snapshot().PoolLive)
 	request = request.WithContext(requestCtx)
 	release, err := s.codexCookies.AttachRoute(request.Context(), account, rawURL, request.Header)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if applied := poolSink.snapshot(); applied.Cookie != "" {
 		parentSink.mark(applied)
@@ -42,28 +75,30 @@ func (s *OpenAIGatewayService) doOpenAIUpstream(request *http.Request, proxyURL 
 	// **之前**，一个字节都没出去 ⇒ 槽位还给池子（见 gatewayPoolReleasesUnsent）。
 	if ctxErr := request.Context().Err(); ctxErr != nil {
 		gatewayPoolReleaseUnsent(release)
-		return nil, ctxErr
+		return nil, false, ctxErr
 	}
 	resp, err := s.doOpenAIUpstreamRoundTrip(request, proxyURL, account)
 	if err == nil && resp != nil {
-		// 插件可能不返回 Request，也可能返回重定向后的 Request；仅补入本次快照，保持其它响应属性。
-		if pair, ok := request.Context().Value(openAIGatewayPoolRoutePairContextKey{}).(OpenAIGatewayPoolApplied); ok {
+		degraded := s.gatewayPoolRouteDegraded(request, resp, account)
+		// 判据先补齐本次读数，再冻结响应快照；共享上下文后续变化不能改写它。
+		if applied := poolSink.snapshot(); applied.Cookie != "" {
+			parentSink.mark(applied)
+			parentSink.notePoolLive(applied.PoolLive)
 			if resp.Request == nil {
 				resp.Request = request
-			} else {
-				resp.Request = resp.Request.WithContext(context.WithValue(resp.Request.Context(), openAIGatewayPoolRoutePairContextKey{}, pair))
 			}
+			resp.Request = resp.Request.WithContext(context.WithValue(resp.Request.Context(), openAIGatewayPoolRoutePairContextKey{}, applied))
+		}
+		if degraded {
+			return resp, true, nil
 		}
 		s.codexCookies.Store(account, rawURL, resp.Header)
-		// 取票后的第一发（且票临期）会摘掉 __oailb 出站，换回来的那张新 __cflb 要回传池子续寿命。
-		// 异步 + 自带 ctx，绝不拖业务响应；没抢到名额 / 上游没下发新两件时它什么都不做。
-		s.codexCookies.gatewayPoolRenew(request.Context(), account, resp.Header)
-		return resp, nil
+		return resp, false, nil
 	}
 	if gatewayPoolReleasesUnsent(resp, err) {
 		gatewayPoolReleaseUnsent(release)
 	}
-	return resp, err
+	return resp, false, err
 }
 
 // gatewayPoolReleasesUnsent 判「这一发一个字节都没发出去」，决定取到的池子票要不要还。
