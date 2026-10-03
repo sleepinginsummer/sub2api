@@ -59,6 +59,15 @@ func TestIsMigrationChecksumCompatible(t *testing.T) {
 		require.True(t, ok)
 	})
 
+	t.Run("249仅兼容已执行的原版checksum", func(t *testing.T) {
+		const name = "249_allow_gwpool_degraded_usage_request_type.sql"
+		const oldChecksum = "69926e5ae314202dc32894dd34506ae8e3b364c895fcd03d0495689ec57ff492"
+		const newChecksum = "c4e32d5cd57ee7504b35740e5eed075c62fec997b48aa3a836b46054235480fe"
+		require.True(t, isMigrationChecksumCompatible(name, oldChecksum, newChecksum))
+		require.False(t, isMigrationChecksumCompatible(name, "unknown", newChecksum))
+		require.False(t, isMigrationChecksumCompatible(name, oldChecksum, "unknown"))
+	})
+
 	t.Run("非白名单迁移不兼容", func(t *testing.T) {
 		ok := isMigrationChecksumCompatible(
 			"001_init.sql",

@@ -397,8 +397,8 @@ const windowUsage = computed(() => {
   const free = history.value.pool_free
   // **两个字段都在**才算测到。只看 live 的话，klno.3 及更早写下的记录（有 live、没有
   // pool_free）会把缺字段当成 0，渲染出「可交付 61 个，其中 0 个没烧过」—— 正是这次要修
-  // 的那句假话，换了个来源。后端那边 pool_free 刻意不带 omitempty，所以真的 0 会出现在
-  // JSON 里，缺席只可能是老记录。
+  // 的那句假话，换了个来源。后端用可空字段保留未测量状态，实测 0 仍明确写入 JSON。
+  // 缺字段代表尚未取得剩余数，历史刷新也不能将它变成测得 0。
   const measured = live > 0 && typeof free === 'number'
   return { used, live, free: measured ? (free as number) : 0, measured }
 })

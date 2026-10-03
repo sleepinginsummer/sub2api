@@ -6,6 +6,8 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"os"
+	"os/exec"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -434,6 +436,18 @@ func attachInflightSnapshot(svc *GatewayService, snap *inflightSnapshotCacheStub
 
 // 已定价模型永不查账号映射；随机未定价模型名不直接查库、不产生按模型名的缓存（内存有界）。
 func TestInflightEstimate_AccountMappingNoDBAndBoundedMemory(t *testing.T) {
+	// HeapAlloc 是整个进程的读数；用独立测试进程隔离其它用例的后台任务和缓存，
+	// 仍执行相同的 20000 次请求、零查库与 8 MiB 内存上限断言。
+	const childFlag = "SUB2API_TEST_INFLIGHT_MEMORY_CHILD"
+	if os.Getenv(childFlag) != "1" {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestInflightEstimate_AccountMappingNoDBAndBoundedMemory$", "-test.count=1", "-test.timeout=25s")
+		cmd.Env = append(os.Environ(), childFlag+"=1")
+		output, err := cmd.CombinedOutput()
+		require.NoError(t, err, "独立进程中的内存和业务断言失败：%s", output)
+		return
+	}
 	groupID := int64(40)
 	svc := newInflightEstimateGateway(t, nil)
 	snap := &inflightSnapshotCacheStub{byBucket: map[string][]Account{inflightBucketKey(groupID, PlatformAnthropic): {

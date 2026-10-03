@@ -7,9 +7,12 @@
 -- 刻意不做本地估算：编出来的数字进了计费表，事后没人分得清哪条是真的。
 --
 -- 与 244 同型，只放宽 CHECK 上界。
+-- 用量表是热表：有界等待锁，仅校验后续写入，避免启动时扫描全部历史行。
+SET LOCAL lock_timeout = '5s';
+
 ALTER TABLE usage_logs
     DROP CONSTRAINT IF EXISTS usage_logs_request_type_check;
 
 ALTER TABLE usage_logs
     ADD CONSTRAINT usage_logs_request_type_check
-    CHECK (request_type >= 0 AND request_type <= 7);
+    CHECK (request_type >= 0 AND request_type <= 7) NOT VALID;

@@ -25,7 +25,9 @@ import (
 // 一次降智，而那条路本来就有 state-echo 兜着），**不许反过来当「这个落点还能用」**（会把
 // 别的行烧掉的窗口当成没烧）。前者就是 gatewayPoolHydrateUsed；后者仍然只信
 // gatewayPoolUsedRecently 那本内存账。
-const openAIGatewayHistoryExtraKey = "openai_gwpool_gateways"
+// OpenAIGatewayHistoryExtraKey 用于仓储识别需要锁内合并的历史更新。
+const OpenAIGatewayHistoryExtraKey = "openai_gwpool_gateways"
+const openAIGatewayHistoryExtraKey = OpenAIGatewayHistoryExtraKey
 
 const (
 	// openAIGatewayHistoryMax 是留多少个网关。
@@ -105,16 +107,14 @@ type openAIGatewayHistory struct {
 	// 负数，夹到 0 就成了「池子用完了」（2026-10-03 现网：账本 67、可交付 62，卡片报成 0）。
 	//
 	// PoolLive=0 = 还没问到过：关了 steering 的号不取清单（gatewayPoolPick 直接返回），
-	// 列表打不开时也不覆盖旧值。卡片在那时只报已用，不编分母。PoolLive>0 时 PoolFree=0
-	// 是**真的 0**（可交付的全烧过了）。
+	// 列表打不开时也不覆盖旧值。卡片在那时只报已用，不编分母。PoolLive>0 且 PoolFree 已
+	// 测量时，PoolFree 指向 0 才表示可交付的全烧过了；nil 则仍是未知。
 	//
 	// 存在账号行上是搭车：池子全局的读数每一行各存一份。新鲜度跟着这一行自己的流量走，
 	// 而那正是要看它的时候。
 	PoolLive int `json:"pool_live,omitempty"`
-	// PoolFree **不能带 omitempty**：带了的话真实的 0（可交付的全烧过了）会被整条省掉，
-	// 和「这条记录是旧版本写的、压根没这个字段」在消费端长得一模一样 —— 而那正是这个字段
-	// 存在的意义。消费端按「两个字段都在」判「这一对测到了」。
-	PoolFree int `json:"pool_free"`
+	// nil 表示尚未测到剩余数；指针保证实测 0 仍写入 JSON，旧记录缺字段则继续缺席。
+	PoolFree *int `json:"pool_free,omitempty"`
 	// UpdatedAt 是写下这条记录的时刻，只用于展示「这份读数有多新」。
 	UpdatedAt time.Time `json:"updated_at"`
 }
@@ -245,7 +245,7 @@ func (s *OpenAIGatewayService) noteOpenAIGatewayUse(
 	// 而那个组合从来没有同时成立过。跟着这条写路径走、不单独穿过节流 —— 它只是展示用的
 	// 读数，下一次正常写就会刷新。
 	if poolLive > 0 {
-		rec.PoolLive, rec.PoolFree = poolLive, poolFree
+		rec.PoolLive, rec.PoolFree = poolLive, &poolFree
 	}
 	rec.UpdatedAt = now
 	pruneOpenAIGatewayHistory(&rec)
@@ -262,9 +262,26 @@ func (s *OpenAIGatewayService) noteOpenAIGatewayUse(
 		account.Extra = map[string]any{}
 	}
 	account.Extra[openAIGatewayHistoryExtraKey] = generic
+	// 持久化只提交本次落点；仓储在行锁内合并，不能用入口旧快照覆盖其它请求。
+	delta := rec
+	delta.Seen = map[string]openAIGatewaySeen{gateway: next}
+	if !advanceCurrent {
+		delta.Current, delta.CurrentRegion = "", ""
+	}
+	if poolLive <= 0 {
+		delta.PoolLive, delta.PoolFree = 0, nil
+	}
+	deltaJSON, err := json.Marshal(delta)
+	if err != nil {
+		return
+	}
+	var update map[string]any
+	if err := json.Unmarshal(deltaJSON, &update); err != nil {
+		return
+	}
 	// 不随请求取消：用量是在响应收尾之后记的，跟着请求 ctx 一起死就等于这条读数永远写不进去。
 	if err := s.accountRepo.UpdateExtra(context.WithoutCancel(ctx), account.ID, map[string]any{
-		openAIGatewayHistoryExtraKey: generic,
+		openAIGatewayHistoryExtraKey: update,
 	}); err != nil {
 		slog.Debug("gwpool_gateway_history_persist_failed", "account_id", account.ID, "error", err)
 	}

@@ -43,20 +43,23 @@ func TestNoteOpenAIGatewayUse(t *testing.T) {
 		rec, ok := readOpenAIGatewayHistory(acct)
 		require.True(t, ok)
 		require.Equal(t, 62, rec.PoolLive)
-		require.Equal(t, 5, rec.PoolFree)
+		require.NotNil(t, rec.PoolFree)
+		require.Equal(t, 5, *rec.PoolFree)
 
 		// 换个网关穿过节流，这一发没问到清单 ⇒ 旧的那一对留着。
 		svc.noteOpenAIGatewayUse(context.Background(), acct, "unified-73", "", "", true, 0, 0, 0)
 		rec, ok = readOpenAIGatewayHistory(acct)
 		require.True(t, ok)
 		require.Equal(t, 62, rec.PoolLive, "没问到清单的那一发把读数抹掉了")
-		require.Equal(t, 5, rec.PoolFree)
+		require.NotNil(t, rec.PoolFree)
+		require.Equal(t, 5, *rec.PoolFree)
 
 		// 可交付的全烧过了：free=0 是**真的 0**，照写。
 		svc.noteOpenAIGatewayUse(context.Background(), acct, "unified-99", "", "", true, 41, 0, 0)
 		rec, _ = readOpenAIGatewayHistory(acct)
 		require.Equal(t, 41, rec.PoolLive)
-		require.Equal(t, 0, rec.PoolFree)
+		require.NotNil(t, rec.PoolFree)
+		require.Equal(t, 0, *rec.PoolFree)
 	})
 
 	t.Run("同一个网关在节流窗口里不再写", func(t *testing.T) {

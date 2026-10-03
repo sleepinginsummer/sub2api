@@ -102,6 +102,8 @@ var migrationChecksumCompatibilityRules = map[string]migrationChecksumCompatibil
 	"240_affiliate_ledger_operation_id.sql": newMigrationChecksumCompatibilityRule("2d378e2750fe88af7c250b6990817b1d351e88bc5cd5211c49fa759abee28728", "3823bfea5f64feb58f5fcebc341c6877eaefc97834b4cd652c8e83ad08ed78da"),
 	// 244 已随 v0.2.7-sleepinsum.1 发布；兼容旧 checksum，让未执行实例采用热表安全版本。
 	"244_allow_probe_usage_request_type.sql": newMigrationChecksumCompatibilityRule("7b543936a7f7cb256274d468e81d01c4f0785942e8ee7163846ca518712cadea", "13a8cd295d5b1105d735e4040d99d0b175934ffe2a800f5a264486d1b26fefce"),
+	// 兼容已执行原版 249 的数据库；未执行实例使用有界锁等待和 NOT VALID。
+	"249_allow_gwpool_degraded_usage_request_type.sql": newMigrationChecksumCompatibilityRule("c4e32d5cd57ee7504b35740e5eed075c62fec997b48aa3a836b46054235480fe", "69926e5ae314202dc32894dd34506ae8e3b364c895fcd03d0495689ec57ff492"),
 }
 
 // ApplyMigrations 将嵌入的 SQL 迁移文件应用到指定的数据库。

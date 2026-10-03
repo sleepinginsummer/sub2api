@@ -337,14 +337,22 @@ func (s *OpenAIGatewayService) dropDegradedGatewayPoolRoute(
 	if resp.Body != nil {
 		_ = resp.Body.Close()
 	}
-	applied := openAIGatewayPoolSinkFrom(request.Context()).snapshot()
+	// HTTP 响应携带首发的完整快照，不能从可能已被后发覆盖的共享 sink 取路由。
+	applied := openAIGatewayPoolAppliedFromResponse(resp)
+	if applied.Cookie == "" {
+		applied = openAIGatewayPoolSinkFrom(request.Context()).snapshot()
+	}
 	// 身份解析对影子行要读一次库：用脱离取消的 ctx，否则客户端刚好断开的那一瞬连标 Stale 都做不了，
 	// 票会留在缓存里被下一发继续拿出去（与 gatewayPoolRenew 同一处取舍）。
 	detached := context.WithoutCancel(request.Context())
 	if identity, err := s.codexCookies.gatewayPoolIdentity(detached, account); err == nil {
 		// 票据状态和验满血起点按池配置隔离，测得时长仍随本次请求返回。
-		openAIGatewayPoolSinkFrom(detached).noteFullHeld(
-			s.codexCookies.gatewayPoolMarkStale(openAIGatewayPoolCacheKey(account, identity), applied.Version, applied.Gateway))
+		held := s.codexCookies.gatewayPoolMarkStale(openAIGatewayPoolCacheKey(account, identity), applied.Version, applied.Gateway)
+		openAIGatewayPoolSinkFrom(detached).noteFullHeld(held)
+		// 落库使用的是这份票据副本，测量后必须补齐副本，不能只更新 sink。
+		if held > 0 {
+			applied.FullHeldMs = held.Milliseconds()
+		}
 		// 账本记的是**实际交付的那个网关**：标 Stale 只让下一发换票，账本才是「这个上游账号
 		// 4 小时内别再点这个落点」的依据。
 		s.codexCookies.gatewayPoolMarkUsed(identity, applied.Gateway)

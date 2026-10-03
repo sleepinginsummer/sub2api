@@ -2762,20 +2762,32 @@ func (r *accountRepository) UpdateExtra(ctx context.Context, id int64, updates m
 
 	clearProbeSnapshot := upstreamBillingProbeExplicitlyDisabled(updates) || upstreamBillingProbeSnapshotClearRequested(updates)
 	durableSchedulerChange := shouldEnqueueSchedulerOutboxForExtraUpdates(updates) || clearProbeSnapshot
+	_, mergeGatewayHistory := updates[service.OpenAIGatewayHistoryExtraKey]
 	baseCtx := ctx
 	contextTx := dbent.TxFromContext(ctx)
 	client := clientFromContext(ctx, r.client)
 	var tx *dbent.Tx
-	if durableSchedulerChange && contextTx == nil {
+	if (durableSchedulerChange || mergeGatewayHistory) && contextTx == nil {
 		var txErr error
 		tx, txErr = r.client.Tx(ctx)
-		if txErr != nil && !errors.Is(txErr, dbent.ErrTxStarted) {
+		if txErr != nil && (mergeGatewayHistory || !errors.Is(txErr, dbent.ErrTxStarted)) {
 			return txErr
 		}
 		if tx != nil {
 			defer func() { _ = tx.Rollback() }()
 			ctx = dbent.NewTxContext(ctx, tx)
 			client = tx.Client()
+		}
+	}
+	if mergeGatewayHistory {
+		// 行锁必须覆盖读取、合并和写入，进程内 mutex 无法保护多实例。
+		updates, err = mergeLockedGatewayHistoryExtra(ctx, client, id, updates)
+		if err != nil {
+			return err
+		}
+		payload, err = json.Marshal(updates)
+		if err != nil {
+			return err
 		}
 	}
 	extraExpression := "COALESCE(extra, '{}'::jsonb) || $1::jsonb"
@@ -2806,21 +2818,15 @@ func (r *accountRepository) UpdateExtra(ctx context.Context, id int64, updates m
 		if err := enqueueSchedulerOutbox(ctx, client, service.SchedulerOutboxEventAccountChanged, &id, nil, nil); err != nil {
 			return err
 		}
-		if tx != nil {
-			if err := tx.Commit(); err != nil {
-				return err
-			}
+	}
+	if tx != nil {
+		if err := tx.Commit(); err != nil {
+			return err
 		}
-		if contextTx == nil {
-			r.syncSchedulerAccountSnapshot(baseCtx, id)
-		}
-	} else {
-		// 观测型 extra 字段不需要触发 bucket 重建，但仍同步单账号快照，
-		// 让 sticky session / GetAccount 命中缓存时也能读到最新数据，
-		// 同时避免缓存局部 patch 覆盖掉并发写入的其它账号字段。
-		if dbent.TxFromContext(ctx) == nil {
-			r.syncSchedulerAccountSnapshot(ctx, id)
-		}
+	}
+	if contextTx == nil {
+		// 自有事务提交后才读取最新整行并刷新缓存，保持观测字段的调度中立语义。
+		r.syncSchedulerAccountSnapshot(baseCtx, id)
 	}
 	return nil
 }
