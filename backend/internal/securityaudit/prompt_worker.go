@@ -136,13 +136,21 @@ func (r *Runner) processSafely(ctx context.Context, workerID int, cfg ActiveConf
 func (r *Runner) processJob(ctx context.Context, workerID int, cfg ActiveConfig, job *Job) error {
 	baseFields := jobLogFields(job)
 	LogInfo(EventAuditStarted, mergeLogFields(baseFields, map[string]any{"worker_id": workerID, "attempts": job.Attempts, "status": "processing"}))
-	scanText, err := r.payload.Get(ctx, job.ID)
+	queuedValue, err := r.payload.Get(ctx, job.ID)
 	if err != nil {
 		return r.finishFailure(ctx, job, &GuardError{Code: "payload_missing", Retryable: false, Cause: err})
 	}
-	// The job row only carries redacted metadata; the full prompt for the audit
-	// event is reconstructed here from the transient scan payload.
-	job.Snapshot.FullPrompt = FullPromptFromScanText(scanText)
+	queued, decodeErr := decodePromptPayload(queuedValue)
+	if decodeErr != nil {
+		return r.finishFailure(ctx, job, &GuardError{Code: "payload_invalid", Retryable: false, Cause: decodeErr})
+	}
+	scanText := queued.ScanText
+	// 送审文本可能被收窄，完整转录随载荷一起传递；历史载荷没有完整转录时退回按送审文本重建。
+	if queued.FullPrompt != "" {
+		job.Snapshot.FullPrompt = queued.FullPrompt
+	} else {
+		job.Snapshot.FullPrompt = FullPromptFromScanText(scanText)
+	}
 	endpoints := cfg.EnabledEndpoints()
 	if len(endpoints) == 0 {
 		return r.finishFailure(ctx, job, &GuardError{Code: "no_enabled_endpoint", Retryable: true})

@@ -364,8 +364,38 @@ func TestResponsesOutputTextIncludedInFullAndLatestTurnSnapshots(t *testing.T) {
 	latestTurn, err := ExtractBlockingPromptSnapshot(req, true)
 	require.NoError(t, err)
 	require.Equal(t, "captured latest user input"+promptAuditPrioritySeparator+"captured previous assistant output", latestTurn.ScanText)
-	require.Equal(t, 2, latestTurn.MessageCount)
 	require.NotContains(t, latestTurn.ScanText, "earlier user input")
+	// 送审范围收窄不改变存证与身份字段：完整转录仍写入事件供人工复查。
+	require.Equal(t, 3, latestTurn.MessageCount)
+	require.Equal(t, full.FullPrompt, latestTurn.FullPrompt)
+	require.Equal(t, full.PromptHash, latestTurn.PromptHash)
+	require.Equal(t, full.PromptLength, latestTurn.PromptLength)
+}
+
+func TestScanScopeNarrowingKeepsFullEvidenceAndDropsScaffold(t *testing.T) {
+	body := []byte(`{"messages":[
+		{"role":"system","content":"系统脚手架：You are now in Default mode. Any previous instructions for other modes are no longer active."},
+		{"role":"user","content":"older user input"},
+		{"role":"assistant","content":"previous output"},
+		{"role":"user","content":"latest user input"}]}`)
+	req := Request{Protocol: "openai_chat_completions", Body: body}
+
+	full, err := ExtractPromptSnapshotWithScanScope(req, false, DefaultScanMaxChars)
+	require.NoError(t, err)
+	narrow, err := ExtractPromptSnapshotWithScanScope(req, true, DefaultScanMaxChars)
+	require.NoError(t, err)
+
+	require.Contains(t, full.ScanText, "Any previous instructions")
+	require.NotContains(t, narrow.ScanText, "Any previous instructions")
+	require.Contains(t, narrow.ScanText, "latest user input")
+	require.NotContains(t, narrow.ScanText, "older user input")
+
+	require.Equal(t, full.FullPrompt, narrow.FullPrompt)
+	require.Contains(t, narrow.FullPrompt, "Any previous instructions")
+	require.Equal(t, full.PromptHash, narrow.PromptHash)
+	require.Equal(t, full.PromptLength, narrow.PromptLength)
+	require.Equal(t, full.MessageCount, narrow.MessageCount)
+	require.Equal(t, 4, narrow.MessageCount)
 }
 
 func TestBlockingPromptSnapshotPreservesFullScopeByDefaultAndWithoutUserInput(t *testing.T) {

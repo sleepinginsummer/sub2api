@@ -39,9 +39,18 @@ func ExtractPromptSnapshotWithLimit(req Request, scanMaxChars int) (PromptSnapsh
 	return extractPromptSnapshot(req, false, scanMaxChars)
 }
 
+// ExtractPromptSnapshotWithScanScope 在保留完整存证的前提下收窄送审范围：
+// latestTurnOnly 为 true 时只送审「最新 user 轮 + 最近一轮 assistant 输出」
+// （与 blocking 同步路径共用同一取段规则），否则送审完整转录。
+// 无论送审范围如何，FullPrompt / PromptHash / PromptLength / MessageCount 都来自完整段，
+// 因此人工复查与跨路径去重口径不变。
+func ExtractPromptSnapshotWithScanScope(req Request, latestTurnOnly bool, scanMaxChars int) (PromptSnapshot, error) {
+	return extractPromptSnapshot(req, latestTurnOnly, scanMaxChars)
+}
+
 // ExtractBlockingPromptSnapshot builds the narrow, low-latency blocking input
-// when configured. Asynchronous auditing always uses ExtractPromptSnapshot so
-// the complete client-controlled transcript is retained for review.
+// when configured. The scan scope is narrowed only when latestTurnOnly is set;
+// stored evidence always keeps the complete transcript.
 func ExtractBlockingPromptSnapshot(req Request, latestTurnOnly bool) (PromptSnapshot, error) {
 	return extractPromptSnapshot(req, latestTurnOnly, DefaultScanMaxChars)
 }
@@ -53,31 +62,36 @@ func ExtractBlockingPromptSnapshotWithLimit(req Request, latestTurnOnly bool, sc
 	return extractPromptSnapshot(req, latestTurnOnly, scanMaxChars)
 }
 
-func extractPromptSnapshot(req Request, latestTurnOnly bool, scanMaxChars int) (PromptSnapshot, error) {
+func extractPromptSnapshot(req Request, scanLatestTurnOnly bool, scanMaxChars int) (PromptSnapshot, error) {
 	var document any
 	if err := json.Unmarshal(req.Body, &document); err != nil {
 		return PromptSnapshot{}, errors.New("prompt audit request JSON is invalid")
 	}
 	extracted := extractProtocolSegments(req.Protocol, document)
-	segments := normalizeSegmentsLatestUserFirst(extracted)
-	if latestTurnOnly {
-		segments = blockingSegmentsLatestUserAndPreviousOutput(extracted)
-	}
-	if len(segments) == 0 {
+	// 存证与身份字段始终取「完整规范化段」；送审范围单独收窄，
+	// 使 FullPrompt / PromptHash / PromptLength / MessageCount 不随送审范围变化。
+	fullSegments := normalizeSegmentsLatestUserFirst(extracted)
+	if len(fullSegments) == 0 {
 		return PromptSnapshot{}, ErrNoPromptText
 	}
-	scanText, metadataText := buildPrioritizedScanText(segments)
-	scanText = truncateScanText(scanText, scanMaxChars)
+	scanSegments := fullSegments
+	if scanLatestTurnOnly {
+		scanSegments = blockingSegmentsLatestUserAndPreviousOutput(extracted)
+	}
+	rawScanText, _ := buildPrioritizedScanText(scanSegments)
+	scanText := truncateScanText(rawScanText, scanMaxChars)
+	metadataText := strings.Join(fullSegments, "\n\n")
 	digest := sha256.Sum256([]byte(metadataText))
 	stage := strings.TrimSpace(req.Stage)
 	if stage == "" {
 		stage = "http"
 	}
-	if original, scanned := utf8.RuneCountInString(metadataText), utf8.RuneCountInString(scanText); scanned < original {
+	if cappedFrom, cappedTo := utf8.RuneCountInString(rawScanText), utf8.RuneCountInString(scanText); cappedTo < cappedFrom {
 		LogInfo(EventScanTextTruncated, map[string]any{
 			"request_id": req.RequestID, "user_id": req.UserID, "api_key_id": req.APIKeyID,
 			"group_id": pointerLogID(req.GroupID), "model": req.Model, "stage": stage,
-			"scan_max_chars": scanMaxChars, "input_chars": original, "scanned_chars": scanned,
+			"scan_max_chars": scanMaxChars, "input_chars": utf8.RuneCountInString(metadataText),
+			"scan_scope_chars": cappedFrom, "scanned_chars": cappedTo,
 			"status": "truncated",
 		})
 	}
@@ -88,7 +102,7 @@ func extractPromptSnapshot(req Request, latestTurnOnly bool, scanMaxChars int) (
 		Endpoint: req.Endpoint, Protocol: req.Protocol, Model: req.Model,
 		PromptHash: hex.EncodeToString(digest[:]), RedactedPreview: BuildPromptPreview(metadataText, DefaultPromptPreviewMaxRunes),
 		FullPrompt:   BuildFullPrompt(metadataText, DefaultFullPromptMaxRunes),
-		PromptLength: utf8.RuneCountInString(metadataText), MessageCount: len(segments), Stage: stage,
+		PromptLength: utf8.RuneCountInString(metadataText), MessageCount: len(fullSegments), Stage: stage,
 		ScanText: scanText,
 	}, nil
 }

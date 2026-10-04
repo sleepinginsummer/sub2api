@@ -40,7 +40,9 @@ func (e *Enqueuer) Enqueue(ctx context.Context, req Request) error {
 		LogWarn(EventEnqueueDropped, mergeLogFields(baseFields, map[string]any{"status": "dropped", "error_code": "no_enabled_endpoint"}))
 		return nil
 	}
-	snapshot, err := ExtractPromptSnapshotWithLimit(req, cfg.ScanMaxChars)
+	// 送审范围与 blocking 同步路径共用同一策略（blocking_latest_turn_only=true 时
+	// 只审「最新 user 轮 + 最近一轮 assistant 输出」）；完整转录仍作为存证写入事件。
+	snapshot, err := ExtractPromptSnapshotWithScanScope(req, cfg.BlockingLatestTurnOnly, cfg.ScanMaxChars)
 	if errors.Is(err, ErrNoPromptText) {
 		LogInfo(EventEnqueueSkipped, mergeLogFields(baseFields, map[string]any{"status": "skipped", "error_code": "no_user_text"}))
 		return nil
@@ -65,7 +67,18 @@ func (e *Enqueuer) Enqueue(ctx context.Context, req Request) error {
 		e.recordDropped()
 		return err
 	}
-	if err := e.payload.Set(ctx, job.ID, snapshot.ScanText, DefaultPayloadTTL); err != nil {
+	// 送审文本与完整转录一次写入同一载荷：worker 用前者扫描、后者存证，
+	// 避免存证完整性依赖第二次写入是否成功。
+	encoded, encodeErr := encodePromptPayload(snapshot.ScanText, snapshot.FullPrompt)
+	if encodeErr != nil {
+		_ = e.repo.MarkStagingFailed(ctx, job.ID, "payload_encode_failed", "payload encode failed")
+		LogWarn(EventEnqueueDropped, mergeLogFields(baseFields, map[string]any{
+			"job_id": job.ID, "status": "dropped", "error_code": "payload_encode_failed",
+		}))
+		e.recordDropped()
+		return encodeErr
+	}
+	if err := e.payload.Set(ctx, job.ID, encoded, DefaultPayloadTTL); err != nil {
 		_ = e.repo.MarkStagingFailed(ctx, job.ID, "payload_store_failed", "payload store unavailable")
 		LogWarn(EventEnqueueDropped, mergeLogFields(baseFields, map[string]any{
 			"job_id": job.ID, "status": "dropped", "error_code": "payload_store_failed",

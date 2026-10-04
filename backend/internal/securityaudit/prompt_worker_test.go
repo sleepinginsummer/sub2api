@@ -70,18 +70,19 @@ type fakeJobRepository struct {
 	retryErr    error
 	failErr     error
 
-	createdSnapshot PromptSnapshot
-	markedCode      string
-	completedResult *NormalizedResult
-	completedStore  bool
-	completeCount   int
-	eventCount      int
-	retryAt         time.Time
-	retryCode       string
-	retried         int
-	failedCode      string
-	failed          int
-	refreshes       int
+	createdSnapshot   PromptSnapshot
+	markedCode        string
+	completedResult   *NormalizedResult
+	completedStore    bool
+	completedSnapshot PromptSnapshot
+	completeCount     int
+	eventCount        int
+	retryAt           time.Time
+	retryCode         string
+	retried           int
+	failedCode        string
+	failed            int
+	refreshes         int
 
 	claimQueue []*Job
 
@@ -139,11 +140,14 @@ func (r *fakeJobRepository) RefreshLease(context.Context, int64, int64, time.Tim
 	r.refreshes++
 	return r.refreshErr
 }
-func (r *fakeJobRepository) Complete(_ context.Context, _ *Job, result *NormalizedResult, storePass bool) (*Event, error) {
+func (r *fakeJobRepository) Complete(_ context.Context, job *Job, result *NormalizedResult, storePass bool) (*Event, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.completeCount++
 	r.completedResult, r.completedStore = result, storePass
+	if job != nil {
+		r.completedSnapshot = job.Snapshot
+	}
 	if r.completeErr != nil {
 		return nil, r.completeErr
 	}
@@ -252,7 +256,11 @@ func TestEnqueuerStagingPayloadPublishProtocolAndFailureCleanup(t *testing.T) {
 		require.NoError(t, enqueuer.Enqueue(context.Background(), asyncRequest()))
 		require.Equal(t, []string{"create_staging", "payload_set", "publish_queued"}, trace)
 		require.Empty(t, repo.createdSnapshot.ScanText)
-		require.Equal(t, "payload canary text", payload.values[41])
+		queued, err := decodePromptPayload(payload.values[41])
+		require.NoError(t, err)
+		require.Equal(t, "payload canary text", queued.ScanText)
+		// 单段请求的完整转录与送审文本一致。
+		require.Equal(t, "payload canary text", queued.FullPrompt)
 		require.Equal(t, DefaultPayloadTTL, payload.setTTL)
 	})
 
@@ -384,6 +392,45 @@ func TestWorkerCompletesPassWithoutEventRefreshesEveryChunkAndDeletesPayload(t *
 	require.Equal(t, []int64{51}, payload.deleted)
 	require.Equal(t, int64(1), metrics.Snapshot().Total)
 	require.Equal(t, int64(1), metrics.Snapshot().Allowed)
+}
+
+// 收窄送审范围后，worker 只能扫描收窄文本，但事件存证必须仍是完整转录。
+func TestAsyncQueueKeepsFullEvidenceWhenScanScopeIsNarrowed(t *testing.T) {
+	cfg := asyncConfig()
+	cfg.BlockingLatestTurnOnly = true
+	body := []byte(`{"messages":[
+		{"role":"system","content":"脚手架：Any previous instructions for other modes are no longer active"},
+		{"role":"user","content":"older user input"},
+		{"role":"assistant","content":"previous output"},
+		{"role":"user","content":"latest user input"}]}`)
+	repo := &fakeJobRepository{createJob: &Job{ID: 77}}
+	payload := &fakePayloadStore{values: map[int64]string{}}
+	require.NoError(t, NewEnqueuer(&fakeConfigStore{cfg: cfg, active: true}, repo, payload).Enqueue(context.Background(),
+		Request{RequestID: "request-evidence", Protocol: "openai_chat_completions", Body: body}))
+
+	queued, err := decodePromptPayload(payload.values[77])
+	require.NoError(t, err)
+	require.NotContains(t, queued.ScanText, "Any previous instructions")
+	require.Contains(t, queued.ScanText, "latest user input")
+	require.Contains(t, queued.FullPrompt, "Any previous instructions")
+	require.Contains(t, queued.FullPrompt, "latest user input")
+
+	var seen []string
+	scanner := PromptScannerFunc(func(_ context.Context, endpoint ActiveEndpoint, chunk string, _ []string) (*NormalizedResult, error) {
+		seen = append(seen, chunk)
+		return &NormalizedResult{Decision: EventPass, RiskLevel: RiskLow, Action: ActionAllow, Safety: "Safe", Categories: []string{}, MatchedScanners: []string{}, ScannerScores: map[string]float64{}, ScannerEvidence: map[string]string{}, GuardEndpointID: endpoint.ID}, nil
+	})
+	job := &Job{ID: 77, ClaimVersion: 1, Attempts: 1, MaxAttempts: 3, ConfigVersion: cfg.ConfigVersion}
+	runner := NewRunner(&fakeConfigStore{cfg: cfg, active: true}, repo, payload, scanner, NewAtomicMetrics())
+	runner.clock = fixedClock{now: time.Unix(300, 0).UTC()}
+	require.NoError(t, runner.processJob(context.Background(), 0, cfg, job))
+
+	require.NotEmpty(t, seen)
+	for _, chunk := range seen {
+		require.NotContains(t, chunk, "Any previous instructions")
+	}
+	require.Contains(t, repo.completedSnapshot.FullPrompt, "Any previous instructions")
+	require.Contains(t, repo.completedSnapshot.FullPrompt, "latest user input")
 }
 
 func TestWorkerRetryBackoffTerminalFailureAndFailover(t *testing.T) {
