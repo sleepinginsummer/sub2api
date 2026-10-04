@@ -45,6 +45,7 @@ func TestGatewayPoolWarmVerificationSeparatesAccountConfigurations(t *testing.T)
 	require.Len(t, first.shots, 2)
 
 	// 未验的新配置不能借旧配置的快路跳过模型检查。
+	b.Extra[openAIGatewayPoolProbeModelExtraKey] = gatewayPoolProbeModelBusiness
 	req, err := http.NewRequest(http.MethodPost, gwpoolTestURL, strings.NewReader("not json"))
 	require.NoError(t, err)
 	require.ErrorIs(t, svc.gatewayPoolWarmUp(req, "", b), errOpenAIGatewayPoolWarmNoModel)

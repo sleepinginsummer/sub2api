@@ -13,6 +13,17 @@ func MergeOpenAIGatewayHistoryExtra(existing, updates map[string]any) (map[strin
 		return nil, fmt.Errorf("invalid gateway history update")
 	}
 	current, _ := readOpenAIGatewayHistory(&Account{Extra: existing})
+	// 冷却账本随凭证域切换，旧域的落点不能污染新域；迟到的旧域写入也不能倒退。
+	if incoming.LedgerTag != "" && current.LedgerTag != "" && incoming.LedgerTag != current.LedgerTag {
+		if incoming.UpdatedAt.Before(current.UpdatedAt) {
+			incoming = openAIGatewayHistory{}
+		} else {
+			current = openAIGatewayHistory{}
+		}
+	}
+	if incoming.LedgerTag != "" {
+		current.LedgerTag = incoming.LedgerTag
+	}
 	currentAt := current.Seen[current.Current].At
 	incomingAt := incoming.Seen[incoming.Current].At
 	if current.Seen == nil {
@@ -34,6 +45,10 @@ func MergeOpenAIGatewayHistoryExtra(existing, updates map[string]any) (map[strin
 		}
 		if next.FullHeldMs <= 0 {
 			next.FullHeldMs = previous.FullHeldMs
+		}
+		// 未测到冷却或旧观察不能擦掉后续学到的冷却参数。
+		if next.Cooldown == nil || (previous.Cooldown != nil && previous.Cooldown.UpdatedAt.After(next.Cooldown.UpdatedAt)) {
+			next.Cooldown = previous.Cooldown
 		}
 		current.Seen[gateway] = next
 	}
@@ -63,5 +78,8 @@ func MergeOpenAIGatewayHistoryExtra(existing, updates map[string]any) (map[strin
 		result[key] = value
 	}
 	result[OpenAIGatewayHistoryExtraKey] = merged
+	if current.LedgerTag != "" {
+		result[openAIGatewayLedgerTagExtraKey] = current.LedgerTag
+	}
 	return result, nil
 }

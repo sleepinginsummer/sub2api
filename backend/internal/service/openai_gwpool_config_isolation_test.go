@@ -73,6 +73,10 @@ func TestGatewayPoolCacheSeparatesConsumerKeys(t *testing.T) {
 	first, second := gwpoolTestPairCookie(t, "unified-142"), gwpoolTestPairCookie(t, "unified-84")
 	calls := make(chan string, 4)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/gateways" {
+			_, _ = w.Write([]byte(`{"gateways":[]}`))
+			return
+		}
 		auth := r.Header.Get("Authorization")
 		calls <- auth
 		pair := first
@@ -84,7 +88,6 @@ func TestGatewayPoolCacheSeparatesConsumerKeys(t *testing.T) {
 	defer srv.Close()
 	store := &openAICodexCookieStore{}
 	account := gwpoolTestAccount(1)
-	account.Extra[openAIGatewayPoolSteeringExtraKey] = false
 	account.Extra[openAIGatewayPoolBaseURLExtraKey] = srv.URL
 	account.Extra[OpenAIGatewayPoolConsumerKeyExtraKey] = "first-key"
 	require.NoError(t, attachRoute(context.Background(), store, account, gwpoolTestURL, http.Header{}))
@@ -117,6 +120,10 @@ func TestGatewayPoolConcurrentDifferentConfigurationsDoNotCoalesce(t *testing.T)
 	release := make(chan struct{})
 	makePool := func(pair string) *httptest.Server {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/gateways" {
+				_, _ = w.Write([]byte(`{"gateways":[]}`))
+				return
+			}
 			entered <- pair
 			<-release
 			_ = json.NewEncoder(w).Encode(map[string]any{"cookie": pair, "valid_for_s": 150})
@@ -134,7 +141,6 @@ func TestGatewayPoolConcurrentDifferentConfigurationsDoNotCoalesce(t *testing.T)
 	results := make(chan error, 2)
 	for i, url := range []string{poolA.URL, poolB.URL} {
 		account := gwpoolTestAccount(int64(i + 1))
-		account.Extra[openAIGatewayPoolSteeringExtraKey] = false
 		account.Extra[openAIGatewayPoolBaseURLExtraKey] = url
 		account.Extra[OpenAIGatewayPoolConsumerKeyExtraKey] = "key"
 		go func() { results <- attachRoute(context.Background(), store, account, gwpoolTestURL, http.Header{}) }()

@@ -308,6 +308,8 @@ type Gateway struct {
 	UsedByYou bool
 	// LastUsedAt 是池子记的「你上次碰它」的时刻。零值 = 没碰过，也是最优候选。
 	LastUsedAt time.Time
+	Cooldown   *CooldownRecommendation
+	Contacts   []ContactStats
 }
 
 // Client 是一个池子实例的客户端。并发安全。
@@ -595,7 +597,7 @@ func refusal(resp *http.Response) error {
 //
 // account 与 Cookie 的那个同义、同样必须带：used_by_you / last_used_at 报的是**那个上游账号的**
 // 槽位历史，不报就变成上传者的历史（见 Cookie 的说明）。空串 = 按上传者算。
-func (c *Client) Gateways(ctx context.Context, account string) ([]Gateway, error) {
+func (c *Client) Gateways(ctx context.Context, account string, accountTag ...string) ([]Gateway, error) {
 	if c == nil {
 		return nil, fmt.Errorf("%w: client is nil", ErrPool)
 	}
@@ -607,6 +609,10 @@ func (c *Client) Gateways(ctx context.Context, account string) ([]Gateway, error
 	if err != nil {
 		return nil, fmt.Errorf("%w: build gateways request: %w", ErrPool, err)
 	}
+	if len(accountTag) > 0 && validCooldownTag(accountTag[0]) {
+		req.Header.Set(cooldownAccountHeader, accountTag[0])
+	}
+	req.Header.Set(cooldownMaxHeader, strconv.Itoa(CooldownMaxSeconds))
 	resp, err := c.do(req)
 	if err != nil {
 		return nil, err
@@ -627,7 +633,9 @@ func (c *Client) Gateways(ctx context.Context, account string) ([]Gateway, error
 			UsedByYou bool   `json:"used_by_you"`
 			// 收成字符串再自己解：池子在「没碰过」时给的是缺省，但给成空串 / null 时
 			// time.Time 会连带让**整份列表**解码失败，而这个字段只用来排序。
-			LastUsedAt string `json:"last_used_at"`
+			LastUsedAt string                  `json:"last_used_at"`
+			Cooldown   *CooldownRecommendation `json:"cooldown"`
+			Contacts   []ContactStats          `json:"contacts"`
 		} `json:"gateways"`
 	}
 	if err := json.NewDecoder(io.LimitReader(resp.Body, maxListBytes)).Decode(&payload); err != nil {
@@ -646,9 +654,19 @@ func (c *Client) Gateways(ctx context.Context, account string) ([]Gateway, error
 		}
 		// 解不开当没碰过（零值）：排序用的字段不值得为格式问题废掉整张列表。
 		lastUsedAt, _ := time.Parse(time.RFC3339, strings.TrimSpace(item.LastUsedAt))
+		if item.Cooldown != nil && !item.Cooldown.Valid() {
+			item.Cooldown = nil
+		}
+		contacts := make([]ContactStats, 0, len(item.Contacts))
+		for _, row := range item.Contacts {
+			if row.Gateway == name && row.Valid() {
+				contacts = append(contacts, row)
+			}
+		}
 		gateways = append(gateways, Gateway{
 			Name: name, PairReady: item.PairReady,
-			UsedByYou: item.UsedByYou, LastUsedAt: lastUsedAt,
+			UsedByYou: item.UsedByYou, LastUsedAt: lastUsedAt, Cooldown: item.Cooldown,
+			Contacts: contacts,
 		})
 	}
 	return gateways, nil

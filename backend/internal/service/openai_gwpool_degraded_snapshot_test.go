@@ -58,6 +58,7 @@ func TestGatewayPoolDegradedUsesFrozenHTTPRoute(t *testing.T) {
 	key := reviewPoolCacheKey(t, &svc.codexCookies)
 	first, _ := svc.codexCookies.cachedPoolPair(key)
 	first.since = time.Now().Add(-3 * time.Minute)
+	first.firstSent = first.since
 	svc.codexCookies.poolPairs.Store(key, first)
 	svc.codexCookies.poolVerified.Store(key, gatewayPoolVerifiedMark{version: first.version, at: time.Now().Add(-time.Minute)})
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, gwpoolTestURL, strings.NewReader("{}"))

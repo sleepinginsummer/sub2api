@@ -41,3 +41,45 @@ func TestGatewayHistoryMergePreservesOtherRequestsAndNewestFacts(t *testing.T) {
 	require.NotNil(t, rec.PoolFree)
 	require.Equal(t, 7, *rec.PoolFree)
 }
+
+func TestGatewayHistoryMergePreservesCooldownAndCredentialDomain(t *testing.T) {
+	now := time.Now().UTC()
+	cooldown := &gatewayPoolCooldown{UpdatedAt: now, WindowSeconds: 7200, Until: now.Add(2 * time.Hour)}
+	existing := map[string]any{OpenAIGatewayHistoryExtraKey: openAIGatewayHistory{
+		LedgerTag: "old-domain", Current: "unified-84", UpdatedAt: now,
+		Seen: map[string]openAIGatewaySeen{"unified-84": {At: now, Cooldown: cooldown}},
+	}}
+	// 新请求没有冷却读数时，行锁合并必须保留先前学习结果。
+	delta := map[string]any{OpenAIGatewayHistoryExtraKey: openAIGatewayHistory{
+		LedgerTag: "old-domain", UpdatedAt: now.Add(time.Minute),
+		Seen: map[string]openAIGatewaySeen{"unified-84": {At: now.Add(time.Minute)}},
+	}}
+	merged, err := MergeOpenAIGatewayHistoryExtra(existing, delta)
+	require.NoError(t, err)
+	rec, ok := readOpenAIGatewayHistory(&Account{Extra: merged})
+	require.True(t, ok)
+	require.Equal(t, cooldown, rec.Seen["unified-84"].Cooldown)
+	require.Equal(t, "old-domain", merged[openAIGatewayLedgerTagExtraKey])
+
+	// 凭证域切换时清掉旧域历史，顶层查询标签与嵌套账本始终一致。
+	switched := map[string]any{OpenAIGatewayHistoryExtraKey: openAIGatewayHistory{
+		LedgerTag: "new-domain", Current: "unified-142", UpdatedAt: now.Add(2 * time.Minute),
+		Seen: map[string]openAIGatewaySeen{"unified-142": {At: now.Add(2 * time.Minute)}},
+	}, openAIGatewayLedgerTagExtraKey: "new-domain"}
+	merged, err = MergeOpenAIGatewayHistoryExtra(merged, switched)
+	require.NoError(t, err)
+	rec, ok = readOpenAIGatewayHistory(&Account{Extra: merged})
+	require.True(t, ok)
+	require.Equal(t, "new-domain", rec.LedgerTag)
+	require.NotContains(t, rec.Seen, "unified-84")
+	require.Equal(t, "unified-142", rec.Current)
+
+	// 迟到的旧域写入不能覆盖新域及其索引标签。
+	merged, err = MergeOpenAIGatewayHistoryExtra(merged, delta)
+	require.NoError(t, err)
+	rec, ok = readOpenAIGatewayHistory(&Account{Extra: merged})
+	require.True(t, ok)
+	require.Equal(t, "new-domain", rec.LedgerTag)
+	require.Len(t, rec.Seen, 1)
+	require.Equal(t, "new-domain", merged[openAIGatewayLedgerTagExtraKey])
+}

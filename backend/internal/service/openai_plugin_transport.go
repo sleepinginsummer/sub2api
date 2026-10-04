@@ -3,9 +3,14 @@ package service
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"net/http"
+	"net/http/httptrace"
 	"net/url"
+	"sync/atomic"
 	"time"
+
+	"github.com/Wei-Shaw/sub2api/internal/pkg/chatgptcookies"
 )
 
 func (s *OpenAIGatewayService) SetPluginManager(manager *PluginManager) {
@@ -19,9 +24,12 @@ func (s *OpenAIGatewayService) SetPluginManager(manager *PluginManager) {
 // 满足两个条件：响应头已经到手，而调用方还一个字节都没往下游写（调用方要等这个函数返回才开始
 // 解析响应）。所以「截断」在这里是干净的，不会留一个半截的 SSE 流。
 func (s *OpenAIGatewayService) doOpenAIUpstream(request *http.Request, proxyURL string, account *Account) (*http.Response, error) {
+	if request != nil {
+		request = request.WithContext(s.gatewayPoolWaitContext(request.Context(), account))
+	}
 	// 业务请求只落在**验过满血**的槽上。判据跑在这一发之前、用便宜的垫话，所以用户的请求不会是
 	// 那个去试网关的人（openai_gwpool_warm.go）。验不出来就把错误往上抛，**绝不降级放行**。
-	// 没有档位可关：2026-10-03 删了（见 openai_gwpool_state_echo.go 文件头）。
+	// 显式关闭防护时跳过质量验证；取票、冷却和限流仍在后续路径生效。
 	if err := s.gatewayPoolWarmUp(request, proxyURL, account); err != nil {
 		return nil, err
 	}
@@ -57,14 +65,14 @@ func (s *OpenAIGatewayService) doOpenAIUpstreamOnce(
 	if request != nil && request.URL != nil {
 		rawURL = request.URL.String()
 	}
-	// 每个实际 HTTP 请求单独冻结票据，避免同一转发上下文中的侧信道或重试覆盖读数。
+	// 每个实际 HTTP 请求单独收集并冻结票据，父上下文只继承模型及成对供给数。
 	parentSink := openAIGatewayPoolSinkFrom(request.Context())
 	requestCtx, poolSink := withOpenAIGatewayPoolSink(request.Context(), nil)
 	poolSink.noteModel(parentSink.modelOf())
 	parentApplied := parentSink.snapshot()
 	poolSink.notePoolCounts(parentApplied.PoolLive, parentApplied.PoolFree)
 	request = request.WithContext(requestCtx)
-	release, err := s.codexCookies.AttachRoute(request.Context(), account, rawURL, request.Header)
+	release, err := s.attachGatewayPoolRouteWithWait(request.Context(), account, rawURL, request.Header)
 	if err != nil {
 		return nil, false, err
 	}
@@ -79,14 +87,40 @@ func (s *OpenAIGatewayService) doOpenAIUpstreamOnce(
 		gatewayPoolReleaseUnsent(release)
 		return nil, false, ctxErr
 	}
-	resp, err := s.doOpenAIUpstreamRoundTrip(request, proxyURL, account)
+	applied := openAIGatewayPoolSinkFrom(request.Context()).snapshot()
+	poolRequest := s.codexCookies.gatewayPoolTakeover(account) && request.URL != nil &&
+		chatgptcookies.IsChatGPTURL(request.URL) && request.URL.Path == openAIGatewayPoolInferencePath
+	var identity string
+	var identityErr error
+	if poolRequest && applied.AccountID == account.ID && applied.Version != "" {
+		identity, identityErr = s.codexCookies.gatewayPoolIdentity(request.Context(), account)
+	}
+	if poolRequest && account.gatewayPoolGuardEnabled() {
+		// WarmUp 与实际发送之间可能过期/换票。只检查本次真正附带的那一张，
+		// 不允许“旧票验证成功，新票直接发业务”的竞态穿过严格模式。
+		cacheKey := openAIGatewayPoolCacheKey(account, identity)
+		mark, verified := s.codexCookies.gatewayPoolVerifiedMarkOf(cacheKey)
+		if identityErr != nil || applied.AccountID != account.ID || applied.Version == "" ||
+			!verified || mark.version != applied.Version || !s.codexCookies.gatewayPoolVerifiedFull(cacheKey) {
+			gatewayPoolReleaseUnsent(release)
+			return nil, false, errOpenAIGatewayPoolWarmUnverified
+		}
+	}
+	if identityErr != nil {
+		slog.Warn("gwpool_first_send_identity_unavailable", "account_id", account.ID)
+	}
+	resp, sentAt, err := s.gatewayPoolObservedRoundTrip(request, proxyURL, account, poolRequest)
+	if !sentAt.IsZero() {
+		s.codexCookies.gatewayPoolMarkSent(openAIGatewayPoolCacheKey(account, identity), applied.Version, sentAt)
+	}
 	if err == nil && resp != nil {
 		degraded := s.gatewayPoolRouteDegraded(request, resp, account)
-		// 判据先补齐本次读数，再冻结响应快照；共享上下文后续变化不能改写它。
+		s.noteGatewayPoolBusinessContact(request, account, identity, applied, sentAt)
+		// 判据及接触记录完成后冻结该 HTTP 响应，保留传输层返回的 Request。
 		if applied := poolSink.snapshot(); applied.Cookie != "" {
 			parentSink.mark(applied)
 			parentSink.notePoolCounts(applied.PoolLive, applied.PoolFree)
-			parentSink.noteFullHeld(time.Duration(applied.FullHeldMs) * time.Millisecond)
+			parentSink.noteFullHeld(applied, time.Duration(applied.FullHeldMs)*time.Millisecond)
 			if resp.Request == nil {
 				resp.Request = request
 			}
@@ -100,8 +134,37 @@ func (s *OpenAIGatewayService) doOpenAIUpstreamOnce(
 	}
 	if gatewayPoolReleasesUnsent(resp, err) {
 		gatewayPoolReleaseUnsent(release)
+	} else if !sentAt.IsZero() {
+		s.noteGatewayPoolBusinessContact(request, account, identity, applied, sentAt)
 	}
 	return resp, false, err
+}
+
+// Not being safe to return a ticket is not evidence of a send. Native HTTP
+// records a completed request write; plugins may explicitly attest RequestSent.
+// A response itself is sufficient evidence when the transport has no trace.
+func (s *OpenAIGatewayService) gatewayPoolObservedRoundTrip(request *http.Request, proxyURL string, account *Account, observe bool) (*http.Response, time.Time, error) {
+	if !observe {
+		resp, err := s.doOpenAIUpstreamRoundTrip(request, proxyURL, account)
+		return resp, time.Time{}, err
+	}
+	started := time.Now()
+	var wroteAt atomic.Int64
+	trace := &httptrace.ClientTrace{WroteRequest: func(info httptrace.WroteRequestInfo) {
+		if info.Err == nil {
+			wroteAt.CompareAndSwap(0, time.Now().UnixNano())
+		}
+	}}
+	traced := request.WithContext(httptrace.WithClientTrace(request.Context(), trace))
+	resp, err := s.doOpenAIUpstreamRoundTrip(traced, proxyURL, account)
+	if at := wroteAt.Load(); at != 0 {
+		return resp, time.Unix(0, at), err
+	}
+	var pluginErr *PluginTransportError
+	if resp != nil || (errors.As(err, &pluginErr) && pluginErr.RequestSent) {
+		return resp, started, err
+	}
+	return resp, time.Time{}, err
 }
 
 // gatewayPoolReleasesUnsent 判「这一发一个字节都没发出去」，决定取到的池子票要不要还。

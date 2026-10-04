@@ -16,10 +16,13 @@ func TestGatewayPoolHTTPRouteSnapshotSurvivesSharedSinkOverwrite(t *testing.T) {
 	pool := newGwpoolFakePool(t, gwpoolTestPairCookie(t, "unified-142"), 150)
 	account := pool.account(1)
 	svc := &OpenAIGatewayService{httpUpstream: &cookieRecordingUpstream{}}
+	verified := attachRouteApplied(t, &svc.codexCookies, account, gwpoolTestURL, http.Header{})
+	svc.codexCookies.gatewayPoolMarkVerifiedFull(openAIGatewayPoolCacheKey(account, gwpoolTestIdentity), verified.Version)
 	ctx, sink := withOpenAIGatewayPoolSink(context.Background(), nil)
+	sink.mark(OpenAIGatewayPoolApplied{AccountID: account.ID, Cookie: "old", Gateway: "unified-old", Version: "old-ticket"})
 	sink.notePoolCounts(4, 2)
 	// 满血时长属于具体票据，不能把上一发的测量值继承给新 HTTP 请求。
-	sink.noteFullHeld(5 * time.Second)
+	sink.noteFullHeld(sink.snapshot(), 5*time.Second)
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, gwpoolTestURL, strings.NewReader("{}"))
 	require.NoError(t, err)
 	request.Header.Set(openAICodexTurnStateHeader, gwpoolEchoLiveTicket)
@@ -40,7 +43,7 @@ func TestGatewayPoolHTTPRouteSnapshotSurvivesSharedSinkOverwrite(t *testing.T) {
 		Gateway: "unified-84", Version: "later-ticket",
 	})
 	sink.notePoolCounts(9, 0)
-	sink.noteFullHeld(90 * time.Second)
+	sink.noteFullHeld(sink.snapshot(), 90*time.Second)
 	result := &OpenAIForwardResult{
 		GatewayPoolRoutePair: openAIGatewayPoolRoutePairFromResponse(response),
 		GatewayPoolApplied:   openAIGatewayPoolAppliedFromResponse(response),

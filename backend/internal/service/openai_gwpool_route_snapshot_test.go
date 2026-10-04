@@ -39,6 +39,7 @@ func TestGatewayPoolRouteSnapshotSurvivesCacheChanges(t *testing.T) {
 			upstream := &gatewayPoolSnapshotUpstream{responseRequest: redirect}
 			svc := &OpenAIGatewayService{httpUpstream: upstream}
 			account := pool.account(1)
+			account.Extra[openAIGatewayPoolGuardEnabledExtraKey] = false // 本组只验证传输快照。
 			svc.codexCookies.Store(account, gwpoolTestURL, codexCookieUpstreamResponse())
 			send := func() *http.Response {
 				req, err := http.NewRequest(http.MethodPost, gwpoolTestURL, strings.NewReader("{}"))
@@ -102,6 +103,7 @@ func TestGatewayPoolRouteSnapshotForwardedToResults(t *testing.T) {
 				cfg := &config.Config{Gateway: config.GatewayConfig{MaxLineSize: defaultMaxLineSize, OpenAIFirstOutputTimeoutSeconds: 1}}
 				svc := &OpenAIGatewayService{cfg: cfg, httpUpstream: upstream, responseHeaderFilter: compileResponseHeaderFilter(cfg)}
 				account := pool.account(1)
+				account.Extra[openAIGatewayPoolGuardEnabledExtraKey] = false // 本组只验证出口快照及序列化。
 				account.Credentials["access_token"] = "test-access-token"
 				account.Extra["openai_passthrough"] = passthrough
 				body := []byte(fmt.Sprintf(`{"model":"gpt-6-astra","input":"hi","instructions":"test","stream":%t}`, stream))

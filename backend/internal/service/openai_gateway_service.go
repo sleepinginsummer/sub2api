@@ -499,6 +499,8 @@ type OpenAIGatewayService struct {
 	openaiWSPool                  *openAIWSConnPool
 	// codexCookies：推理面按账号隔离的 ChatGPT cookie 罐（openai_codex_cookies.go），HTTP 与 WS 握手共用。
 	codexCookies                   openAICodexCookieStore
+	gatewayReporterMu              sync.Mutex
+	gatewayReporter                *gatewayPoolReporter
 	openaiWSStateStore             OpenAIWSStateStore
 	openaiScheduler                OpenAIAccountScheduler
 	openaiWSPassthroughDialer      openAIWSClientDialer
@@ -622,6 +624,13 @@ func NewOpenAIGatewayService(
 	svc.codexSideCalls = newCodexSideCallState()
 	// 网关池接管推理面的路由 cookie（openai_gwpool.go）。配置全在账号 extra 上，客户端按需建。
 	svc.codexCookies.identity = svc.codexCredentialIdentity
+	svc.codexCookies.poolProbeObserved = svc.noteGatewayPoolProbeAndContact
+	if svc.accountRepo != nil {
+		svc.codexCookies.accountByID = svc.accountRepo.GetByID
+		svc.codexCookies.historyByTag = func(ctx context.Context, tag string) ([]Account, error) {
+			return svc.accountRepo.FindByExtraField(ctx, openAIGatewayLedgerTagExtraKey, tag)
+		}
+	}
 	return svc
 }
 
