@@ -134,6 +134,9 @@ func TestGatewayUsageCallerTransactionLocksCloneDomainUntilCommit(t *testing.T) 
 		account := mustCreateAccount(t, integrationEntClient, &service.Account{Name: tag, Platform: service.PlatformOpenAI})
 		accounts[i] = account
 		t.Cleanup(func() {
+			// 不同配置写入产生真实调度事件，按夹具账号清理，避免污染后续全表断言。
+			_, err := integrationDB.ExecContext(context.Background(), "DELETE FROM scheduler_outbox WHERE account_id = $1", account.ID)
+			require.NoError(t, err)
 			require.NoError(t, integrationEntClient.Account.DeleteOneID(account.ID).Exec(context.Background()))
 		})
 	}
