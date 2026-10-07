@@ -18,7 +18,7 @@ func TestGatewayPoolPreparingWaiterCannotMaskExhaustion(t *testing.T) {
 	account.Extra[openAIGatewayPoolRotationMinGatewaysExtraKey] = 10
 	fake.configure(account)
 	svc, _ := gatewayRuntimeService(account)
-	identity := openAIGatewayPoolAccountKey(account)
+	identity := openAIGatewayPoolCacheKey(account, openAIGatewayPoolAccountKey(account))
 	require.True(t, svc.gatewayPoolNoRemainingRoutes(context.Background(), account))
 	waiter, finish := svc.beginGatewayPoolUsageRequest(context.Background(), account)
 	require.NotNil(t, finish)

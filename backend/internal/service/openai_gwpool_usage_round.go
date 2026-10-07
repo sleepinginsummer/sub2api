@@ -71,6 +71,12 @@ type gatewayPoolUsageLedger struct {
 	VerificationStartedAt  time.Time                          `json:"verification_started_at,omitzero"`
 }
 
+// 用量周期属于供给配置域，与库存、验证和休眠保持一致；真实消耗账本仍共享。
+// 保留原哈希格式，无配置指纹的身份标签不变，旧配置记录由 Previous 保留。
+func gatewayPoolUsageTag(identity string) string {
+	return gatewayPoolRestTag(identity)
+}
+
 func gatewayPoolUsageDigest(value string) string {
 	sum := sha256.Sum256([]byte(value))
 	return hex.EncodeToString(sum[:])
@@ -101,6 +107,52 @@ func readGatewayPoolUsage(account *Account, tag string) gatewayPoolUsageLedger {
 	return state
 }
 
+// 首次升级到配置标签时继承原共享统计，并独立保存旧快照，避免已有历史消失。
+func readGatewayPoolUsageForIdentity(account *Account, identity string) gatewayPoolUsageLedger {
+	tag := gatewayPoolUsageTag(identity)
+	state := readGatewayPoolUsage(account, tag)
+	legacyTag := gatewayPoolLedgerTag(identity)
+	if tag != legacyTag && state.UpdatedAt.IsZero() && state.Previous != nil && state.Previous.Tag == legacyTag {
+		legacy := readGatewayPoolUsage(account, legacyTag)
+		legacy.Tag, legacy.Previous = tag, state.Previous
+		return legacy
+	}
+	return state
+}
+
+// 配置周期一旦持久化就以新域为准；首次迁移才读取旧共享域，继承最新克隆快照。
+func (s *OpenAIGatewayService) gatewayPoolUsagePeers(ctx context.Context, identity string) ([]Account, bool, error) {
+	tag := gatewayPoolUsageTag(identity)
+	peers, err := s.gatewayPoolStatePeers(ctx, tag, "usage")
+	if err != nil {
+		return nil, false, err
+	}
+	for i := range peers {
+		if !readGatewayPoolUsage(&peers[i], tag).UpdatedAt.IsZero() {
+			return peers, false, nil
+		}
+	}
+	legacyTag := gatewayPoolLedgerTag(identity)
+	if tag == legacyTag {
+		return peers, false, nil
+	}
+	peers, err = s.gatewayPoolStatePeers(ctx, legacyTag, "usage")
+	return peers, true, err
+}
+
+func gatewayPoolUsagePeerView(account *Account, identity string, legacy bool) gatewayPoolUsageLedger {
+	if !legacy {
+		return readGatewayPoolUsage(account, gatewayPoolUsageTag(identity))
+	}
+	tag := gatewayPoolLedgerTag(identity)
+	state := readGatewayPoolUsage(account, tag)
+	// 两次解码保证新周期与保留快照的 ticket map 完全独立。
+	previous := readGatewayPoolUsage(account, tag)
+	previous.Previous = nil
+	state.Tag, state.Previous = gatewayPoolUsageTag(identity), &previous
+	return state
+}
+
 // The entire snapshot is serialized by ledger, including clones. Each write
 // first adopts the newest durable snapshot; no per-row totals are ever summed.
 func (s *OpenAIGatewayService) changeGatewayPoolUsage(ctx context.Context, account *Account, identity string,
@@ -110,7 +162,7 @@ func (s *OpenAIGatewayService) changeGatewayPoolUsage(ctx context.Context, accou
 	if s == nil || s.accountRepo == nil || account == nil || identity == "" {
 		return false
 	}
-	tag := gatewayPoolLedgerTag(identity)
+	tag := gatewayPoolUsageTag(identity)
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), gatewayPoolWarmNoteTimeout)
 	defer cancel()
 	value, _ := s.codexCookies.poolUsageLocks.LoadOrStore(tag, &sync.Mutex{})
@@ -146,23 +198,31 @@ func (s *OpenAIGatewayService) changeGatewayPoolUsage(ctx context.Context, accou
 		return false
 	}
 	current, err := s.codexCookies.gatewayPoolIdentity(ctx, fresh)
-	if err != nil || gatewayPoolLedgerTag(current) != tag {
+	if err != nil || gatewayPoolUsageTag(current) != tag {
 		return false // identity changed while an old request was in flight
 	}
-	state := readGatewayPoolUsage(fresh, tag)
+	state := readGatewayPoolUsageForIdentity(fresh, identity)
 	blockedAt := gatewayPoolUsageBlockedAt(fresh)
-	peers, err := s.gatewayPoolStatePeers(ctx, tag, "usage")
+	stored := readGatewayPoolUsage(fresh, tag)
+	peers, legacy, err := s.gatewayPoolUsagePeers(ctx, identity)
 	if err != nil {
 		slog.Warn("gwpool_usage_peers_unavailable", "account_id", account.ID)
 		return false // do not overwrite a possibly newer clone snapshot
 	}
+	if !legacy && stored.UpdatedAt.IsZero() {
+		// 已迁移克隆的配置快照优先于旧版本后来写出的共享快照。
+		state = stored
+	}
 	for i := range peers {
-		if blocked := gatewayPoolUsageBlockedAt(&peers[i]); blocked.After(blockedAt) {
+		if blocked := gatewayPoolUsageBlockedAt(&peers[i]); !legacy && blocked.After(blockedAt) {
 			blockedAt = blocked
 		}
-		other := readGatewayPoolUsage(&peers[i], tag)
+		other := gatewayPoolUsagePeerView(&peers[i], identity, legacy)
 		if other.UpdatedAt.After(state.UpdatedAt) {
 			previous := state.Previous
+			if legacy && (previous == nil || previous.Tag == gatewayPoolLedgerTag(identity)) {
+				previous = other.Previous
+			}
 			state = other
 			state.Previous = previous
 		}

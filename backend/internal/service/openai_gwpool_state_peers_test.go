@@ -21,7 +21,7 @@ func TestGatewayPoolStatePeersEqualTimeKeepsCurrentBeforePrevious(t *testing.T) 
 	account := gwpoolTestAccount(1)
 	identity := openAIGatewayPoolCacheKey(account, gwpoolTestIdentity)
 	tag := gatewayPoolRestTag(identity)
-	usageTag := gatewayPoolLedgerTag(identity)
+	usageTag := gatewayPoolUsageTag(identity)
 	at := time.Now().UTC()
 	current := Account{ID: 2, Extra: map[string]any{
 		gatewayPoolRestStateKey:  gatewayPoolRestState{Tag: tag, ChangedAt: at, Active: false},
@@ -40,7 +40,7 @@ func TestGatewayPoolStatePeersEqualTimeKeepsCurrentBeforePrevious(t *testing.T) 
 	rest, _, err := svc.loadGatewayPoolRest(context.Background(), account, identity)
 	require.NoError(t, err)
 	require.False(t, rest.Active, "equal-time previous state must not revive current inactive tombstone")
-	require.True(t, svc.changeGatewayPoolUsage(context.Background(), account, gwpoolTestIdentity,
+	require.True(t, svc.changeGatewayPoolUsage(context.Background(), account, identity,
 		func(state *gatewayPoolUsageLedger) bool {
 			require.EqualValues(t, 9, state.VerificationSequence)
 			return true

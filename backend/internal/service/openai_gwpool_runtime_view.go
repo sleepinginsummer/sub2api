@@ -69,23 +69,28 @@ func (s *OpenAIGatewayService) GatewayPoolRuntimeProgress(ctx context.Context, i
 			}
 			historyPeers[tag] = peers
 		}
-		state := readGatewayPoolUsage(account, tag)
-		if cached, ok := s.codexCookies.poolUsageCache.Load(tag); ok {
-			if other, valid := cached.(*gatewayPoolUsageLedger); valid && other.UpdatedAt.After(state.UpdatedAt) {
+		usageTag := gatewayPoolUsageTag(identity)
+		state := readGatewayPoolUsageForIdentity(account, identity)
+		stored := readGatewayPoolUsage(account, usageTag)
+		if cached, ok := s.codexCookies.poolUsageCache.Load(usageTag); ok {
+			if other, valid := cached.(*gatewayPoolUsageLedger); valid && (stored.UpdatedAt.IsZero() || other.UpdatedAt.After(state.UpdatedAt)) {
 				state = *other
 			}
 		} else {
-			usagePeers, err := s.gatewayPoolStatePeers(ctx, tag, "usage")
+			usagePeers, legacy, err := s.gatewayPoolUsagePeers(ctx, identity)
 			if err != nil {
 				return nil, err
 			}
+			if !legacy && stored.UpdatedAt.IsZero() {
+				state = stored
+			}
 			for i := range usagePeers {
-				other := readGatewayPoolUsage(&usagePeers[i], tag)
+				other := gatewayPoolUsagePeerView(&usagePeers[i], identity, legacy)
 				if other.UpdatedAt.After(state.UpdatedAt) {
 					state = other
 				}
 			}
-			s.codexCookies.poolUsageCache.LoadOrStore(tag, &state)
+			s.codexCookies.poolUsageCache.LoadOrStore(usageTag, &state)
 		}
 		runtime := &GatewayPoolRuntimeView{ObservedAt: time.Now().UTC(), Tickets: []GatewayPoolLiveTicket{},
 			Rounds: make([]GatewayPoolUsageRound, len(state.Rounds)), Archived: state.Archived, Incomplete: state.Incomplete}
@@ -157,7 +162,7 @@ func (s *OpenAIGatewayService) GatewayPoolRuntimeProgress(ctx context.Context, i
 			}
 		}
 		progress := s.codexCookies.poolProgress.snapshot([]int64{progressAccount}, runtime.ObservedAt,
-			map[int64]gatewayPoolProgressScope{progressAccount: {tag: tag, closedBefore: closedBefore, identity: identity}})[progressAccount]
+			map[int64]gatewayPoolProgressScope{progressAccount: {tag: usageTag, closedBefore: closedBefore, identity: identity}})[progressAccount]
 		if sharedProgress && progress.RunID != "" {
 			progress.ActiveRequests = s.codexCookies.gatewayPoolPreparationWaiters(identity)
 		}

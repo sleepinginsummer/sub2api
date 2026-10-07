@@ -77,3 +77,44 @@ func TestGatewayHistoryLockSurvivesCallerTransaction(t *testing.T) {
 	history := saved.Extra[service.OpenAIGatewayHistoryExtraKey].(map[string]any)
 	require.Len(t, history["seen"].(map[string]any), 2)
 }
+
+func TestGatewayHistoryPreviousViewConcurrentUpdates(t *testing.T) {
+	ctx := context.Background()
+	at := time.Now().UTC()
+	base := map[string]any{"ledger_tag": "current-member", "updated_at": at.Add(time.Minute).Format(time.RFC3339Nano),
+		"seen":     map[string]any{"current": map[string]any{"at": at.Format(time.RFC3339Nano)}},
+		"previous": map[string]any{"ledger_tag": "previous-member", "updated_at": at.Format(time.RFC3339Nano), "seen": map[string]any{}}}
+	acct := mustCreateAccount(t, integrationEntClient, &service.Account{Name: "history-previous", Platform: service.PlatformOpenAI,
+		Extra: map[string]any{service.OpenAIGatewayHistoryExtraKey: base}})
+	t.Cleanup(func() { require.NoError(t, integrationEntClient.Account.DeleteOneID(acct.ID).Exec(ctx)) })
+	start := make(chan struct{})
+	results := make(chan error, 2)
+	for _, barrier := range []string{"last_at", "cleared_at"} {
+		go func(field string) {
+			<-start
+			previous := map[string]any{"ledger_tag": "previous-member", "updated_at": at.Format(time.RFC3339Nano),
+				"cooldown_reset": map[string]any{field: at.Add(time.Second).Format(time.RFC3339Nano)},
+				"seen":           map[string]any{field: map[string]any{"at": at.Format(time.RFC3339Nano)}}}
+			delta := map[string]any{service.OpenAIGatewayHistoryExtraKey: map[string]any{
+				"ledger_tag": "current-member", "updated_at": at.Format(time.RFC3339Nano), "previous": previous}}
+			repo := newAccountRepositoryWithSQL(integrationEntClient, integrationDB, nil)
+			results <- repo.UpdateExtra(ctx, acct.ID, delta)
+		}(barrier)
+	}
+	close(start)
+	for range 2 {
+		require.NoError(t, <-results)
+	}
+	repo := newAccountRepositoryWithSQL(integrationEntClient, integrationDB, nil)
+	saved, err := repo.GetByID(ctx, acct.ID)
+	require.NoError(t, err)
+	history := saved.Extra[service.OpenAIGatewayHistoryExtraKey].(map[string]any)
+	require.Equal(t, "current-member", history["ledger_tag"])
+	require.Contains(t, history["seen"], "current")
+	previous := history["previous"].(map[string]any)
+	require.Len(t, previous["seen"], 2)
+	reset := previous["cooldown_reset"].(map[string]any)
+	require.Equal(t, at.Add(time.Second).Format(time.RFC3339Nano), reset["last_at"])
+	require.Equal(t, at.Add(time.Second).Format(time.RFC3339Nano), reset["cleared_at"])
+	require.NotContains(t, previous, "previous")
+}

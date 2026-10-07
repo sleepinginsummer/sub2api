@@ -75,7 +75,7 @@ func TestGatewayPoolUsageConcurrentDedupPersistsAcrossRestart(t *testing.T) {
 	account := gwpoolTestAccount(1)
 	svc, repo := gatewayRuntimeService(account)
 	applied := OpenAIGatewayPoolApplied{AccountID: 1, Gateway: "g", Version: "v"}
-	identity := openAIGatewayPoolAccountKey(account)
+	identity := openAIGatewayPoolCacheKey(account, openAIGatewayPoolAccountKey(account))
 	at := time.Now().UTC()
 	var done sync.WaitGroup
 	for i := 0; i < 24; i++ {
@@ -87,14 +87,14 @@ func TestGatewayPoolUsageConcurrentDedupPersistsAcrossRestart(t *testing.T) {
 	}
 	done.Wait()
 	fresh, _ := repo.GetByID(context.Background(), 1)
-	state := readGatewayPoolUsage(fresh, gatewayPoolLedgerTag(identity))
+	state := readGatewayPoolUsage(fresh, gatewayPoolUsageTag(identity))
 	require.Len(t, state.Rounds, 1)
 	require.Equal(t, 1, state.Rounds[0].Attempted)
 	require.Equal(t, 1, state.Rounds[0].Full)
 	restarted := &OpenAIGatewayService{accountRepo: repo}
 	restarted.noteGatewayPoolUsage(context.Background(), account, identity, "gpt-6-luna", applied, at.Add(time.Second), true)
 	fresh, _ = repo.GetByID(context.Background(), 1)
-	state = readGatewayPoolUsage(fresh, gatewayPoolLedgerTag(identity))
+	state = readGatewayPoolUsage(fresh, gatewayPoolUsageTag(identity))
 	require.Len(t, state.Rounds, 1)
 	require.Equal(t, 1, state.Rounds[0].Attempted)
 }
@@ -102,14 +102,14 @@ func TestGatewayPoolUsageConcurrentDedupPersistsAcrossRestart(t *testing.T) {
 func TestGatewayPoolUsageWriteFailureRemainsRetryable(t *testing.T) {
 	account := gwpoolTestAccount(1)
 	svc, repo := gatewayRuntimeService(account)
-	identity := openAIGatewayPoolAccountKey(account)
+	identity := openAIGatewayPoolCacheKey(account, openAIGatewayPoolAccountKey(account))
 	applied := OpenAIGatewayPoolApplied{AccountID: 1, Gateway: "g", Version: "v"}
 	repo.fail = true
 	svc.noteGatewayPoolUsage(context.Background(), account, identity, "gpt-6-luna", applied, time.Now(), true)
 	repo.fail = false
 	svc.noteGatewayPoolUsage(context.Background(), account, identity, "gpt-6-luna", applied, time.Now(), true)
 	fresh, _ := repo.GetByID(context.Background(), 1)
-	state := readGatewayPoolUsage(fresh, gatewayPoolLedgerTag(identity))
+	state := readGatewayPoolUsage(fresh, gatewayPoolUsageTag(identity))
 	require.Len(t, state.Rounds, 1)
 }
 
@@ -134,7 +134,7 @@ func TestGatewayPoolUsagePersistsWhileFirstResponseStillPending(t *testing.T) {
 	request, err := http.NewRequest(http.MethodPost, gwpoolTestURL, nil)
 	require.NoError(t, err)
 	applied := OpenAIGatewayPoolApplied{AccountID: 1, Gateway: "g", Version: "v"}
-	identity := openAIGatewayPoolAccountKey(account)
+	identity := openAIGatewayPoolCacheKey(account, openAIGatewayPoolAccountKey(account))
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -144,7 +144,7 @@ func TestGatewayPoolUsagePersistsWhileFirstResponseStillPending(t *testing.T) {
 	}()
 	<-upstream.written
 	fresh, _ := repo.GetByID(context.Background(), 1)
-	state := readGatewayPoolUsage(fresh, gatewayPoolLedgerTag(identity))
+	state := readGatewayPoolUsage(fresh, gatewayPoolUsageTag(identity))
 	close(upstream.release)
 	<-done
 	require.Len(t, state.Rounds, 1, "attempt is durable before response completion")
@@ -202,7 +202,7 @@ func TestGatewayPoolUsageEndsOnlyOnStableFreshZeroInventory(t *testing.T) {
 		OpenAIGatewayPoolApplied{AccountID: 1, Gateway: "g", Version: "v"}, time.Now().Add(-time.Minute), false)
 	ended := func() bool {
 		fresh, _ := repo.GetByID(context.Background(), 1)
-		state := readGatewayPoolUsage(fresh, gatewayPoolLedgerTag(identity))
+		state := readGatewayPoolUsage(fresh, gatewayPoolUsageTag(identity))
 		return !state.Rounds[0].EndedAt.IsZero()
 	}
 	finish := svc.codexCookies.gatewayPoolInventoryOperation(identity)
@@ -233,14 +233,14 @@ func TestGatewayPoolUsageUnreservedEarlyOpportunityDoesNotHoldCycleOpen(t *testi
 	account.Status, account.Schedulable = StatusActive, true
 	account.Extra[openAIGatewayPoolEarlyEnabledKey] = true
 	svc, repo := gatewayRuntimeService(account)
-	identity := openAIGatewayPoolAccountKey(account)
+	identity := openAIGatewayPoolCacheKey(account, openAIGatewayPoolAccountKey(account))
 	svc.codexCookies.gatewayPoolMarkUsed(identity, "unified-80")
 	require.True(t, svc.codexCookies.gatewayPoolEarlyDue(context.Background(), account, identity))
 	svc.noteGatewayPoolUsage(context.Background(), account, identity, "luna",
 		OpenAIGatewayPoolApplied{AccountID: 1, Gateway: "old", Version: "old"}, time.Now().Add(-time.Minute), false)
 	svc.finishGatewayPoolUsageIfExhausted(context.Background(), account)
 	fresh, _ := repo.GetByID(context.Background(), 1)
-	state := readGatewayPoolUsage(fresh, gatewayPoolLedgerTag(identity))
+	state := readGatewayPoolUsage(fresh, gatewayPoolUsageTag(identity))
 	require.False(t, state.Rounds[0].EndedAt.IsZero())
 	require.True(t, readGatewayPoolEarlyState(fresh, identity).IsZero(), "settlement never spends an early probe budget")
 	require.Zero(t, fake.hits.Load())
@@ -263,7 +263,7 @@ func TestGatewayPoolUsageAbandonedFetchSettlesAfterStrictZero(t *testing.T) {
 	account := fake.account(1)
 	svc, repo := gatewayRuntimeService(account)
 	svc.codexCookies.poolUsageFinished = svc.finishGatewayPoolUsageIfExhausted
-	identity := openAIGatewayPoolAccountKey(account)
+	identity := openAIGatewayPoolCacheKey(account, openAIGatewayPoolAccountKey(account))
 	svc.noteGatewayPoolUsage(context.Background(), account, identity, gatewayPoolProbeModelLuna,
 		OpenAIGatewayPoolApplied{AccountID: 1, Gateway: "old", Version: "old"}, time.Now().Add(-time.Minute), false)
 	started, release := make(chan struct{}), make(chan struct{})
@@ -284,7 +284,7 @@ func TestGatewayPoolUsageAbandonedFetchSettlesAfterStrictZero(t *testing.T) {
 	releaseOnce.Do(func() { close(release) })
 	require.Eventually(t, func() bool {
 		fresh, _ := repo.GetByID(context.Background(), 1)
-		state := readGatewayPoolUsage(fresh, gatewayPoolLedgerTag(identity))
+		state := readGatewayPoolUsage(fresh, gatewayPoolUsageTag(identity))
 		return len(state.Rounds) == 1 && !state.Rounds[0].EndedAt.IsZero()
 	}, time.Second, time.Millisecond, "the abandoned fetch's final zero must close the round without another business request")
 }

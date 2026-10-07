@@ -55,37 +55,37 @@ func TestGatewayPoolUsageInFlightAndSharedWorkPreventIdleEnd(t *testing.T) {
 	fresh, _ := repo.GetByID(ctx, 1)
 	svc.maintainGatewayPoolUsage(ctx, fresh, time.Now().Add(time.Hour))
 	fresh, _ = repo.GetByID(ctx, 1)
-	require.True(t, readGatewayPoolUsage(fresh, gatewayPoolLedgerTag(identity)).Rounds[0].EndedAt.IsZero())
+	require.True(t, readGatewayPoolUsage(fresh, gatewayPoolUsageTag(identity)).Rounds[0].EndedAt.IsZero())
 	finish()
 	fresh, _ = repo.GetByID(ctx, 1)
-	before := readGatewayPoolUsage(fresh, gatewayPoolLedgerTag(identity))
+	before := readGatewayPoolUsage(fresh, gatewayPoolUsageTag(identity))
 	require.False(t, before.LastRequestCompletedAt.IsZero())
 	finishShared := svc.codexCookies.gatewayPoolInventoryOperation(identity)
 	svc.maintainGatewayPoolUsage(ctx, fresh, time.Now().Add(time.Hour))
 	fresh, _ = repo.GetByID(ctx, 1)
-	require.True(t, readGatewayPoolUsage(fresh, gatewayPoolLedgerTag(identity)).Rounds[0].EndedAt.IsZero())
+	require.True(t, readGatewayPoolUsage(fresh, gatewayPoolUsageTag(identity)).Rounds[0].EndedAt.IsZero())
 	finishShared()
 	svc.maintainGatewayPoolUsage(ctx, fresh, time.Now().Add(time.Hour))
 	fresh, _ = repo.GetByID(ctx, 1)
-	state := readGatewayPoolUsage(fresh, gatewayPoolLedgerTag(identity))
+	state := readGatewayPoolUsage(fresh, gatewayPoolUsageTag(identity))
 	require.Equal(t, before.LastRequestCompletedAt, state.Rounds[0].EndedAt)
 	require.Equal(t, "idle_timeout", state.Rounds[0].EndReason)
 	// One old request cannot reopen a later cycle after an asynchronous result.
 	svc.noteGatewayPoolFullUse(ctx, account, identity, applied, time.Now().Add(time.Minute))
 	fresh, _ = repo.GetByID(ctx, 1)
-	require.Len(t, readGatewayPoolUsage(fresh, gatewayPoolLedgerTag(identity)).Rounds, 1)
+	require.Len(t, readGatewayPoolUsage(fresh, gatewayPoolUsageTag(identity)).Rounds, 1)
 	newCtx, newFinish := svc.beginGatewayPoolUsageRequest(context.Background(), account)
 	nextAt := before.LastRequestCompletedAt.Add(time.Second)
 	svc.noteGatewayPoolFullUse(newCtx, account, identity, applied, nextAt)
 	newFinish()
 	fresh, _ = repo.GetByID(ctx, 1)
-	require.Len(t, readGatewayPoolUsage(fresh, gatewayPoolLedgerTag(identity)).Rounds, 2)
+	require.Len(t, readGatewayPoolUsage(fresh, gatewayPoolUsageTag(identity)).Rounds, 2)
 }
 
 func TestGatewayPoolUsageTemporaryBlockSurvivesClearAndEndsActiveCycle(t *testing.T) {
 	account := gwpoolTestAccount(1)
 	svc, repo := gatewayRuntimeService(account)
-	identity := openAIGatewayPoolAccountKey(account)
+	identity := openAIGatewayPoolCacheKey(account, openAIGatewayPoolAccountKey(account))
 	applied := OpenAIGatewayPoolApplied{AccountID: 1, Gateway: "g", Version: "v"}
 	svc.codexCookies.poolPairs.Store(identity, openAIGatewayPoolPair{cookie: "offline", gateway: "g", version: "v"})
 	svc.codexCookies.gatewayPoolMarkVerifiedFull(identity, "v", "luna")
@@ -98,20 +98,20 @@ func TestGatewayPoolUsageTemporaryBlockSurvivesClearAndEndsActiveCycle(t *testin
 	require.Nil(t, fresh.TempUnschedulableUntil)
 	svc.maintainGatewayPoolUsage(ctx, fresh, time.Now())
 	fresh, _ = repo.GetByID(ctx, 1)
-	state := readGatewayPoolUsage(fresh, gatewayPoolLedgerTag(identity))
+	state := readGatewayPoolUsage(fresh, gatewayPoolUsageTag(identity))
 	require.Equal(t, blocked, state.Rounds[0].EndedAt)
 	require.Equal(t, "temporarily_unschedulable", state.Rounds[0].EndReason)
 	svc.noteGatewayPoolFullUse(ctx, account, identity, applied, blocked.Add(time.Second))
 	finish()
 	fresh, _ = repo.GetByID(ctx, 1)
-	require.Len(t, readGatewayPoolUsage(fresh, gatewayPoolLedgerTag(identity)).Rounds, 1)
+	require.Len(t, readGatewayPoolUsage(fresh, gatewayPoolUsageTag(identity)).Rounds, 1)
 }
 
 func TestGatewayPoolUsageBlockAfterRestartDoesNotInventTail(t *testing.T) {
 	account := gwpoolTestAccount(1)
-	identity := openAIGatewayPoolAccountKey(account)
+	identity := openAIGatewayPoolCacheKey(account, openAIGatewayPoolAccountKey(account))
 	start := time.Now().UTC().Add(-time.Hour)
-	state := gatewayPoolUsageLedger{Tag: gatewayPoolLedgerTag(identity)}
+	state := gatewayPoolUsageLedger{Tag: gatewayPoolUsageTag(identity)}
 	state.note("luna", "ticket", start, true)
 	state.startFullUse("ticket", start, time.Time{}, "old-process")
 	state.startFullUse("ticket", start.Add(time.Minute), time.Time{}, "old-process")
@@ -120,7 +120,7 @@ func TestGatewayPoolUsageBlockAfterRestartDoesNotInventTail(t *testing.T) {
 	svc, repo := gatewayRuntimeService(account)
 	svc.maintainGatewayPoolUsage(context.Background(), account, time.Now())
 	fresh, _ := repo.GetByID(context.Background(), 1)
-	state = readGatewayPoolUsage(fresh, gatewayPoolLedgerTag(identity))
+	state = readGatewayPoolUsage(fresh, gatewayPoolUsageTag(identity))
 	require.EqualValues(t, 60000, state.Rounds[0].fullUseDuration(time.Now()))
 	require.True(t, state.Rounds[0].DurationIncomplete)
 }
@@ -128,7 +128,7 @@ func TestGatewayPoolUsageBlockAfterRestartDoesNotInventTail(t *testing.T) {
 func TestGatewayPoolUsageBlockBeforeFirstAttemptStopsOldRequest(t *testing.T) {
 	account := gwpoolTestAccount(1)
 	svc, repo := gatewayRuntimeService(account)
-	identity := openAIGatewayPoolAccountKey(account)
+	identity := openAIGatewayPoolCacheKey(account, openAIGatewayPoolAccountKey(account))
 	start := time.Now().UTC().Add(-time.Minute)
 	ctx := context.WithValue(context.Background(), gatewayPoolUsageRequestKey{}, start)
 	blocked := start.Add(time.Second)
@@ -136,7 +136,7 @@ func TestGatewayPoolUsageBlockBeforeFirstAttemptStopsOldRequest(t *testing.T) {
 	svc.noteGatewayPoolUsage(ctx, account, identity, "luna",
 		OpenAIGatewayPoolApplied{AccountID: 1, Gateway: "g", Version: "v"}, blocked.Add(time.Second), false)
 	fresh, _ := repo.GetByID(ctx, 1)
-	state := readGatewayPoolUsage(fresh, gatewayPoolLedgerTag(identity))
+	state := readGatewayPoolUsage(fresh, gatewayPoolUsageTag(identity))
 	require.Empty(t, state.Rounds)
 	require.Equal(t, blocked, state.ClosedBefore[gatewayPoolUsageSharedModel])
 }
@@ -157,7 +157,7 @@ func (r *gatewayPoolUsageBlockOnReadRepo) GetByID(ctx context.Context, id int64)
 func TestGatewayPoolUsageBlockDuringBeginDoesNotRewriteOldRequest(t *testing.T) {
 	account := gwpoolTestAccount(1)
 	svc, repo := gatewayRuntimeService(account)
-	identity := openAIGatewayPoolAccountKey(account)
+	identity := openAIGatewayPoolCacheKey(account, openAIGatewayPoolAccountKey(account))
 	blocked := time.Now().UTC().Add(time.Second)
 	svc.accountRepo = &gatewayPoolUsageBlockOnReadRepo{gatewayRuntimeRepo: repo, blocked: blocked}
 	ctx, finish := svc.beginGatewayPoolUsageRequest(context.Background(), account)
@@ -170,7 +170,7 @@ func TestGatewayPoolUsageBlockDuringBeginDoesNotRewriteOldRequest(t *testing.T) 
 	svc.codexCookies.poolPairs.Store(identity, openAIGatewayPoolPair{cookie: "offline", gateway: "g", version: "v"})
 	finish()
 	fresh, _ := repo.GetByID(ctx, 1)
-	require.Empty(t, readGatewayPoolUsage(fresh, gatewayPoolLedgerTag(identity)).Rounds)
+	require.Empty(t, readGatewayPoolUsage(fresh, gatewayPoolUsageTag(identity)).Rounds)
 }
 
 func TestGatewayPoolEarlySkipLogsAreThrottledPerAccountAndReason(t *testing.T) {

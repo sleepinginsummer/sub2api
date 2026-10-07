@@ -134,7 +134,7 @@ func TestGatewayPoolRuntimeSnapshotClearsReadyWhenVerifiedTicketDies(t *testing.
 	identity := openAIGatewayPoolCacheKey(account, openAIGatewayPoolAccountKey(account))
 	now := time.Now()
 	run := svc.codexCookies.poolProgress.start(account.ID, 0, gatewayPoolProgressScope{
-		tag: gatewayPoolLedgerTag(identity), identity: identity, requestStarted: now,
+		tag: gatewayPoolUsageTag(identity), identity: identity, requestStarted: now,
 	})
 	svc.codexCookies.poolProgress.update(run, "ready", 1, "offline", false, true)
 	svc.codexCookies.poolPairs.Store(identity, openAIGatewayPoolPair{

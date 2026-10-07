@@ -5,15 +5,14 @@ import (
 	"fmt"
 )
 
-// MergeOpenAIGatewayHistoryExtra 供仓储在账号行锁内使用：按落点时间合并增量，
-// 保留其它请求的记录和未知读数，最后仍按既有上限裁剪。
+// MergeOpenAIGatewayHistoryExtra 供仓储在账号行锁内合并增量，按成员标签保留当前和上一视图。
 func MergeOpenAIGatewayHistoryExtra(existing, updates map[string]any) (map[string]any, error) {
 	incoming, ok := readOpenAIGatewayHistory(&Account{Extra: updates})
 	if !ok {
 		return nil, fmt.Errorf("invalid gateway history update")
 	}
 	current, _ := readOpenAIGatewayHistory(&Account{Extra: existing})
-	// 冷却账本随凭证域切换，旧域的落点不能污染新域；迟到的旧域写入也不能倒退。
+	// 保持凭证域切换保护：迟到的旧域写入不能切回或污染当前视图。
 	if incoming.LedgerTag != "" && current.LedgerTag != "" && incoming.LedgerTag != current.LedgerTag {
 		if incoming.UpdatedAt.Before(current.UpdatedAt) {
 			incoming = openAIGatewayHistory{}
@@ -21,67 +20,20 @@ func MergeOpenAIGatewayHistoryExtra(existing, updates map[string]any) (map[strin
 			current = gatewayPoolHistoryForTag(current, incoming.LedgerTag)
 		}
 	}
-	if incoming.LedgerTag != "" {
-		current.LedgerTag = incoming.LedgerTag
-	}
-	currentAt := current.Seen[current.Current].At
-	incomingAt := incoming.Seen[incoming.Current].At
-	if current.Seen == nil {
-		current.Seen = make(map[string]openAIGatewaySeen)
-	}
-	for gateway, next := range incoming.Seen {
-		previous, exists := current.Seen[gateway]
-		if exists && previous.At.After(next.At) {
-			continue
-		}
-		if next.Region == "" {
-			next.Region = previous.Region
-		}
-		if next.Verdict == "" {
-			next.Verdict = previous.Verdict
-		}
-		if previous.FullAt.After(next.FullAt) {
-			next.FullAt = previous.FullAt
-		}
-		if next.FullHeldMs <= 0 {
-			next.FullHeldMs = previous.FullHeldMs
-		}
-		// 未测到冷却或旧观察不能擦掉后续学到的冷却参数。
-		if next.Cooldown == nil || newerGatewayPoolCooldown(previous.Cooldown, next.Cooldown) {
-			next.Cooldown = previous.Cooldown
-		}
-		current.Seen[gateway] = next
-	}
-	if incoming.Current != "" && !incomingAt.Before(currentAt) {
-		current.Current, current.CurrentRegion = incoming.Current, incoming.CurrentRegion
-		if current.CurrentRegion == "" {
-			current.CurrentRegion = current.Seen[incoming.Current].Region
-		}
-	}
-	if incoming.PoolLive > 0 && incoming.PoolFree != nil && !incoming.UpdatedAt.Before(current.UpdatedAt) {
-		current.PoolLive, current.PoolFree = incoming.PoolLive, incoming.PoolFree
-	}
-	// 新观察可更新排程配置，清冷却/重置代际独立取最新，迟到增量不能回滚屏障。
-	reset := current.CooldownReset
-	if !incoming.UpdatedAt.Before(current.UpdatedAt) {
-		reset.IntervalHours, reset.StartedAt = incoming.CooldownReset.IntervalHours, incoming.CooldownReset.StartedAt
-		if current.Previous == nil && incoming.Previous != nil {
+	mergeGatewayPoolHistoryView(&current, incoming)
+	if incoming.Previous != nil {
+		if current.Previous != nil && current.Previous.LedgerTag == incoming.Previous.LedgerTag {
+			// 清理和重置上一成员时，根视图的观察时间可能没有变化，不能以它阻止合并。
+			mergeGatewayPoolHistoryView(current.Previous, *incoming.Previous)
+		} else if current.Previous == nil && !incoming.UpdatedAt.Before(current.UpdatedAt) {
 			previous := *incoming.Previous
 			previous.Previous = nil
 			current.Previous = &previous
 		}
 	}
-	if incoming.CooldownReset.LastAt.After(reset.LastAt) {
-		reset.LastAt = incoming.CooldownReset.LastAt
+	if current.Previous != nil {
+		current.Previous.Previous = nil
 	}
-	if incoming.CooldownReset.ClearedAt.After(reset.ClearedAt) {
-		reset.ClearedAt = incoming.CooldownReset.ClearedAt
-	}
-	current.CooldownReset = reset
-	if incoming.UpdatedAt.After(current.UpdatedAt) {
-		current.UpdatedAt = incoming.UpdatedAt
-	}
-	pruneOpenAIGatewayHistory(&current)
 	encoded, err := json.Marshal(current)
 	if err != nil {
 		return nil, err
@@ -104,4 +56,67 @@ func MergeOpenAIGatewayHistoryExtra(existing, updates map[string]any) (map[strin
 	}
 	result[openAIGatewayPreviousLedgerTagExtraKey] = previousTag
 	return result, nil
+}
+
+// 每个成员视图独立比较观察时间及冷却代际，禁止递归带入第三层历史。
+func mergeGatewayPoolHistoryView(current *openAIGatewayHistory, incoming openAIGatewayHistory) {
+	if incoming.LedgerTag != "" {
+		current.LedgerTag = incoming.LedgerTag
+	}
+	currentAt := current.Seen[current.Current].At
+	incomingAt := incoming.Seen[incoming.Current].At
+	if current.Seen == nil {
+		current.Seen = make(map[string]openAIGatewaySeen)
+	}
+	for gateway, next := range incoming.Seen {
+		previous, exists := current.Seen[gateway]
+		if exists && previous.At.After(next.At) {
+			// 清理屏障可以晚于旧观察，保留新观察的同时接纳更新的冷却代际。
+			if newerGatewayPoolCooldown(next.Cooldown, previous.Cooldown) {
+				previous.Cooldown = next.Cooldown
+				current.Seen[gateway] = previous
+			}
+			continue
+		}
+		if next.Region == "" {
+			next.Region = previous.Region
+		}
+		if next.Verdict == "" {
+			next.Verdict = previous.Verdict
+		}
+		if previous.FullAt.After(next.FullAt) {
+			next.FullAt = previous.FullAt
+		}
+		if next.FullHeldMs <= 0 {
+			next.FullHeldMs = previous.FullHeldMs
+		}
+		if next.Cooldown == nil || newerGatewayPoolCooldown(previous.Cooldown, next.Cooldown) {
+			next.Cooldown = previous.Cooldown
+		}
+		current.Seen[gateway] = next
+	}
+	if incoming.Current != "" && !incomingAt.Before(currentAt) {
+		current.Current, current.CurrentRegion = incoming.Current, incoming.CurrentRegion
+		if current.CurrentRegion == "" {
+			current.CurrentRegion = current.Seen[incoming.Current].Region
+		}
+	}
+	if incoming.PoolLive > 0 && incoming.PoolFree != nil && !incoming.UpdatedAt.Before(current.UpdatedAt) {
+		current.PoolLive, current.PoolFree = incoming.PoolLive, incoming.PoolFree
+	}
+	reset := current.CooldownReset
+	if !incoming.UpdatedAt.Before(current.UpdatedAt) {
+		reset.IntervalHours, reset.StartedAt = incoming.CooldownReset.IntervalHours, incoming.CooldownReset.StartedAt
+	}
+	if incoming.CooldownReset.LastAt.After(reset.LastAt) {
+		reset.LastAt = incoming.CooldownReset.LastAt
+	}
+	if incoming.CooldownReset.ClearedAt.After(reset.ClearedAt) {
+		reset.ClearedAt = incoming.CooldownReset.ClearedAt
+	}
+	current.CooldownReset = reset
+	if incoming.UpdatedAt.After(current.UpdatedAt) {
+		current.UpdatedAt = incoming.UpdatedAt
+	}
+	pruneOpenAIGatewayHistory(current)
 }

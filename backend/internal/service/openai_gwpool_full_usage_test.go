@@ -65,7 +65,7 @@ func TestGatewayPoolFullUsageLegacyWallClockRemainsSeparate(t *testing.T) {
 func TestGatewayPoolFullUsageKeepsEarliestOutOfOrderSend(t *testing.T) {
 	account := gwpoolTestAccount(1)
 	svc, repo := gatewayRuntimeService(account)
-	identity := openAIGatewayPoolAccountKey(account)
+	identity := openAIGatewayPoolCacheKey(account, openAIGatewayPoolAccountKey(account))
 	start := time.Now().UTC().Add(-time.Minute)
 	applied := OpenAIGatewayPoolApplied{AccountID: 1, Gateway: "g", Version: "v"}
 	svc.codexCookies.poolPairs.Store(identity, openAIGatewayPoolPair{cookie: "offline", gateway: "g", version: "v"})
@@ -74,14 +74,14 @@ func TestGatewayPoolFullUsageKeepsEarliestOutOfOrderSend(t *testing.T) {
 	svc.noteGatewayPoolFullUse(context.Background(), account, identity, applied, start)
 	fresh, err := repo.GetByID(context.Background(), 1)
 	require.NoError(t, err)
-	state := readGatewayPoolUsage(fresh, gatewayPoolLedgerTag(identity))
+	state := readGatewayPoolUsage(fresh, gatewayPoolUsageTag(identity))
 	require.Equal(t, start, state.Rounds[0].Tickets[gatewayPoolUsageTicketKey("g", "v")].UseStartedAt)
 }
 
 func TestGatewayPoolFullUsageFailedEndDoesNotAccumulateWaiting(t *testing.T) {
 	account := gwpoolTestAccount(1)
 	svc, repo := gatewayRuntimeService(account)
-	identity := openAIGatewayPoolAccountKey(account)
+	identity := openAIGatewayPoolCacheKey(account, openAIGatewayPoolAccountKey(account))
 	start := time.Now().UTC().Add(-time.Minute)
 	applied := OpenAIGatewayPoolApplied{AccountID: 1, Gateway: "g", Version: "v"}
 	pair := openAIGatewayPoolPair{cookie: "offline", gateway: "g", version: "v"}
@@ -94,7 +94,7 @@ func TestGatewayPoolFullUsageFailedEndDoesNotAccumulateWaiting(t *testing.T) {
 	svc.endGatewayPoolFullUse(context.Background(), account, identity, applied, pair.invalidatedAt)
 	repo.fail = false
 	fresh, _ := repo.GetByID(context.Background(), 1)
-	state := readGatewayPoolUsage(fresh, gatewayPoolLedgerTag(identity))
+	state := readGatewayPoolUsage(fresh, gatewayPoolUsageTag(identity))
 	for _, elapsed := range []time.Duration{time.Minute, time.Hour} {
 		view := state.Rounds[0].fullUsageView(svc.codexCookies.gatewayPoolUsageLive(identity),
 			svc.codexCookies.gatewayPoolUsageSession(), start.Add(elapsed))
@@ -127,7 +127,7 @@ func TestGatewayPoolFullUsageSettlesBeforeExpiredTicketIsReplaced(t *testing.T) 
 	svc.codexCookies.poolPairs.Store(identity, pair)
 	require.NoError(t, attachRoute(context.Background(), &svc.codexCookies, account, gwpoolTestURL, http.Header{}))
 	fresh, _ := repo.GetByID(context.Background(), 1)
-	state := readGatewayPoolUsage(fresh, gatewayPoolLedgerTag(identity))
+	state := readGatewayPoolUsage(fresh, gatewayPoolUsageTag(identity))
 	require.EqualValues(t, 540000, state.Rounds[0].fullUseDuration(time.Now()))
 	require.False(t, state.Rounds[0].DurationIncomplete)
 }
@@ -163,7 +163,7 @@ func TestGatewayPoolFullUsageStartsOnBusinessWriteBeforeResponse(t *testing.T) {
 	close(upstream.release)
 	<-done
 	require.NoError(t, readErr)
-	state := readGatewayPoolUsage(fresh, gatewayPoolLedgerTag(gwpoolTestIdentity))
+	state := readGatewayPoolUsage(fresh, gatewayPoolUsageTag(openAIGatewayPoolCacheKey(account, gwpoolTestIdentity)))
 	require.Len(t, state.Rounds, 1)
 	require.False(t, state.Rounds[0].FullStartedAt.IsZero())
 	require.Equal(t, 1, state.Rounds[0].Full)

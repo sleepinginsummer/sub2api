@@ -12,12 +12,12 @@ func (s *OpenAIGatewayService) startGatewayPoolProgress(ctx context.Context, acc
 	if start.IsZero() {
 		start = time.Now().UTC()
 	}
-	tag := gatewayPoolLedgerTag(identity)
+	tag := gatewayPoolUsageTag(identity)
 	if original, _ := ctx.Value(gatewayPoolUsageIdentityKey{}).(string); original != "" {
 		tag = original
 	}
 	scope := gatewayPoolProgressScope{tag: tag, requestStarted: start, identity: identity}
-	if tag == gatewayPoolLedgerTag(identity) {
+	if tag == gatewayPoolUsageTag(identity) {
 		var sequence uint64
 		committed := s.changeGatewayPoolUsage(ctx, account, identity, func(state *gatewayPoolUsageLedger) bool {
 			if !start.After(state.ClosedBefore[gatewayPoolUsageSharedModel]) {

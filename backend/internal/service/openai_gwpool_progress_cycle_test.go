@@ -11,13 +11,13 @@ import (
 
 func gatewayPoolProgressContext(identity string, start time.Time) context.Context {
 	ctx := context.WithValue(context.Background(), gatewayPoolUsageRequestKey{}, start)
-	return context.WithValue(ctx, gatewayPoolUsageIdentityKey{}, gatewayPoolLedgerTag(identity))
+	return context.WithValue(ctx, gatewayPoolUsageIdentityKey{}, gatewayPoolUsageTag(identity))
 }
 
 func TestGatewayPoolProgressSequencePersistsAcrossConcurrentRunsAndRestart(t *testing.T) {
 	account := gwpoolTestAccount(1)
 	svc, repo := gatewayRuntimeService(account)
-	identity := openAIGatewayPoolAccountKey(account)
+	identity := openAIGatewayPoolCacheKey(account, openAIGatewayPoolAccountKey(account))
 	const workers = 12
 	runs := make(chan *gatewayPoolProgressRun, workers)
 	var group sync.WaitGroup
@@ -57,7 +57,7 @@ func TestGatewayPoolProgressSequencePersistsAcrossConcurrentRunsAndRestart(t *te
 func TestGatewayPoolProgressSequencePublishesOnlyAfterDurableWrite(t *testing.T) {
 	account := gwpoolTestAccount(1)
 	svc, repo := gatewayRuntimeService(account)
-	identity := openAIGatewayPoolAccountKey(account)
+	identity := openAIGatewayPoolCacheKey(account, openAIGatewayPoolAccountKey(account))
 	repo.fail = true
 	first := svc.startGatewayPoolProgress(context.Background(), account, identity)
 	require.Zero(t, first.progress.Sequence, "failure must not publish a number that can be reused")
@@ -108,7 +108,7 @@ func TestGatewayPoolProgressPureFetchIsVisibleAndIdleCycleIsDurable(t *testing.T
 	svc.maintainGatewayPoolUsage(context.Background(), fresh, time.Now().Add(time.Hour))
 	fresh, err = repo.GetByID(context.Background(), 1)
 	require.NoError(t, err)
-	state := readGatewayPoolUsage(fresh, gatewayPoolLedgerTag(identity))
+	state := readGatewayPoolUsage(fresh, gatewayPoolUsageTag(identity))
 	require.Zero(t, state.VerificationSequence)
 	require.False(t, state.ClosedBefore[gatewayPoolUsageSharedModel].IsZero())
 	view, err = svc.GatewayPoolRuntimeProgress(context.Background(), []int64{1})
@@ -119,7 +119,7 @@ func TestGatewayPoolProgressPureFetchIsVisibleAndIdleCycleIsDurable(t *testing.T
 func TestGatewayPoolProgressOriginalIdentityCannotJoinNewCycle(t *testing.T) {
 	account := gwpoolTestAccount(1)
 	svc, _ := gatewayRuntimeService(account)
-	identity := openAIGatewayPoolAccountKey(account)
+	identity := openAIGatewayPoolCacheKey(account, openAIGatewayPoolAccountKey(account))
 	ctx := gatewayPoolProgressContext("old-credential-domain", time.Now().UTC())
 	run := svc.startGatewayPoolProgress(ctx, account, identity)
 	require.Zero(t, run.progress.Sequence)

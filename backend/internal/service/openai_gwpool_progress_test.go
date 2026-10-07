@@ -115,7 +115,7 @@ func TestGatewayPoolProgressEndsWithUsageCycle(t *testing.T) {
 	before, err := svc.GatewayPoolRuntimeProgress(ctx, []int64{1})
 	require.NoError(t, err)
 	require.Equal(t, "ready", before[1].Phase)
-	svc.changeGatewayPoolUsage(ctx, account, gwpoolTestIdentity, func(state *gatewayPoolUsageLedger) bool {
+	svc.changeGatewayPoolUsage(ctx, account, openAIGatewayPoolCacheKey(account, gwpoolTestIdentity), func(state *gatewayPoolUsageLedger) bool {
 		return state.end(time.Now().UTC(), "temporarily_unschedulable")
 	})
 	after, err := svc.GatewayPoolRuntimeProgress(ctx, []int64{1})

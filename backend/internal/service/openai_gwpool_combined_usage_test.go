@@ -13,7 +13,7 @@ func TestGatewayPoolFullUseIncludesAttemptInOneDurableMutation(t *testing.T) {
 	account := gwpoolTestAccount(1)
 	repo := &forkPerformanceRepo{gatewayRuntimeRepo: &gatewayRuntimeRepo{account: *account}}
 	svc := &OpenAIGatewayService{accountRepo: repo}
-	identity := openAIGatewayPoolAccountKey(account)
+	identity := openAIGatewayPoolCacheKey(account, openAIGatewayPoolAccountKey(account))
 	at := time.Now().UTC()
 	applied := OpenAIGatewayPoolApplied{AccountID: account.ID, Gateway: "g", Version: "v"}
 	svc.codexCookies.poolPairs.Store(identity, openAIGatewayPoolPair{
@@ -26,8 +26,8 @@ func TestGatewayPoolFullUseIncludesAttemptInOneDurableMutation(t *testing.T) {
 	require.True(t, svc.noteGatewayPoolFullUse(context.Background(), account, identity, applied, at))
 	require.Equal(t, 1, repo.writes)
 	require.Equal(t, 1, repo.reads)
-	require.Equal(t, 1, repo.scans)
-	state := readGatewayPoolUsage(&repo.account, gatewayPoolLedgerTag(identity))
+	require.Equal(t, 2, repo.scans, "首次建周期查询配置域和旧共享域，持久化后只查配置域")
+	state := readGatewayPoolUsage(&repo.account, gatewayPoolUsageTag(identity))
 	require.Len(t, state.Rounds, 1)
 	require.Equal(t, 1, state.Rounds[0].Attempted)
 	require.Equal(t, 1, state.Rounds[0].Full)
@@ -44,7 +44,7 @@ func TestGatewayPoolBusinessContactDoesNotRetryFailedCombinedMutation(t *testing
 			account := gwpoolTestAccount(1)
 			repo := &forkPerformanceRepo{gatewayRuntimeRepo: &gatewayRuntimeRepo{account: *account, fail: fail}}
 			svc := &OpenAIGatewayService{accountRepo: repo}
-			identity := openAIGatewayPoolAccountKey(account)
+			identity := openAIGatewayPoolCacheKey(account, openAIGatewayPoolAccountKey(account))
 			applied := OpenAIGatewayPoolApplied{AccountID: account.ID, Gateway: "g", Version: "v"}
 			svc.codexCookies.poolPairs.Store(identity, openAIGatewayPoolPair{gateway: "g", version: "v", cookie: "offline"})
 			ctx, sink := withOpenAIGatewayPoolSink(context.Background(), nil)
@@ -56,7 +56,7 @@ func TestGatewayPoolBusinessContactDoesNotRetryFailedCombinedMutation(t *testing
 			// business completion entry still executes its full usage branch.
 			svc.noteGatewayPoolBusinessContact(request, account, identity, applied, time.Now().UTC())
 			require.Equal(t, 1, repo.writes, "do not try a second mutation on persistence failure")
-			state := readGatewayPoolUsage(&repo.account, gatewayPoolLedgerTag(identity))
+			state := readGatewayPoolUsage(&repo.account, gatewayPoolUsageTag(identity))
 			if fail {
 				require.Empty(t, state.Rounds)
 			} else {
