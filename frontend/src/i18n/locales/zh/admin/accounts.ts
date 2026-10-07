@@ -1,6 +1,8 @@
 export default {
     accounts: {
       title: '账号管理',
+      upstreamRecordingTitle: '上游交互记录（不推荐启用）',
+      upstreamRecordingHint: '默认关闭，与网关池无关，仅记录此账号的 OpenAI/Codex 交互。会加密保存敏感对话正文及路由信息，增加资源与磁盘消耗；认证头不保存。只记录实际发送/读取的应用层数据，不额外读完已取消或主动关闭的响应。全实例默认 2 GiB，达到上限停止并在服务日志告警；没有日志浏览页面，需服务器管理员导出。',
       description: '管理 AI 平台账号和 Cookie',
       createAccount: '添加账号',
       autoRefresh: '自动刷新',
@@ -485,6 +487,12 @@ export default {
         accountName: '账号',
         triggeredAt: '触发时间',
         until: '解除时间',
+        cooldownUntil: '预计冷却结束',
+        cooldownRemaining: '本地冷却剩余',
+        cooldownUnknown: '无法估计',
+        cooldownFinished: '本地冷却已结束，等待可用候选',
+        cooldownEstimateHint: '按第 {count} 个已知网关的本地冷却截止时间估计；不代表届时池中有票或已恢复满血。',
+        poolRestPending: '等待本地冷却与可用候选达到恢复门槛；详情中查看冷却预计时间',
         remaining: '剩余时间',
         matchedKeyword: '匹配关键词',
         errorMessage: '错误详情',
@@ -746,16 +754,66 @@ export default {
       },
       // OpenAI specific hints
       openai: {
-        gwpoolRotation: '满血网关耗尽后多账号轮转',
-        gwpoolAutoWait: '缺票时等待重试（默认关闭）',
-        gwpoolAutoWaitDesc: '只在业务发送前，因无可用网关、无有效票或全部冷却而取不到票时等待；不会重发已发送的业务，不重试鉴权、限流或其他上游错误。开启轮转时先等待本账号，等待结束后仍须满足耗尽条件才能换号。',
-        gwpoolMaxWait: '最长缺票等待（秒）',
-        gwpoolMaxWaitDesc: '可填1–3600秒，留空默认120秒；同一请求累计等待，不逐轮重置。仍受客户端/反向代理及首输出截止时间限制，无法保证长连接始终不断。等待不增加前台验证张数或验证工作预算。',
+        gwpoolMemberIsolation: 'Team 成员独立记账',
+        gwpoolUseRecommendation: '使用池端推荐冷却（默认关闭）',
+        gwpoolUseRecommendationDesc: '关闭时只使用本地配置、学习与失败退避。开启后叠加池端推荐；推荐降低或撤回不抹掉真实失败下限，固定档优先。旧版混合记录保守保留至下一真实周期。',
+        gwpoolMemberIsolationDesc: '用于同一Team空间中不同成员分别记录网关冷却，默认关闭。只改变本地账本和池端消费身份，不改出站身份，也不代表上游冷却一定独立。',
+        gatewayRuntime: {
+          durationHours: '{hours}小时{minutes}分{seconds}秒',
+          live: '已验证 · {gateway} · 验证模型：{models}',
+          unverified: '尚未验证',
+          counts: '本轮验满 / 尝试 {full} / {attempted} 张',
+          active: '当前周期满血使用 {duration}',
+          duration: '{minutes}分{seconds}秒',
+          history: '使用历史',
+          ended: '{full}/{attempted}张 · 满血使用 {duration} · {end}结束',
+          archived: '历史满血累计 {duration} / {count}轮',
+          legacy: '旧统计 · {model} · {full}/{attempted}张',
+          legacyArchived: '旧归档 · {model} · {count}轮 · {full}/{attempted}张',
+          durationIncomplete: '（部分时长未观测）',
+          incomplete: '（计数为下界）'
+        },
+        gatewayProgress: {
+          run: '验证 #{id}',
+          idle: '当前无验证请求',
+          pending: '待重新准备',
+          count: '已试{attempt}张 · 用时{seconds}秒',
+          lastCount: '上次试票 {attempt} / {limit} 张 · 用时{seconds}秒',
+          fetching: '正在获取候选票',
+          verifying: '正在验证候选票',
+          waiting: '等待候选 / 验证重试',
+          ready: '已验满 · 队列暂停验证',
+          recentReady: '最近验满',
+          exhausted: '验证已结束 · 未找到可用票',
+          unknown: '验证已结束 · 未完成（缺票、超时或异常）',
+          cancelled: '验证已结束 · 请求取消',
+          rejected: '{count}张未通过',
+          concurrent: '{count}个请求正在预检（含当前请求）',
+          unavailable: '实时验证进度暂不可用'
+        },
+        gwpoolRotation: '网关不足时多账号轮转',
+        gwpoolRotationMinGateways: '停用门槛',
+        gwpoolRotationMinGatewaysDesc: '候选少于此数时休息，优先用完活票。默认1。',
+        gwpoolResumeGateways: '恢复门槛',
+        gwpoolResumeGatewaysDesc: '候选达到此数后恢复，不低于停用门槛。默认50。',
+        gwpoolCandidatesHint: '候选指可取且未冷却的网关，不代表已验满；清单读取失败不按零处理。',
+        gwpoolBulkHint: '逐项勾选才修改；未选字段保留各账号原值。数字清空恢复默认；Key留空保留原Key，不复制任一账号的运行统计。',
+        gwpoolBulkApply: '修改：{field}',
+        gwpoolAutoWait: '缺票或可恢复预检失败时等待（默认关闭）',
+        gwpoolEarlyProbe: '提前探测（实验性）',
+        gwpoolEarlyProbeDesc: '用于有请求等待、但正常候选已空的场景。每30分钟最多提前验证一个仍在本地冷却中的可取网关，成功即接业务；默认关闭，不后台囤票，不绕过鉴权或限流。',
+        gwpoolAutoWaitDesc: '仅在业务发送前，对缺票、全部冷却或可恢复的验证传输失败有限退避。不会重发已发送的业务；自身取消、验证预算/次数耗尽、鉴权及限流错误不走此重试。开启轮转时先等待本账号，换号仍须满足耗尽条件。',
+        gwpoolMaxWait: '请求等待最大时间（秒）',
+        gwpoolMaxWaitDesc: '默认120秒。每条请求独立累计取票、验证和恢复的等待；不限制成功后的推理时长，也不清空共享候选队列。客户端更早截止仍会退出。',
+        gwpoolProbeTimeout: '票验证最大时间（秒）',
+        gwpoolProbeTimeoutDesc: '默认35秒，范围1–120秒。每张票的A/B两次探测分别计时，不是两次合计；与请求等待最大时间独立。可恢复验证异常用完恢复次数后，丢弃当前票并按现有窗口冷却，继续下一张；不计为降级。',
+        gwpoolPrepareRetries: '异常恢复次数',
+        gwpoolPrepareRetriesDesc: '默认0次，不额外重试。可配置发送业务前取票或验证异常的额外恢复次数；并发请求共享恢复，次数用完后失败票进入冷却，不重放业务。',
         gwpoolProbeModel: 'state-echo 预检模型（实验性）',
         gwpoolProbeModelDefault: '默认：Luna（gpt-6-luna）',
         gwpoolProbeModelBusiness: '跟随业务模型',
-        gwpoolProbeModelDesc: '默认用 Luna 完成 A 请求取 state、B 请求带同一 state 验证；两次请求始终用同一所选模型。可切回 Astra、Sol 或跟随业务，从下一轮前台预检/后台预热生效。业务模型与 state 不变。现有样本不证明跨模型等价，预检通过不保证业务模型满血；关闭质量防护时不运行预检。',
-        gwpoolRotationDesc: '默认关闭。最新清单确认本账号可尝试网关耗尽后，先标记本轮耗尽，再从同组开启网关池和轮转的合格账号中换号。同一实例跨请求共享轮次，克隆账号按上游凭证域合并；全部合格账号耗尽才开新轮，并优先实际歇息最久者（包含预检触碰）。首次优先冷却完毕网关更多者，同会话有效满血窗口优先用完。重启会重建轮次，不清除网关冷却或限流；每请求同一凭证域最多一次，强续链不强行换号。单网关降级、预检次数或预算用尽、超时、429、鉴权等错误本身均不换号，也不沿普通故障转移换号。原全局换号上限仍有效，可能增加首输出等待。',
+        gwpoolProbeModelDesc: '默认用 Luna 完成 A 请求取 state、B 请求带同一 state 验证；两次请求始终使用所选模型。同账号同票共享验证结果，仍记录实际验证模型，业务继续使用自己的 state-echo 判据。修改从下一次预检生效；关闭质量防护时不运行预检。',
+        gwpoolRotationDesc: '网关池账号自动启用。活满血票优先用完；没有活满血票且最新清单确认候选低于阈值时，账号临时休息30秒至10分钟，并尝试同组其他合格网关池账号。到期仅重新评估，不保证满血。克隆去重、不回访、不强行切断续链；手动停用、认证和限流仍生效。候选严格为0且无活票、备用或在途工作，或超过30分钟无请求，或进入临时不可调度，任一条件结束当前周期并清零，历史保留。只累计本周期满血使用区间，不计找票等待；空闲结束截止最后请求完成，在途流不算空闲。',
         baseUrlHint: '留空使用官方 OpenAI API',
         apiKeyHint: '您的 OpenAI API Key',
         oauthPassthrough: '自动透传（仅替换认证）',
@@ -851,6 +909,15 @@ export default {
         codexImageToolBadgeDisabled: '不注入 Hosted 工具',
         codexImageToolBadgeBlock: '客户端图片工具已移除',
         gwpool: '使用网关池选择 Codex 路由',
+        gwpoolManualRetry: '清空冷却',
+        gwpoolManualRetryPending: '处理中…',
+        gwpoolManualRetryHint: '清零冷却与退避，保留活票和历史；无活票时重新准备。不清鉴权或上游限流。',
+        gwpoolManualRetryFailed: '清除冷却或启动重试失败',
+        gwpoolManualRetryResult: {
+          retained: '冷却已清除，保留当前活票。',
+          preparing: '冷却已清除，正在共享验证网关。',
+          blocked: '冷却已清除；账号仍受其它停调条件限制，未发起验证。'
+        },
         gwpoolDesc:
           '开启后，从网关池获取路由票，并在缓存有效期内复用。取不到可用票时，该账号请求失败，不回退到旧路由。原本使用 WebSocket 的上游请求会改走 HTTP/SSE。',
         gwpoolBaseUrl: '网关池地址',
@@ -861,39 +928,38 @@ export default {
         gwpoolConsumerKeyKeep: '已保存，留空不修改',
         gwpoolConsumerKeyDesc:
           '用于向网关池取票，不是 ChatGPT 的访问令牌。保存后不回显；已保存时留空可保留原值。',
-        gwpoolAdvanced: '冷却与等待上限（留空使用默认值）',
+        gwpoolAdvanced: '进阶：单次网络超时',
         gwpoolGatewayWindow: '初始冷却时间（秒）',
+        gwpoolCooldownResetHours: '冷却退避重置（小时）',
+        gwpoolCooldownResetDesc: '默认24小时，0关闭。定期降回初始冷却档，不重置账号额度；保留最近触碰、历史和活票，不立即解除冷却。',
         gwpoolGatewayWindowDesc:
           '默认 3600 秒（1 小时），可设 1～24 小时。每个账号×网关独立学习并调整冷却；到期只表示允许重试，不保证恢复。',
-        gwpoolFetchTimeout: '取票超时（秒）',
+        gwpoolFetchTimeout: '单次取票超时（秒）',
         gwpoolFetchTimeoutDesc:
           '默认 25 秒。限制一次取票等待，包含池子准备路由票的时间。过短可能取票失败，过长会增加请求等待。',
-        gwpoolListTimeout: '网关清单超时（秒）',
+        gwpoolListTimeout: '单次网关清单超时（秒）',
         gwpoolListTimeoutDesc:
           '默认 2 秒。限制获取候选网关清单的等待；失败或超时后交给池子选择，仍遵守本地冷却。',
         gwpoolWarmTickets: '前台最多验证几张票',
         gwpoolWarmTicketsDesc:
-          '默认 5 张，上限 8 张。调大会增加验证请求、等待和冷却中的网关数量，不保证成功。只影响前台；后台每个当前窗口最多尝试 1 张。',
-        gwpoolPrewarm: '提前准备下一个网关（默认关闭）',
-        gwpoolPrewarmDesc:
-          '有业务请求且当前已验证的网关接近切换时，后台最多尝试 1 个候选，减少下次等待。会消耗额外上游请求，并启动候选网关的冷却。失败保留当前票，同一窗口不重试；不能保证无等待切换。',
+          '默认 5 张，上限 8 张。调大会增加验证请求、等待和冷却中的网关数量，不保证成功。仅在业务需要新票时进行前台验证，不提前准备下一张票。',
         gwpoolGuard: '降智防护（默认开启）',
         gwpoolGuardDesc:
-          '开启时严格验证：无法判断或预算不足就阻止业务请求，不把未知记成降级。关闭后不做质量预检、降智截断或后台提前准备，但取票、冷却和限流仍然生效。验证是路由状态信号，不保证回答质量。',
+          '开启时严格验证：无法判断或预算不足就阻止业务请求，不把未知记成降级。关闭后不做质量预检或降智截断，但取票、冷却和限流仍然生效。验证是路由状态信号，不保证回答质量。',
         gwpoolGuardDescs: {
           queue:
-            '防护开启时，新票先用 2 次简短请求验证，通过后才发送业务请求；判降级则换票，达到前台张数上限仍未通过就失败。已验证且仍在缓存有效期内的票会直接复用。'
+            '新票逐张验证，通过后并发请求共享活票并暂停验证；失效后继续候选队列。没有固定验票张数上限，但每条业务请求有独立等票期限。'
         },
         gwpoolDetails: '查看冷却、触发条件与排障说明',
         gwpoolCooldownDetails:
           '冷却按账号×网关分别计算。明确未恢复时依次退避到 1/2/4/6/8/10/12/16/20/24 小时；确认恢复后结束本周期。同一档位在两个独立周期成功后固定，再次失败会解除固定。网络错误不参与学习。匿名统计的推荐值参与后续周期，个人固定值优先，已有冷却不会被突然缩短。',
-        gwpoolPrewarmDetails:
-          '提前准备只由业务请求触发，不运行空闲账号的定时探测。开始时参考当前缓存到期时间、最近验证耗时，以及样本足够时的历史窗口；历史样本在进程内共享，重启清零，样本不足仍可按缓存期限触发。每个当前窗口最多一轮、一个候选，最长 90 秒且不超过当前票到期时间；候选通过后至少还需 60 秒缓存寿命才切换。缺票、验证失败或异常均结束本轮。日志：gwpool_prewarm_start / gwpool_prewarm_ready / gwpool_prewarm_degraded / gwpool_prewarm_no_ticket / gwpool_prewarm_inconclusive。',
         gwpoolGuardDetails:
-          'state-echo 用两次请求比较响应头中的 turn-state：第二次携带第一次得到的值，HTTP 200 且未换成新值时判通过。限流、故障或缺少基准值都不下质量结论。业务响应上的连续刷新检查仍是启发式，不能保证识别全部降级。',
+          '前台A/B先取state再回带确认。业务需要复验时，票龄小于90秒额外最多3发，90秒及以上额外1发；任意HTTP 200且state同值或缺省即停止，保留原业务响应，全部刷新才丢票。不重发业务正文。错误、限流或超时为未知，不学习降级冷却。',
         gwpoolWarmDetails:
-          '前台验证预算默认 90 秒，取票可能额外增加等待；换账号重试也会叠加时间。它最多使用服务端首输出超时剩余额度的一半，预算不足时严格拒绝，不放行业务。验证请求消耗上游配额，不计入业务计费。排障日志：gwpool_warm_probe（验证）、gwpool_warm_inconclusive（无法判断并阻止业务）、gwpool_warm_no_budget（预算不足）。',
+          '同身份共享候选队列，取票和单次验证各有网络超时。每条请求独立等票，退出不影响其他等待者；最后一个等待者退出才取消网络工作，队列进度保留。验证请求消耗上游配额，不计入业务计费。',
         gwpoolErrors: {
+          GWPOOL_SETTING_INVALID: '网关池设置无效，请检查开关类型和数值范围。',
+          GWPOOL_TARGET_INVALID: '网关池批量设置仅支持OpenAI OAuth或Setup Token账号。',
           GWPOOL_PROBE_MODEL_INVALID: '实验性预检模型只能选择 Astra、Sol 或 Luna；选择默认则保持业务模型。',
           GWPOOL_WAIT_INVALID: '缺票等待开关必须是布尔值；最长等待需为1–3600的整数秒。',
           GWPOOL_BASE_URL_INVALID:
@@ -940,16 +1006,14 @@ export default {
           fullUntimed: '未计时',
           cooldownFixed: '固定{minutes}分钟',
           cooldownRecommended: '池子建议{minutes}分钟',
-          legend: '✓ 近期验过满血 · ! 本地冷却中 · 灰 冷却到期可重试，不代表已确认恢复',
+          legend: '✓ 当前票已验证 · ! 本地冷却中 · 灰 可再试；历史满血不代表当前可用',
           // 两个数各报各的，**不做减法**：历史落点来自本地账本（过去一个窗口碰过的网关名），
           // 池子剩余是「此刻可交付的清单」现对本地账本得出的，两个集合不是包含关系。
-          windowUsage: '初始冷却 {hours} 小时；冷却中 {used} 个；冷却完毕 {cooled} 个',
+          windowUsage: '冷却中 {used} · 冷却完毕 {cooled}',
           poolSnapshot: '最近库存快照：{free}（非实时）',
           windowUsageHint:
             '「冷却中」和「冷却完毕」按本行历史中各网关的冷却截止时间实时计算；时间未知不计入完毕。' +
-            '冷却完毕只表示允许重试，不保证池中仍有票或已经恢复满血。\n' +
-            '库存快照是上次取票查询时，有可交付票且本地不在冷却的网关数；不是当前可尝试数量，' +
-            '不会随时间自动更新，也不包含所有池侧限制。历史与库存不是同一集合，不能相减；没有快照时不显示。',
+            '冷却完毕只表示允许重试，不保证池中仍有票或已经恢复满血。',
           // 冷却到期只是允许重试，不能把本地估计写成满血保底。
           forecast: '可重试网关按实测成功率估计：一小时约 {minutes} 分钟满血',
           forecastPending: '一小时满血预测：待统计（同层样本不足）',
@@ -971,7 +1035,7 @@ export default {
           // state-echo 判定（后端 openai_gwpool_state_echo.go）。
           verdicts: {
             full: '满血',
-            fullExpired: '历史满血（窗口已过，不代表当前可用）',
+            fullExpired: '历史满血（不代表当前票或其它模型可用）',
             degraded: '降智',
             none: '没判过'
           },

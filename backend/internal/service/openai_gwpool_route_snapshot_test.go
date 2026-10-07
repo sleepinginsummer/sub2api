@@ -57,7 +57,7 @@ func TestGatewayPoolRouteSnapshotSurvivesCacheChanges(t *testing.T) {
 			require.Equal(t, first, *snapshot)
 			result := &OpenAIForwardResult{Model: "gpt-6-astra", UpstreamHeaders: resp.Header, GatewayPoolRoutePair: snapshot, GatewayPoolApplied: openAIGatewayPoolAppliedFromResponse(resp)}
 			cacheKey := openAIGatewayPoolCacheKey(account, gwpoolTestIdentity)
-			svc.codexCookies.poolPairs.Store(cacheKey, openAIGatewayPoolPair{cookie: first, gateway: "unified-142", until: time.Now().Add(-time.Second)})
+			svc.codexCookies.poolPairs.Store(cacheKey, openAIGatewayPoolPair{cookie: first, gateway: "unified-142", until: time.Now().Add(-time.Second), invalidated: true})
 			switch state {
 			case "rotated":
 				rotated := send()

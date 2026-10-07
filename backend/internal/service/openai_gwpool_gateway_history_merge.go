@@ -18,7 +18,7 @@ func MergeOpenAIGatewayHistoryExtra(existing, updates map[string]any) (map[strin
 		if incoming.UpdatedAt.Before(current.UpdatedAt) {
 			incoming = openAIGatewayHistory{}
 		} else {
-			current = openAIGatewayHistory{}
+			current = gatewayPoolHistoryForTag(current, incoming.LedgerTag)
 		}
 	}
 	if incoming.LedgerTag != "" {
@@ -47,7 +47,7 @@ func MergeOpenAIGatewayHistoryExtra(existing, updates map[string]any) (map[strin
 			next.FullHeldMs = previous.FullHeldMs
 		}
 		// 未测到冷却或旧观察不能擦掉后续学到的冷却参数。
-		if next.Cooldown == nil || (previous.Cooldown != nil && previous.Cooldown.UpdatedAt.After(next.Cooldown.UpdatedAt)) {
+		if next.Cooldown == nil || newerGatewayPoolCooldown(previous.Cooldown, next.Cooldown) {
 			next.Cooldown = previous.Cooldown
 		}
 		current.Seen[gateway] = next
@@ -61,6 +61,23 @@ func MergeOpenAIGatewayHistoryExtra(existing, updates map[string]any) (map[strin
 	if incoming.PoolLive > 0 && incoming.PoolFree != nil && !incoming.UpdatedAt.Before(current.UpdatedAt) {
 		current.PoolLive, current.PoolFree = incoming.PoolLive, incoming.PoolFree
 	}
+	// 新观察可更新排程配置，清冷却/重置代际独立取最新，迟到增量不能回滚屏障。
+	reset := current.CooldownReset
+	if !incoming.UpdatedAt.Before(current.UpdatedAt) {
+		reset.IntervalHours, reset.StartedAt = incoming.CooldownReset.IntervalHours, incoming.CooldownReset.StartedAt
+		if current.Previous == nil && incoming.Previous != nil {
+			previous := *incoming.Previous
+			previous.Previous = nil
+			current.Previous = &previous
+		}
+	}
+	if incoming.CooldownReset.LastAt.After(reset.LastAt) {
+		reset.LastAt = incoming.CooldownReset.LastAt
+	}
+	if incoming.CooldownReset.ClearedAt.After(reset.ClearedAt) {
+		reset.ClearedAt = incoming.CooldownReset.ClearedAt
+	}
+	current.CooldownReset = reset
 	if incoming.UpdatedAt.After(current.UpdatedAt) {
 		current.UpdatedAt = incoming.UpdatedAt
 	}
@@ -81,5 +98,10 @@ func MergeOpenAIGatewayHistoryExtra(existing, updates map[string]any) (map[strin
 	if current.LedgerTag != "" {
 		result[openAIGatewayLedgerTagExtraKey] = current.LedgerTag
 	}
+	previousTag := ""
+	if current.Previous != nil {
+		previousTag = current.Previous.LedgerTag
+	}
+	result[openAIGatewayPreviousLedgerTagExtraKey] = previousTag
 	return result, nil
 }

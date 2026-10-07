@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"slices"
 	"sync"
 	"time"
 )
@@ -19,6 +20,9 @@ type gatewayPoolRounds struct {
 type gatewayPoolRound struct {
 	generation uint64
 	exhausted  map[string]struct{}
+	current    string
+	active     []string
+	resting    map[string]time.Time
 }
 
 func (r *gatewayPoolRounds) groupLocked(group int64) *gatewayPoolRound {
@@ -26,9 +30,36 @@ func (r *gatewayPoolRounds) groupLocked(group int64) *gatewayPoolRound {
 		r.groups = map[int64]*gatewayPoolRound{}
 	}
 	if r.groups[group] == nil {
-		r.groups[group] = &gatewayPoolRound{exhausted: map[string]struct{}{}}
+		r.groups[group] = &gatewayPoolRound{exhausted: map[string]struct{}{}, resting: map[string]time.Time{}}
 	}
-	return r.groups[group]
+	state := r.groups[group]
+	for domain, until := range state.resting {
+		if !time.Now().Before(until) {
+			delete(state.resting, domain)
+			delete(state.exhausted, domain)
+		}
+	}
+	return state
+}
+
+func (r *gatewayPoolRounds) rest(group int64, identity string, until time.Time) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	state := r.groupLocked(group)
+	domain := gatewayPoolLedgerIdentity(identity)
+	state.resting[domain] = until
+	state.exhausted[domain] = struct{}{}
+	state.retire(domain)
+}
+
+func (r *gatewayPoolRounds) recovered(identity string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	domain := gatewayPoolLedgerIdentity(identity)
+	for _, state := range r.groups {
+		delete(state.resting, domain)
+		delete(state.exhausted, domain)
+	}
 }
 
 func (r *gatewayPoolRounds) generation(group int64) uint64 {
@@ -43,8 +74,39 @@ func (r *gatewayPoolRounds) exhaust(group int64, identity string, generation uin
 	state := r.groupLocked(group)
 	// A confirmation started before a concurrent reset cannot exhaust the new round.
 	if identity != "" && state.generation == generation {
-		state.exhausted[gatewayPoolLedgerIdentity(identity)] = struct{}{}
+		domain := gatewayPoolLedgerIdentity(identity)
+		state.exhausted[domain] = struct{}{}
+		state.retire(domain)
 	}
+}
+
+func (r *gatewayPoolRounds) claim(group int64, identity string, limits ...int) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	state := r.groupLocked(group)
+	domain := gatewayPoolLedgerIdentity(identity)
+	if _, exhausted := state.exhausted[domain]; exhausted {
+		return false
+	}
+	limit := gatewayPoolActiveAccountsDefault
+	if len(limits) > 0 {
+		limit = normalizeGatewayPoolActiveAccounts(limits[0])
+	}
+	if len(state.active) == 0 && state.current != "" {
+		state.active = []string{state.current}
+	}
+	if len(state.active) > limit {
+		state.active = state.active[:limit]
+	}
+	if slices.Contains(state.active, domain) {
+		return true
+	}
+	if len(state.active) >= limit {
+		return false
+	}
+	state.active = append(state.active, domain)
+	state.current = state.active[0]
+	return true
 }
 
 func (r *gatewayPoolRounds) touch(identity string, at time.Time) {
@@ -90,6 +152,11 @@ func (r *gatewayPoolRounds) snapshot(group int64, domains map[int64]string, comp
 	if all {
 		state.generation++
 		state.exhausted = map[string]struct{}{}
+		state.current = ""
+		state.active = nil
+		for domain := range state.resting {
+			state.exhausted[domain] = struct{}{}
+		}
 	}
 	excluded := map[int64]struct{}{}
 	for id, domain := range domains {
@@ -118,9 +185,43 @@ func gatewayPoolRoundExclusions(ctx context.Context, excluded map[int64]struct{}
 }
 
 func (s *OpenAIGatewayService) gatewayPoolRoundSelectionAllowed(ctx context.Context, group *int64, selection *AccountSelectionResult) bool {
-	if group == nil || selection == nil || !gatewayPoolRotationAccount(selection.Account, *group) {
+	if group == nil || selection == nil || selection.Account == nil || !selection.Account.IsOpenAIOAuthLike() {
 		return true
 	}
-	identity, err := s.codexCookies.gatewayPoolIdentity(ctx, selection.Account)
-	return err == nil && !s.codexCookies.poolRounds.blocked(*group, openAIGatewayPoolCacheKey(selection.Account, identity))
+	account := selection.Account
+	known, _ := s.codexCookies.poolRotationAccounts.Load(account.ID)
+	if !gatewayPoolRotationAccount(account, *group) && known != true {
+		return true
+	}
+	if s.accountRepo != nil {
+		fresh, err := s.accountRepo.GetByID(ctx, account.ID)
+		if err != nil || fresh == nil {
+			return false
+		}
+		account = fresh
+	}
+	if !gatewayPoolRotationAccount(account, *group) {
+		return true
+	}
+	if !account.IsSchedulable() {
+		return false
+	}
+	if allowed, err := s.gatewayPoolResumeAllowed(ctx, account, true); err != nil || !allowed {
+		return false
+	}
+	identity, err := s.codexCookies.gatewayPoolIdentity(ctx, account)
+	if err != nil || s.codexCookies.poolRounds.blocked(*group, identity) {
+		return false
+	}
+	boundID, _ := ctx.Value(gatewayPoolExistingBindingKey{}).(int64)
+	bound := boundID == account.ID
+	if s.codexCookies.gatewayPoolVerifiedFull(identity) {
+		return bound || s.codexCookies.poolRounds.claim(*group, identity, s.gatewayPoolActiveAccountLimit(ctx, group))
+	}
+	if s.gatewayPoolNoRemainingRoutes(ctx, account) {
+		s.codexCookies.poolRounds.exhaust(*group, identity, s.codexCookies.poolRounds.generation(*group))
+		s.restGatewayPoolAccount(ctx, account, identity, *group)
+		return false
+	}
+	return bound || s.codexCookies.poolRounds.claim(*group, identity, s.gatewayPoolActiveAccountLimit(ctx, group))
 }

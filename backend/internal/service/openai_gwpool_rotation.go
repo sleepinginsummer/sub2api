@@ -4,18 +4,71 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/gwpool"
 )
 
 const openAIGatewayPoolRotationExtraKey = "openai_gwpool_rotation"
+const openAIGatewayPoolRotationMinGatewaysExtraKey = "openai_gwpool_rotation_min_gateways"
+const openAIGatewayPoolResumeGatewaysExtraKey = "openai_gwpool_resume_gateways"
+const gatewayPoolRotationMinGatewaysMax = 512
+const gatewayPoolResumeGatewaysDefault = 50
+
+func (a *Account) gatewayPoolRotationMinGateways() int {
+	if a != nil {
+		if n := a.getExtraInt(openAIGatewayPoolRotationMinGatewaysExtraKey); n >= 1 && n <= gatewayPoolRotationMinGatewaysMax {
+			return n
+		}
+	}
+	return 1
+}
+
+func (a *Account) gatewayPoolResumeGateways() int {
+	threshold := gatewayPoolResumeGatewaysDefault
+	if a != nil {
+		if n := a.getExtraInt(openAIGatewayPoolResumeGatewaysExtraKey); n >= 1 && n <= gatewayPoolRotationMinGatewaysMax {
+			threshold = n
+		}
+	}
+	return max(threshold, a.gatewayPoolRotationMinGateways())
+}
 
 // Distinguishes completed, conclusive ticket attempts from time-budget expiry.
 // Reaching this limit alone still does NOT authorize account rotation.
 var errGatewayPoolWarmAttemptsFinished = fmt.Errorf("gateway attempts finished: %w", errOpenAIGatewayPoolWarmExhausted)
 
 type gatewayPoolRotationKey struct{}
+type gatewayPoolRetryOnlyKey struct{}
+type gatewayPoolRetryOnly struct {
+	accountID int64
+	groupID   int64
+	deadline  time.Time
+	failure   *UpstreamFailoverError
+}
+
+func gatewayPoolRetryOnlyFrom(ctx context.Context) gatewayPoolRetryOnly {
+	state, _ := ctx.Value(gatewayPoolRetryOnlyKey{}).(gatewayPoolRetryOnly)
+	return state
+}
+
+// GatewayPoolRetryFailure checks dispatch admission only. It deliberately does
+// not add a context deadline that could cut off a successful response stream.
+func GatewayPoolRetryFailure(ctx context.Context) *UpstreamFailoverError {
+	retry := gatewayPoolRetryOnlyFrom(ctx)
+	if retry.accountID == 0 || retry.deadline.IsZero() || time.Now().Before(retry.deadline) {
+		return nil
+	}
+	failure := UpstreamFailoverError{StatusCode: http.StatusTooManyRequests}
+	if retry.failure != nil {
+		failure = *retry.failure
+	}
+	failure.RetryableOnSameAccount, failure.SameAccountRetryOnly = false, false
+	failure.NextAccountAction = NextAccountStop
+	return &failure
+}
+
 type gatewayPoolRotation struct {
 	groupID   int64
 	attempted map[int64]struct{}
@@ -33,7 +86,7 @@ func GatewayPoolAccountRotationActive(ctx context.Context) bool {
 
 func gatewayPoolRotationAccount(account *Account, groupID int64) bool {
 	return account != nil && groupID > 0 && account.IsOpenAIOAuthLike() &&
-		account.getExtraBool(openAIGatewayPoolExtraKey) && account.getExtraBool(openAIGatewayPoolRotationExtraKey) &&
+		account.UsesGatewayPool() &&
 		openAIStickyAccountMatchesGroup(account, &groupID)
 }
 
@@ -56,27 +109,47 @@ func (s *OpenAIGatewayService) PrepareGatewayPoolAccountRotation(ctx context.Con
 	if failure == nil {
 		return ctx
 	}
+	previousRetry := gatewayPoolRetryOnlyFrom(ctx)
+	ctx = context.WithValue(ctx, gatewayPoolRetryOnlyKey{}, gatewayPoolRetryOnly{})
+	if source != nil && previousRetry.accountID == source.ID && !previousRetry.deadline.IsZero() &&
+		previousRetry.deadline.Before(failure.SameAccountRetryDeadline) {
+		failure.SameAccountRetryDeadline = previousRetry.deadline
+	}
 	state := gatewayPoolRotationFrom(ctx)
 	if state == nil && (source == nil || !source.IsOpenAIOAuthLike()) {
 		return ctx
 	}
 	if s == nil || s.accountRepo == nil || groupID == nil || source == nil {
-		if state != nil || (source != nil && source.getExtraBool(openAIGatewayPoolRotationExtraKey)) {
+		if state != nil || (source != nil && source.UsesGatewayPool()) {
 			failure.NextAccountAction = NextAccountStop
 		}
 		return ctx
 	}
 	fresh, err := s.accountRepo.GetByID(ctx, source.ID)
-	if state == nil && err == nil && fresh != nil && !fresh.getExtraBool(openAIGatewayPoolRotationExtraKey) {
+	if state == nil && err == nil && fresh != nil && !fresh.UsesGatewayPool() {
 		return ctx
 	}
-	// For opted-in accounts ALL other failures stop here, including ordinary
-	// HTTP/auth/transport failures that the general failover loop could replay.
+	// A confirmed transient 429 may wait on the same credential, but never
+	// grants permission to switch credentials. The deadline/reservation was
+	// already established by the upstream error classifier.
+	retry429 := failure.StatusCode == http.StatusTooManyRequests &&
+		failure.RetryableOnSameAccount && !failure.SameAccountRetryDeadline.IsZero() &&
+		time.Now().Before(failure.SameAccountRetryDeadline) &&
+		failure.SameAccountRetryNotBefore.Before(failure.SameAccountRetryDeadline) &&
+		(failure.NextAccountAction != NextAccountStop || failure.SameAccountRetryOnly) && !failure.GatewayPoolRotation
 	failure.RetryableOnSameAccount = false
+	failure.SameAccountRetryOnly = false
 	failure.NextAccountAction = NextAccountStop
 	if err != nil || !gatewayPoolRotationAccount(fresh, *groupID) || !fresh.IsActive() ||
 		(state != nil && state.groupID != *groupID) {
 		return ctx
+	}
+	if retry429 && fresh.IsSchedulable() {
+		failure.RetryableOnSameAccount = true
+		failure.SameAccountRetryOnly = true
+		return context.WithValue(ctx, gatewayPoolRetryOnlyKey{}, gatewayPoolRetryOnly{
+			accountID: fresh.ID, groupID: *groupID, deadline: failure.SameAccountRetryDeadline, failure: failure,
+		})
 	}
 	generation := s.codexCookies.poolRounds.generation(*groupID)
 	if !failure.GatewayPoolRotation || !s.gatewayPoolNoRemainingRoutes(ctx, fresh) {
@@ -87,9 +160,9 @@ func (s *OpenAIGatewayService) PrepareGatewayPoolAccountRotation(ctx context.Con
 		return ctx
 	}
 	// Mark before finding a replacement, including the last account in a round.
-	// 耗尽及取票退避只影响当前池配置，不能让同凭据的其它池一起停用。
-	cacheKey := openAIGatewayPoolCacheKey(fresh, identity)
-	s.codexCookies.poolRounds.exhaust(*groupID, cacheKey, generation)
+	cacheKey := identity
+	s.codexCookies.poolRounds.exhaust(*groupID, identity, generation)
+	s.restGatewayPoolAccount(ctx, fresh, identity, *groupID)
 	next := &gatewayPoolRotation{groupID: *groupID, attempted: map[int64]struct{}{source.ID: {}},
 		domains: map[string]struct{}{gatewayPoolLedgerIdentity(cacheKey): {}}}
 	if state != nil {
@@ -128,8 +201,8 @@ func (s *OpenAIGatewayService) gatewayPoolNoRemainingRoutes(ctx context.Context,
 	if err := s.codexCookies.hydrateGatewayPoolSharedHistory(ctx, account, identity); err != nil {
 		return false
 	}
-	generation, pending := s.codexCookies.gatewayPoolInventorySnapshot(identity, account)
-	if pending {
+	generation, active, available := s.codexCookies.gatewayPoolInventoryCandidates(identity, account)
+	if active {
 		return false
 	}
 	pool, err := s.codexCookies.poolClient(account)
@@ -139,27 +212,60 @@ func (s *OpenAIGatewayService) gatewayPoolNoRemainingRoutes(ctx context.Context,
 	listCtx, cancel := context.WithTimeout(ctx, account.gatewayPoolListTimeout())
 	defer cancel()
 	gateways, err := pool.Gateways(listCtx, gatewayPoolUpstreamAccountID(identity), gatewayPoolAccountTag(account, identity))
-	if err != nil || len(gateways) == 0 {
-		return false // supply outage / unreadable state is not account-specific exhaustion
+	if err != nil {
+		return false // unreadable state is not a zero inventory
 	}
-	ready := 0
 	for _, gateway := range gateways {
 		if !gateway.PairReady {
 			continue
 		}
-		ready++
-		_, cooling := s.codexCookies.gatewayPoolUsedAt(identity, gateway.Name, account.gatewayPoolGatewayWindow())
-		if !cooling && !gateway.UsedByYou {
-			return false
+		_, cooling := s.codexCookies.gatewayPoolUsedAt(identity, gateway.Name, account.gatewayPoolGatewayWindow(), account.gatewayPoolUseRecommendation())
+		if !cooling {
+			available[gateway.Name] = struct{}{}
 		}
 	}
-	after, pending := s.codexCookies.gatewayPoolInventorySnapshot(identity, account)
-	return ready > 0 && !pending && after == generation
+	after, pending, _ := s.codexCookies.gatewayPoolInventoryCandidates(identity, account)
+	if len(available) == 0 && !pending && after == generation &&
+		len(s.codexCookies.gatewayPoolEarlyCandidates(account, identity, gateways)) > 0 &&
+		s.codexCookies.gatewayPoolEarlyDue(ctx, account, identity) {
+		return false // read-only admission; only the later foreground fetch spends budget
+	}
+	return len(available) < account.gatewayPoolRotationMinGateways() && !pending && after == generation
 }
 
-// Read opt-ins from the repository, not scheduler snapshots. An explicit
+// Read gateway-pool eligibility from the repository, not scheduler snapshots. An explicit
 // allow-list also blocks simple-mode/fallback-group selection from widening scope.
 func gatewayPoolRotationExclusions(ctx context.Context, repo AccountRepository, groupID *int64, excluded map[int64]struct{}) (map[int64]struct{}, map[int64]struct{}, error) {
+	if retry := gatewayPoolRetryOnlyFrom(ctx); retry.accountID != 0 {
+		if failure := GatewayPoolRetryFailure(ctx); failure != nil {
+			return nil, nil, failure
+		}
+		if repo == nil || groupID == nil || *groupID != retry.groupID {
+			return nil, nil, ErrNoAvailableAccounts
+		}
+		accounts, err := repo.ListByPlatform(ctx, PlatformOpenAI)
+		if err != nil {
+			return nil, nil, err
+		}
+		omit := cloneExcludedAccountIDs(excluded)
+		if omit == nil {
+			omit = map[int64]struct{}{}
+		}
+		allowed := map[int64]struct{}{}
+		for i := range accounts {
+			account := &accounts[i]
+			if account.ID != retry.accountID {
+				omit[account.ID] = struct{}{}
+			} else if _, skipped := omit[account.ID]; !skipped &&
+				gatewayPoolRotationAccount(account, retry.groupID) && account.IsSchedulable() {
+				allowed[account.ID] = struct{}{}
+			}
+		}
+		if len(allowed) == 0 {
+			return nil, nil, ErrNoAvailableAccounts
+		}
+		return omit, allowed, nil
+	}
 	state := gatewayPoolRotationFrom(ctx)
 	if state == nil {
 		return excluded, nil, nil
@@ -199,7 +305,8 @@ func gatewayPoolRotationExclusions(ctx context.Context, repo AccountRepository, 
 
 func gatewayPoolRotationRecheck(ctx context.Context, repo AccountRepository, allowed map[int64]struct{}, selection *AccountSelectionResult) bool {
 	state := gatewayPoolRotationFrom(ctx)
-	if state == nil {
+	retry := gatewayPoolRetryOnlyFrom(ctx)
+	if state == nil && retry.accountID == 0 {
 		return true
 	}
 	if selection == nil || selection.Account == nil {
@@ -209,7 +316,11 @@ func gatewayPoolRotationRecheck(ctx context.Context, repo AccountRepository, all
 		return false
 	}
 	fresh, err := repo.GetByID(ctx, selection.Account.ID)
-	if err != nil || !gatewayPoolRotationAccount(fresh, state.groupID) || !fresh.IsSchedulable() {
+	groupID := retry.groupID
+	if retry.accountID == 0 {
+		groupID = state.groupID
+	}
+	if err != nil || !gatewayPoolRotationAccount(fresh, groupID) || !fresh.IsSchedulable() {
 		return false
 	}
 	selection.Account = fresh

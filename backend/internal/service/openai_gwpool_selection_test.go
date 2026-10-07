@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -9,6 +10,41 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/stretchr/testify/require"
 )
+
+type gatewaySelectionReadFails struct{ AccountRepository }
+
+func (gatewaySelectionReadFails) GetByID(context.Context, int64) (*Account, error) {
+	return nil, errors.New("unexpected extra read")
+}
+
+func TestGatewayPoolSelectionLeavesOrdinaryOAuthOutsideFreshGate(t *testing.T) {
+	account := &Account{ID: 1, Platform: PlatformOpenAI, Type: AccountTypeOAuth}
+	svc := &OpenAIGatewayService{accountRepo: gatewaySelectionReadFails{}}
+	group := int64(7)
+	require.True(t, svc.gatewayPoolRoundSelectionAllowed(context.Background(), &group, &AccountSelectionResult{Account: account}))
+}
+
+func TestGatewayPoolSelectionCanReachHealthyFourthAccount(t *testing.T) {
+	group := int64(7)
+	var accounts []Account
+	for id := int64(1); id <= 4; id++ {
+		account := preferenceAccount(id, group, int(10-id))
+		fake := newGwpoolFakePool(t, "offline", 150)
+		fake.listGateways = []gwpoolFakeGateway{{Name: "unified-300", PairReady: id == 4, UsedByYou: id != 4}}
+		fake.configure(account)
+		accounts = append(accounts, *account)
+	}
+	repo := gatewayRotationRepo{schedulerTestOpenAIAccountRepo{accounts: accounts}}
+	svc := &OpenAIGatewayService{accountRepo: repo, cache: &schedulerTestGatewayCache{}, cfg: &config.Config{},
+		concurrencyService: NewConcurrencyService(schedulerTestConcurrencyCache{})}
+	selected, _, err := svc.SelectAccountWithSchedulerForCapability(context.Background(), &group, "", "", "gpt-6-astra", nil,
+		OpenAIUpstreamTransportHTTPSSE, OpenAIEndpointCapabilityChatCompletions, false, false, true)
+	require.NoError(t, err)
+	require.EqualValues(t, 4, selected.Account.ID)
+	if selected.ReleaseFunc != nil {
+		selected.ReleaseFunc()
+	}
+}
 
 func preferenceAccount(id, group int64, cooled int) *Account {
 	account := rotationAccount(id, group)
@@ -52,7 +88,9 @@ func TestGatewayPoolSelectionPrioritizesFreshCooledCountsAcrossSchedulers(t *tes
 				cookie: "offline", version: "full", gateway: "unified-200", until: time.Now().Add(time.Minute),
 			})
 			svc.codexCookies.gatewayPoolMarkVerifiedFull(identity, "full")
-			require.Equal(t, a.ID, selectAccount(context.Background(), nil), "reuse an actual verified live window")
+			require.Equal(t, b.ID, selectAccount(context.Background(), nil), "another live ticket must not evict the active primary")
+			svc.codexCookies.poolRounds.rest(group, openAIGatewayPoolCacheKey(a, openAIGatewayPoolAccountKey(a)), time.Now().Add(time.Minute))
+			svc.codexCookies.poolRounds.rest(group, openAIGatewayPoolCacheKey(b, openAIGatewayPoolAccountKey(b)), time.Now().Add(time.Minute))
 			ctx := context.WithValue(context.Background(), gatewayPoolRotationKey{}, &gatewayPoolRotation{
 				groupID: group, attempted: map[int64]struct{}{a.ID: {}, b.ID: {}},
 			})
@@ -74,7 +112,7 @@ func TestGatewayPoolSelectionReordersOnlyKnownOptedInSlots(t *testing.T) {
 	require.Equal(t, []int64{3, 99, 2, 1, 100}, ids, "ordinary positions and equal-score baseline order must survive")
 }
 
-func TestGatewayPoolSelectionKeepsSessionVerifiedWindowUntilItExpires(t *testing.T) {
+func TestGatewayPoolSelectionKeepsSessionUntilFreshExclusion(t *testing.T) {
 	prefs := gatewayPoolAccountPreferences{
 		1:  {verified: true, cooled: 1},
 		40: {verified: true, cooled: 20},
@@ -83,7 +121,9 @@ func TestGatewayPoolSelectionKeepsSessionVerifiedWindowUntilItExpires(t *testing
 	require.False(t, gatewayPoolPreferAlternative(ctx, 1),
 		"a better future inventory must not evict this session's current verified window")
 	prefs[1] = gatewayPoolAccountPreference{cooled: 1}
-	require.True(t, gatewayPoolPreferAlternative(ctx, 1), "expired windows may yield to a better account")
+	require.False(t, gatewayPoolPreferAlternative(ctx, 1), "finding a new ticket on the old row does not by itself move its session")
+	ctx = context.WithValue(ctx, gatewayPoolRoundExclusionsKey{}, map[int64]struct{}{1: {}})
+	require.True(t, gatewayPoolPreferAlternative(ctx, 1), "fresh rest/exhaustion can release a soft binding")
 }
 
 func TestGatewayPoolSelectionWeightedSessionKeepsVerifiedWindow(t *testing.T) {
@@ -151,8 +191,10 @@ func TestGatewayPoolSelectionRechecksConcurrentExhaustionBySelectingRemainingAcc
 func TestGatewayPoolSelectionRoundPersistsAcrossRequestsAndRestartsAfterLastAccount(t *testing.T) {
 	group := int64(7)
 	a, b := preferenceAccount(1, group, 20), preferenceAccount(2, group, 1)
+	a.Extra[openAIGatewayPoolResumeGatewaysExtraKey] = 1
+	b.Extra[openAIGatewayPoolResumeGatewaysExtraKey] = 1
 	fake := newGwpoolFakePool(t, "offline-cookie", 150)
-	fake.listGateways = []gwpoolFakeGateway{{Name: "unified-200", PairReady: true, UsedByYou: true}}
+	fake.listGateways = []gwpoolFakeGateway{{Name: "unified-201", PairReady: true}}
 	fake.configure(a, b)
 	repo := gatewayRotationRepo{schedulerTestOpenAIAccountRepo{accounts: []Account{*a, *b}}}
 	svc := &OpenAIGatewayService{accountRepo: repo, cache: &schedulerTestGatewayCache{}, cfg: &config.Config{},
@@ -172,9 +214,11 @@ func TestGatewayPoolSelectionRoundPersistsAcrossRequestsAndRestartsAfterLastAcco
 	require.NoError(t, err)
 	require.Equal(t, a.ID, id, "the initial round keeps cooled-count priority")
 	exhaust := func(ctx context.Context, account *Account) context.Context {
+		fake.listGateways = []gwpoolFakeGateway{{Name: "unified-200", PairReady: true, UsedByYou: true}}
 		failure := &UpstreamFailoverError{GatewayPoolRotation: true, NextAccountAction: NextAccountStop}
 		next := svc.PrepareGatewayPoolAccountRotation(ctx, &group, account, failure)
 		require.True(t, failure.ShouldRetryNextAccount())
+		fake.listGateways = []gwpoolFakeGateway{{Name: "unified-201", PairReady: true}}
 		return next
 	}
 	ctx := exhaust(context.Background(), a)
@@ -184,9 +228,22 @@ func TestGatewayPoolSelectionRoundPersistsAcrossRequestsAndRestartsAfterLastAcco
 	ctx = exhaust(ctx, b)
 	_, err = selectID(ctx)
 	require.ErrorIs(t, err, ErrNoAvailableAccounts, "round reset cannot erase this request's attempts")
+	_, err = selectID(context.Background())
+	require.ErrorIs(t, err, ErrNoAvailableAccounts, "all resting accounts must not restart immediately")
+	for i := range repo.accounts {
+		past := time.Now().Add(-time.Second)
+		repo.accounts[i].TempUnschedulableUntil = &past
+		identity := openAIGatewayPoolAccountKey(&repo.accounts[i])
+		gatewayPoolRestDue(t, svc, repo, repo.accounts[i].ID, identity)
+	}
+	svc.codexCookies.poolRounds.mu.Lock()
+	for domain := range svc.codexCookies.poolRounds.groups[group].resting {
+		svc.codexCookies.poolRounds.groups[group].resting[domain] = time.Now().Add(-time.Second)
+	}
+	svc.codexCookies.poolRounds.mu.Unlock()
 	id, err = selectID(context.Background())
 	require.NoError(t, err)
-	require.Equal(t, a.ID, id, "the last exhausted account must allow the next round to start")
+	require.NotZero(t, id, "expired rests permit a fresh evaluation")
 }
 
 func TestGatewayPoolSelectionFreshHistoryIgnoresPoolFreeAndWrongIdentity(t *testing.T) {
@@ -197,15 +254,17 @@ func TestGatewayPoolSelectionFreshHistoryIgnoresPoolFreeAndWrongIdentity(t *test
 		Seen: map[string]openAIGatewaySeen{"unified-1": {At: time.Now().Add(-12 * time.Hour)}},
 	}
 	repo := gatewayRotationRepo{schedulerTestOpenAIAccountRepo{accounts: []Account{*a, *b}}}
-	svc := &OpenAIGatewayService{accountRepo: repo, cfg: &config.Config{}}
-	ctx := svc.withGatewayPoolAccountPreferences(context.Background(), OpenAIAccountScheduleRequest{
+	svc := &OpenAIGatewayService{accountRepo: repo, cfg: &config.Config{}, rateLimitService: gatewayPoolSchedulerTestSettings("legacy")}
+	ctx := svc.withGatewayPoolAccountPreferences(gatewayPoolTestGroupContext(group, 2), OpenAIAccountScheduleRequest{
 		GroupID: &group, Platform: PlatformOpenAI, RequiredTransport: OpenAIUpstreamTransportHTTPSSE,
 	})
-	require.Empty(t, gatewayPoolPreferences(ctx), "one unknown account cannot be assumed to have zero capacity")
+	prefs := gatewayPoolPreferences(ctx)
+	require.Equal(t, gatewayPoolCooledUnknown, prefs[a.ID].cooled, "wrong-identity inventory is unknown, not zero")
+	require.False(t, prefs[a.ID].loadKnown, "missing load is not converted into an idle row")
 }
 
 func TestGatewayPoolSelectionIneligibleAlternativeCannotBreakSticky(t *testing.T) {
-	for _, reason := range []string{"attempted", "model", "disabled", "other-group", "rotation-off"} {
+	for _, reason := range []string{"attempted", "model", "disabled", "other-group", "pool-off"} {
 		t.Run(reason, func(t *testing.T) {
 			group := int64(7)
 			a, b := preferenceAccount(1, group, 1), preferenceAccount(2, group, 20)
@@ -220,8 +279,8 @@ func TestGatewayPoolSelectionIneligibleAlternativeCannotBreakSticky(t *testing.T
 				b.Schedulable = false
 			case "other-group":
 				b.GroupIDs = []int64{8}
-			case "rotation-off":
-				b.Extra[openAIGatewayPoolRotationExtraKey] = false
+			case "pool-off":
+				b.Extra[openAIGatewayPoolExtraKey] = false
 			}
 			repo := gatewayRotationRepo{schedulerTestOpenAIAccountRepo{accounts: []Account{*a, *b}}}
 			svc := &OpenAIGatewayService{accountRepo: repo, cfg: &config.Config{}}

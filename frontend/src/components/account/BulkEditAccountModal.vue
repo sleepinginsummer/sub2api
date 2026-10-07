@@ -32,6 +32,7 @@
       </div>
 
       <!-- OpenAI passthrough -->
+      <GatewayPoolBulkSettings v-if="allOpenAIOAuth" v-model="gatewayPoolExtra" />
       <div
         v-if="allOpenAIPassthroughCapable"
         class="border-t border-gray-200 pt-4 dark:border-dark-600"
@@ -1499,6 +1500,7 @@ import {
   getPresetMappingsByPlatform
 } from '@/composables/useModelWhitelist'
 import HeaderOverrideEditor from '@/components/account/HeaderOverrideEditor.vue'
+import GatewayPoolBulkSettings from '@/components/account/GatewayPoolBulkSettings.vue'
 import {
   buildHeaderOverridesObject,
   isHeaderOverrideCapable,
@@ -1541,6 +1543,7 @@ const emit = defineEmits<{
 
 const { t } = useI18n()
 const appStore = useAppStore()
+const gatewayPoolExtra = ref<Record<string, string | number | boolean | null>>({})
 
 // Platform awareness
 const targetMode = computed(() => props.target?.mode ?? 'selected')
@@ -1953,6 +1956,19 @@ const buildUpdatePayload = (): Record<string, unknown> | null => {
     }
     return updates.extra as Record<string, unknown>
   }
+  if (allOpenAIOAuth.value) {
+    let hasGatewayPoolChanges = false
+    for (const [key, value] of Object.entries(gatewayPoolExtra.value)) {
+      // Empty secret input means keep each account's own key.
+      if (key === 'openai_gwpool_consumer_key' && (typeof value !== 'string' || !value.trim())) continue
+      ensureExtra()[key] = value
+      hasGatewayPoolChanges = true
+    }
+    if (hasGatewayPoolChanges) {
+      ensureExtra().openai_gwpool_guard_enabled = true
+      ensureExtra().openai_gwpool_probe_model = 'gpt-6-luna'
+    }
+  }
 
   if (enableProxy.value) {
     // 后端期望 proxy_id: 0 表示清除代理，而不是 null
@@ -2218,6 +2234,7 @@ const handleSubmit = async () => {
   }
 
   const hasAnyFieldEnabled =
+    (allOpenAIOAuth.value && Object.keys(gatewayPoolExtra.value).length > 0) ||
     enableBaseUrl.value ||
     enableOpenAIPassthrough.value ||
     enableOpenAIFlattenNamespaces.value ||
@@ -2398,6 +2415,7 @@ watch(
       enableRpmLimit.value = false
 
       // Reset all values
+      gatewayPoolExtra.value = {}
       baseUrl.value = ''
       openaiPassthroughEnabled.value = false
       openaiFlattenNamespacesEnabled.value = false

@@ -46,6 +46,14 @@ func (r *gatewayRuntimeRepo) UpdateExtra(_ context.Context, _ int64, patch map[s
 	if r.account.Extra == nil {
 		r.account.Extra = map[string]any{}
 	}
+	// 与真实仓储一致：历史增量在最新行上合并，不模拟成整段覆盖。
+	if _, hasHistory := patch[OpenAIGatewayHistoryExtraKey]; hasHistory {
+		merged, err := MergeOpenAIGatewayHistoryExtra(r.account.Extra, patch)
+		if err != nil {
+			return err
+		}
+		patch = merged
+	}
 	raw, _ := json.Marshal(patch)
 	var generic map[string]any
 	_ = json.Unmarshal(raw, &generic)
@@ -84,7 +92,7 @@ func TestGatewayPoolFirstSendDoesNotCountShelfWaitOrReset(t *testing.T) {
 	store.gatewayPoolMarkSent("id", "old", first.Add(-time.Hour))
 	got, _ := store.cachedPoolPair("id")
 	require.Equal(t, first, got.firstSent)
-	_, age := store.gatewayPoolNoteEcho("id", "a", "g", true)
+	age := time.Since(got.firstSent)
 	require.Less(t, age, time.Second, "备用架待了3分钟，首次接触仍然是年轻窗口")
 }
 
@@ -393,9 +401,10 @@ func TestGatewayPoolStrictGuardReusesResolvedShadowIdentityForSentMark(t *testin
 	svc.codexCookies.poolPairs.Store(openAIGatewayPoolCacheKey(account, gwpoolTestIdentity), openAIGatewayPoolPair{
 		cookie: "offline-cookie", gateway: "g", version: "v", until: time.Now().Add(time.Minute),
 	})
-	svc.codexCookies.gatewayPoolMarkVerifiedFull(openAIGatewayPoolCacheKey(account, gwpoolTestIdentity), "v")
+	svc.codexCookies.gatewayPoolMarkVerifiedFull(openAIGatewayPoolCacheKey(account, gwpoolTestIdentity), "v", "gpt-6-luna")
 	request, err := http.NewRequest(http.MethodPost, gwpoolTestURL, nil)
 	require.NoError(t, err)
+	request.Header.Set(openAICodexTurnStateHeader, "business-state")
 	ginCtx, _ := gin.CreateTestContext(httptest.NewRecorder())
 	ctx, _ := withOpenAIGatewayPoolSink(request.Context(), ginCtx)
 	response, _, err := svc.doOpenAIUpstreamOnce(request.WithContext(ctx), "", account)

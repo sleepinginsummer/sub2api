@@ -5,7 +5,6 @@ import (
 	"net/http"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -57,19 +56,19 @@ func TestGatewayPoolWarmVerificationSeparatesAccountConfigurations(t *testing.T)
 	require.EqualValues(t, 1, poolB.hits.Load())
 }
 
-// 后台预热的 CAS 只能替换本配置的当前票，不能更新同身份其它池的缓存。
-func TestGatewayPoolPrewarmSwapSeparatesAccountConfigurations(t *testing.T) {
+// 新准备流程只能替换本配置的票，不能改写另一配置的已验证快路。
+func TestGatewayPoolPreparationSwapSeparatesAccountConfigurations(t *testing.T) {
 	poolA := newGwpoolFakePool(t, gwpoolTestPairCookie(t, "unified-142"), 150)
 	poolB := newGwpoolFakePool(t, gwpoolTestPairCookie(t, "unified-84"), 150)
 	svc := &OpenAIGatewayService{}
 	a, b := poolA.account(1), poolB.account(2)
 	keyA := openAIGatewayPoolCacheKey(a, gwpoolTestIdentity)
 	keyB := openAIGatewayPoolCacheKey(b, gwpoolTestIdentity)
-	currentA := gwpoolSeedVerifiedAge(&svc.codexCookies, keyA, "tkt-old", 190*time.Second)
-	currentB := gwpoolSeedVerifiedAge(&svc.codexCookies, keyB, "tkt-old", 190*time.Second)
+	first := &gwpoolWarmShooter{}
+	require.NoError(t, gwpoolWarmRun(t, svc, a, first))
+	currentA, _ := svc.codexCookies.cachedPoolPair(keyA)
 	shooter := &gwpoolWarmShooter{}
-	svc.gatewayPoolPrewarmRound(context.Background(), b, gwpoolTestIdentity,
-		currentB, 190*time.Second, shooter.shoot)
+	require.NoError(t, gwpoolWarmRun(t, svc, b, shooter))
 
 	unchanged, _ := svc.codexCookies.cachedPoolPair(keyA)
 	require.Equal(t, currentA, unchanged)

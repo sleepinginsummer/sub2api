@@ -108,9 +108,9 @@ const (
 	defaultRequestTimeout = 5 * time.Second
 	// maxResponseBytes 读响应的上限。pair 里 __oailb 是约 300 字符的 JWT，4 KiB 足够。
 	maxResponseBytes = 4 << 10
-	// maxListBytes 是 /gateways 的上限。cookie 那 4 KiB 对一张列表太紧，而截断会让整份 JSON
-	// 解不开（= 挑不出网关，退回池子自己挑），所以这里给宽一点。
-	maxListBytes = 64 << 10
+	// Catalogs include contact/recommendation history; ordinary 106-gateway
+	// responses already exceed 64 KiB. Bound the whole response, not a JSON prefix.
+	maxListBytes = 2 << 20
 	// MaxRetryAfter 钳住 retry_after_seconds / Retry-After。池子报一个 10 年会把这个身份
 	// **永久饿死**（消费端按身份记退避），所以上限硬钳在这里。
 	MaxRetryAfter = time.Hour
@@ -149,7 +149,8 @@ const (
 // Pair 是 /cookie 的一次下发。
 type Pair struct {
 	// Gateway 形如 "unified-142"。
-	Gateway string
+	Gateway           string
+	DatacenterCountry string
 	// Region 是**铸这张票的出口**所属的大区（池子那九个 key 之一，SPEC 第 4 节）。
 	// 空 = 池子没报（老版本池子 / 它自己也反查不到），消费端按「未归类」处理，不要猜：
 	// 网关 = (大区 × 账号)，同一个网关名在不同账号眼里可能来自不同大区，事后反查不出来。
@@ -159,9 +160,10 @@ type Pair struct {
 	Region string
 	// Cookie 是直接写进出站 Cookie 头的整串 "__cflb=...; __oailb=..."。
 	Cookie string
-	// ValidFor 是**满血窗口**的剩余量（池子的 valid_for_s），不是 cookie 的有效期。
-	// 窗口内同一张 pair 可以复用，过了就该再要一张。
+	// ValidFor is advisory, never a quality or cookie-expiry decision.
 	ValidFor time.Duration
+	// Absolute route deadline calculated by the pool; zero means unknown.
+	RouteExpiresAt time.Time
 	// PairRemaining 是**这张 pair 自己**的剩余寿命（池子的 pair_remaining_s = __cflb 的死期
 	// 减现在）。和 ValidFor 是两根轴：ValidFor = min(满血窗口剩余, pair 剩余)，绝大多数时候
 	// 等于那 183 秒的窗口，分不出 pair 还剩 50 分钟还是 8 分钟 ⇒ 判「这张要不要续」只能用这个。
@@ -307,9 +309,30 @@ type Gateway struct {
 	// 按凭证域身份算的那本在消费端（见 service 层的本地账本）。
 	UsedByYou bool
 	// LastUsedAt 是池子记的「你上次碰它」的时刻。零值 = 没碰过，也是最优候选。
-	LastUsedAt time.Time
-	Cooldown   *CooldownRecommendation
-	Contacts   []ContactStats
+	LastUsedAt        time.Time
+	Cooldown          *CooldownRecommendation
+	Contacts          []ContactStats
+	Priority          *GatewayPriority
+	DatacenterCountry string
+}
+
+type GatewayPriority struct {
+	Model   string `json:"model"`
+	Full    int    `json:"full"`
+	Samples int    `json:"samples"`
+}
+
+func (p *GatewayPriority) Valid(model string) bool {
+	return p != nil && p.Model == model && p.Samples >= 5 && p.Samples <= 8192 &&
+		p.Full >= 0 && p.Full <= p.Samples
+}
+
+func datacenterCountry(value string) string {
+	value = strings.ToUpper(strings.TrimSpace(value))
+	if len(value) != 2 || value[0] < 'A' || value[0] > 'Z' || value[1] < 'A' || value[1] > 'Z' {
+		return ""
+	}
+	return value
 }
 
 // Client 是一个池子实例的客户端。并发安全。
@@ -478,20 +501,22 @@ func (c *Client) Cookies(ctx context.Context, request CookieRequest) ([]Pair, er
 // （池子的 batchResponse.tickets[]），所以单取和批量共用这一份解析与校验 —— 分两份写
 // 必然走散，而走散的那一半是信任边界。
 type cookiePayload struct {
-	Gateway        string `json:"gateway"`
-	Region         string `json:"region"`
-	Cookie         string `json:"cookie"`
-	ValidForS      int    `json:"valid_for_s"`
-	VerifiedFull   bool   `json:"verified_full"`
-	TTLIsAdvisory  bool   `json:"ttl_is_advisory"`
-	CookieVersion  string `json:"cookie_version"`
-	PairRemainingS int    `json:"pair_remaining_s"`
+	Gateway           string    `json:"gateway"`
+	DatacenterCountry string    `json:"datacenter_country"`
+	Region            string    `json:"region"`
+	Cookie            string    `json:"cookie"`
+	ValidForS         int       `json:"valid_for_s"`
+	VerifiedFull      bool      `json:"verified_full"`
+	TTLIsAdvisory     bool      `json:"ttl_is_advisory"`
+	CookieVersion     string    `json:"cookie_version"`
+	PairRemainingS    int       `json:"pair_remaining_s"`
+	RouteExpiresAt    time.Time `json:"route_expires_at"`
 }
 
 // pair 校验并转成 Pair。
 //
 // 这里是信任边界（外部服务的响应 → 要带着该账号的 Authorization 发给 chatgpt.com 的头）：
-// 空 cookie 等于裸打（落点不可控），窗口 ≤0 的 pair 本来就过期，控制字符会劈开出站头。
+// 空 cookie 等于裸打（落点不可控），控制字符会劈开出站头；建议窗口不参与拒收。
 // cookie 名字的收口在消费侧（只留 __cflb / __oailb），这里只拦明显畸形。
 func (p cookiePayload) pair() (Pair, error) {
 	if strings.TrimSpace(p.Cookie) == "" {
@@ -500,18 +525,17 @@ func (p cookiePayload) pair() (Pair, error) {
 	if strings.ContainsFunc(p.Cookie, func(r rune) bool { return r < 0x20 || r == 0x7f }) {
 		return Pair{}, fmt.Errorf("%w: cookie response carried control characters", ErrPool)
 	}
-	if p.ValidForS <= 0 {
-		return Pair{}, fmt.Errorf("%w: cookie response carried a non-positive valid_for_s", ErrPool)
-	}
 	return Pair{
 		Gateway: sanitizeOpaque(p.Gateway, maxGatewayLen),
 		// 同样过 sanitizeOpaque：池子的响应是信任边界，这个串会进账号 extra 和前端。
-		Region:        sanitizeOpaque(p.Region, maxGatewayLen),
-		Cookie:        strings.TrimSpace(p.Cookie),
-		ValidFor:      clampDuration(time.Duration(p.ValidForS)*time.Second, 0, maxValidFor),
-		VerifiedFull:  p.VerifiedFull,
-		TTLIsAdvisory: p.TTLIsAdvisory,
-		Version:       sanitizeOpaque(p.CookieVersion, maxVersionLen),
+		Region:            sanitizeOpaque(p.Region, maxGatewayLen),
+		Cookie:            strings.TrimSpace(p.Cookie),
+		ValidFor:          clampDuration(time.Duration(p.ValidForS)*time.Second, 0, maxValidFor),
+		RouteExpiresAt:    p.RouteExpiresAt,
+		VerifiedFull:      p.VerifiedFull,
+		TTLIsAdvisory:     p.TTLIsAdvisory,
+		Version:           sanitizeOpaque(p.CookieVersion, maxVersionLen),
+		DatacenterCountry: datacenterCountry(p.DatacenterCountry),
 		// 和 ValidFor 同样钳进 [0, maxValidFor]：缺失/负数 ⇒ 0 ⇒ 消费端不续（安全方向），
 		// 报一个大数被钳到 3900s 仍然远在续期阈值之上 ⇒ 同样不续。
 		PairRemaining: clampDuration(time.Duration(p.PairRemainingS)*time.Second, 0, maxValidFor),
@@ -598,31 +622,50 @@ func refusal(resp *http.Response) error {
 // account 与 Cookie 的那个同义、同样必须带：used_by_you / last_used_at 报的是**那个上游账号的**
 // 槽位历史，不报就变成上传者的历史（见 Cookie 的说明）。空串 = 按上传者算。
 func (c *Client) Gateways(ctx context.Context, account string, accountTag ...string) ([]Gateway, error) {
+	tag := ""
+	if len(accountTag) > 0 {
+		tag = accountTag[0]
+	}
+	return c.GatewaysForModel(ctx, account, tag, "")
+}
+
+func (c *Client) GatewaysForModel(ctx context.Context, account, accountTag, model string) ([]Gateway, error) {
 	if c == nil {
 		return nil, fmt.Errorf("%w: client is nil", ErrPool)
 	}
 	endpoint := c.endpoint("gateways")
+	query := url.Values{}
 	if account = strings.TrimSpace(account); account != "" {
-		endpoint += "?" + url.Values{"account": {account}}.Encode()
+		query.Set("account", account)
+	}
+	if model = sanitizeOpaque(model, 128); model != "" {
+		query.Set("model", model)
+	}
+	if len(query) > 0 {
+		endpoint += "?" + query.Encode()
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return nil, fmt.Errorf("%w: build gateways request: %w", ErrPool, err)
 	}
-	if len(accountTag) > 0 && validCooldownTag(accountTag[0]) {
-		req.Header.Set(cooldownAccountHeader, accountTag[0])
+	if validCooldownTag(accountTag) {
+		req.Header.Set(cooldownAccountHeader, accountTag)
 	}
 	req.Header.Set(cooldownMaxHeader, strconv.Itoa(CooldownMaxSeconds))
 	resp, err := c.do(req)
 	if err != nil {
 		return nil, err
 	}
-	defer func() {
-		_, _ = io.Copy(io.Discard, resp.Body)
-		_ = resp.Body.Close()
-	}()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("%w: gateways request returned HTTP %d", ErrPool, resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxListBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("%w: read gateways response: %w", ErrPool, err)
+	}
+	if len(body) > maxListBytes {
+		return nil, fmt.Errorf("%w: gateways response exceeds %d bytes", ErrPool, maxListBytes)
 	}
 	var payload struct {
 		// Account 是池子回显的「这次是替谁问的」，用来自检有没有报对账号。
@@ -633,12 +676,14 @@ func (c *Client) Gateways(ctx context.Context, account string, accountTag ...str
 			UsedByYou bool   `json:"used_by_you"`
 			// 收成字符串再自己解：池子在「没碰过」时给的是缺省，但给成空串 / null 时
 			// time.Time 会连带让**整份列表**解码失败，而这个字段只用来排序。
-			LastUsedAt string                  `json:"last_used_at"`
-			Cooldown   *CooldownRecommendation `json:"cooldown"`
-			Contacts   []ContactStats          `json:"contacts"`
+			LastUsedAt        string                  `json:"last_used_at"`
+			Cooldown          *CooldownRecommendation `json:"cooldown"`
+			Contacts          []ContactStats          `json:"contacts"`
+			Priority          *GatewayPriority        `json:"priority"`
+			DatacenterCountry string                  `json:"datacenter_country"`
 		} `json:"gateways"`
 	}
-	if err := json.NewDecoder(io.LimitReader(resp.Body, maxListBytes)).Decode(&payload); err != nil {
+	if err := json.Unmarshal(body, &payload); err != nil {
 		return nil, fmt.Errorf("%w: decode gateways response: %w", ErrPool, err)
 	}
 	// 自检：回显的身份必须就是报上去的那个，不然 used_by_you / last_used_at 是**别人的**历史，
@@ -658,6 +703,9 @@ func (c *Client) Gateways(ctx context.Context, account string, accountTag ...str
 			item.Cooldown = nil
 		}
 		contacts := make([]ContactStats, 0, len(item.Contacts))
+		if !item.Priority.Valid(model) {
+			item.Priority = nil
+		}
 		for _, row := range item.Contacts {
 			if row.Gateway == name && row.Valid() {
 				contacts = append(contacts, row)
@@ -667,6 +715,7 @@ func (c *Client) Gateways(ctx context.Context, account string, accountTag ...str
 			Name: name, PairReady: item.PairReady,
 			UsedByYou: item.UsedByYou, LastUsedAt: lastUsedAt, Cooldown: item.Cooldown,
 			Contacts: contacts,
+			Priority: item.Priority, DatacenterCountry: datacenterCountry(item.DatacenterCountry),
 		})
 	}
 	return gateways, nil

@@ -257,6 +257,13 @@ func (s *OpenAIGatewayService) flushGatewayPoolReports(ctx context.Context) {
 			return
 		}
 		account := &accounts[i]
+		s.maintainGatewayPoolUsage(ctx, account, time.Now().UTC())
+		resetCtx, resetCancel := context.WithTimeout(ctx, gatewayPoolWarmNoteTimeout)
+		resetErr := s.maintainGatewayPoolCooldownReset(resetCtx, account, time.Now().UTC())
+		resetCancel()
+		if resetErr != nil {
+			slog.Warn("gwpool_cooldown_reset_failed", "account_id", account.ID)
+		}
 		if account.Extra[openAIGatewayPoolOutboxExtraKey] == nil {
 			continue
 		}
@@ -428,6 +435,6 @@ func (s *OpenAIGatewayService) completeGatewayPoolPending(ctx context.Context, a
 		slog.Warn("gwpool_feedback_update_failed", "account_id", accountID)
 	}
 	if sendErr == nil && !bindingChanged && pending.Kind != "contact" {
-		s.codexCookies.noteGatewayPoolRecommendation(identity, pending.Report.Gateway, recommendation)
+		s.codexCookies.noteGatewayPoolRecommendationAt(identity, pending.Report.Gateway, recommendation, startedAt)
 	}
 }

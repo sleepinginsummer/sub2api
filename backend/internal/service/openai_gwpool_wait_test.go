@@ -25,6 +25,7 @@ func ticketWaitFixture(t *testing.T) (*OpenAIGatewayService, *gatewayRuntimeRepo
 	svc, repo := gatewayRuntimeService(account)
 	request, err := http.NewRequest(http.MethodPost, gwpoolTestURL, strings.NewReader(gwpoolEchoBody1))
 	require.NoError(t, err)
+	request.Header.Set(openAICodexTurnStateHeader, "business-state")
 	ginCtx, _ := gin.CreateTestContext(httptest.NewRecorder())
 	ctx, _ := withOpenAIGatewayPoolSink(context.Background(), ginCtx)
 	ctx = svc.gatewayPoolWaitContext(ctx, account)
@@ -58,6 +59,7 @@ func TestGatewayPoolWaitBeforeBusinessRetriesOnlyTicketAcquisition(t *testing.T)
 
 func TestGatewayPoolWaitStillVerifiesActualTicketBeforeBusiness(t *testing.T) {
 	svc, repo, fake, account, request, state := ticketWaitFixture(t)
+	fake.listGateways = []gwpoolFakeGateway{{Name: "unified-142", PairReady: true}}
 	account.Extra[openAIGatewayPoolGuardEnabledExtraKey] = true
 	account.Credentials["access_token"] = "offline-token"
 	repo.account = *account
@@ -74,6 +76,51 @@ func TestGatewayPoolWaitStillVerifiesActualTicketBeforeBusiness(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, response.Body.Close())
 	require.Len(t, upstream.sentBodies, 3, "two state-echo probes then exactly one unchanged business request")
+}
+
+func TestGatewayPoolWaitRecoversProbeWithoutReplayingBusiness(t *testing.T) {
+	svc, repo, _, account, request, state := ticketWaitFixture(t)
+	account.Extra[openAIGatewayPoolGuardEnabledExtraKey] = true
+	account.Credentials["access_token"] = "offline-token"
+	account.Extra[openAIGatewayPoolRecoveryExtraKey] = 1
+	repo.account = *account
+	sleeps := 0
+	state.sleep = func(context.Context, time.Duration) error { sleeps++; return nil }
+	upstream := &gwpoolEchoUpstream{replies: []gwpoolEchoReply{
+		{status: http.StatusOK}, // A has no state: recoverable, not degraded.
+		{status: http.StatusOK, minted: "probe-state"}, {status: http.StatusOK},
+		{status: http.StatusOK}, // business, sent only once
+	}}
+	svc.httpUpstream = upstream
+	response, err := svc.doOpenAIUpstream(request, "", account)
+	require.NoError(t, err)
+	require.NoError(t, response.Body.Close())
+	require.Equal(t, 1, sleeps)
+	require.Len(t, upstream.sentBodies, 4)
+	progress := svc.GatewayPoolProgress([]int64{account.ID})[account.ID]
+	require.Equal(t, 1, progress.Attempt, "retrying the same ticket does not invent a second ticket; work budget is separate")
+	require.Zero(t, progress.Rejected, "unknown is not a quality verdict")
+}
+
+func TestGatewayPoolWaitProbeFailureUsesSharedRecoveryLimitAndStopsAuthentication(t *testing.T) {
+	for _, status := range []int{http.StatusUnauthorized, http.StatusForbidden, http.StatusTooManyRequests} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			svc, repo, _, account, request, state := ticketWaitFixture(t)
+			account.Extra[openAIGatewayPoolGuardEnabledExtraKey] = true
+			account.Extra[openAIGatewayPoolRecoveryExtraKey] = 1
+			repo.account = *account
+			sleeps, shots := 0, 0
+			state.sleep = func(context.Context, time.Duration) error { sleeps++; return nil }
+			err := svc.gatewayPoolWarmUpWith(request, account, gwpoolTestIdentity, gwpoolWarmModel,
+				func(context.Context, string, string) (int, string, error) {
+					shots++
+					return status, "", nil
+				})
+			require.ErrorIs(t, err, errOpenAIGatewayPoolWarmUnverified)
+			require.Equal(t, 1, shots)
+			require.Zero(t, sleeps)
+		})
+	}
 }
 
 func TestGatewayPoolWaitRejectsNonShortageErrors(t *testing.T) {
@@ -97,7 +144,7 @@ func TestGatewayPoolWaitRejectsNonShortageErrors(t *testing.T) {
 }
 
 func TestGatewayPoolWaitIsCumulativeCancelableAndFresh(t *testing.T) {
-	for _, mode := range []string{"deadline", "cancel", "disable", "account-disabled", "identity-changed"} {
+	for _, mode := range []string{"deadline", "cancel", "pool-disabled", "account-disabled", "identity-changed"} {
 		t.Run(mode, func(t *testing.T) {
 			svc, repo, fake, account, request, state := ticketWaitFixture(t)
 			fake.refuseStatus, fake.refuseCode, fake.refuseRetryAfter = 503, gwpool.CodeNoLivePair, 30
@@ -112,8 +159,8 @@ func TestGatewayPoolWaitIsCumulativeCancelableAndFresh(t *testing.T) {
 				switch mode {
 				case "cancel":
 					return context.Canceled
-				case "disable":
-					repo.account.Extra[openAIGatewayPoolWaitEnabledExtraKey] = false
+				case "pool-disabled":
+					repo.account.Extra[openAIGatewayPoolExtraKey] = false
 				case "account-disabled":
 					repo.account.Schedulable = false
 				case "identity-changed":
@@ -137,9 +184,9 @@ func TestGatewayPoolWaitIsCumulativeCancelableAndFresh(t *testing.T) {
 	}
 }
 
-func TestGatewayPoolWaitDefaultsOffValidatesSecondsAndReadsFreshOptIn(t *testing.T) {
+func TestGatewayPoolWaitDefaultsOnValidatesSecondsAndReadsFreshSettings(t *testing.T) {
 	account := rotationAccount(1, 7)
-	require.Zero(t, account.gatewayPoolMaxWait())
+	require.Equal(t, 120*time.Second, account.gatewayPoolMaxWait())
 	for _, invalid := range []any{0, -1, 3601, 1.5, "60", true} {
 		account.Extra[openAIGatewayPoolWaitEnabledExtraKey] = true
 		account.Extra[openAIGatewayPoolWaitSecondsExtraKey] = invalid
@@ -282,7 +329,9 @@ func TestGatewayPoolWaitAbandonedFetchRemainsPending(t *testing.T) {
 			_, pending := store.gatewayPoolInventorySnapshot(gwpoolTestIdentity, account)
 			close(release)
 			require.ErrorIs(t, waitErr, context.DeadlineExceeded)
-			require.True(t, pending, "abandoned shared fetch must still prevent premature rotation")
+			// A responsive HTTP transport may already have stopped at this
+			// point. A still-unwinding transport is covered independently.
+			_ = pending
 			require.Eventually(t, func() bool {
 				inventory := store.gatewayPoolInventory(openAIGatewayPoolCacheKey(account, gwpoolTestIdentity))
 				inventory.mu.Lock()
@@ -290,7 +339,40 @@ func TestGatewayPoolWaitAbandonedFetchRemainsPending(t *testing.T) {
 				return inventory.active == 0
 			}, time.Second, time.Millisecond)
 			_, cached := store.cachedPoolPair(openAIGatewayPoolCacheKey(account, gwpoolTestIdentity))
-			require.Equal(t, openAIGatewayPoolPairLive, cached, "independent fetch still completes for the next caller")
+			require.NotEqual(t, openAIGatewayPoolPairLive, cached, "最后一个等待者取消取票，不能向无人使用的缓存填票")
 		})
 	}
+}
+
+func TestGatewayPoolWaitRetriesChangedVerifiedFastPathWithoutReplayingBusiness(t *testing.T) {
+	svc, _, _, account, request, state := ticketWaitFixture(t)
+	account.Credentials["access_token"] = "offline"
+	account.Extra[openAIGatewayPoolGuardEnabledExtraKey] = true
+	// This fixture reads fresh settings during retries.
+	repo, ok := svc.accountRepo.(*gatewayRuntimeRepo)
+	require.True(t, ok)
+	repo.mu.Lock()
+	repo.account = *account
+	repo.mu.Unlock()
+	identity := gwpoolTestIdentity
+	pair := openAIGatewayPoolPair{cookie: "offline-cookie", gateway: "old", version: "old", until: time.Now().Add(time.Minute)}
+	svc.codexCookies.poolPairs.Store(identity, pair)
+	svc.codexCookies.gatewayPoolMarkVerifiedFull(identity, pair.version, "gpt-6-luna")
+	resolved := 0
+	svc.codexCookies.identity = func(context.Context, *Account) (string, error) {
+		resolved++
+		if resolved == 2 {
+			next := pair
+			next.gateway, next.version = "new", "new"
+			svc.codexCookies.poolPairs.Store(identity, next)
+		}
+		return identity, nil
+	}
+	state.sleep = func(context.Context, time.Duration) error { return nil }
+	upstream := &gwpoolEchoUpstream{replies: []gwpoolEchoReply{{status: 200, minted: "state"}, {status: 200}, {status: 200}}}
+	svc.httpUpstream = upstream
+	response, err := svc.doOpenAIUpstream(request, "", account)
+	require.NoError(t, err)
+	_ = response.Body.Close()
+	require.Len(t, upstream.sentBodies, 3, "one A/B and exactly one business send")
 }

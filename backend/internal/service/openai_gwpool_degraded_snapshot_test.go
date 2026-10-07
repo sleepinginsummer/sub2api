@@ -49,7 +49,7 @@ func TestGatewayPoolFullHeldMeasurementReachesDiscardedAttempt(t *testing.T) {
 func TestGatewayPoolDegradedUsesFrozenHTTPRoute(t *testing.T) {
 	pool := newGwpoolFakePool(t, gwpoolTestPairCookie(t, "unified-142"), 150)
 	account := pool.account(1)
-	upstream := &gwpoolEchoUpstream{replies: []gwpoolEchoReply{{status: http.StatusOK, minted: gwpoolEchoFreshTicket}}}
+	upstream := &gwpoolEchoUpstream{replies: []gwpoolEchoReply{{status: http.StatusOK, minted: gwpoolEchoFreshTicket}, {status: http.StatusOK, minted: "next-confirmation-state"}}}
 	svc := &OpenAIGatewayService{httpUpstream: upstream}
 	ginCtx, _ := gin.CreateTestContext(httptest.NewRecorder())
 	ctx, sink := withOpenAIGatewayPoolSink(context.Background(), ginCtx)
@@ -60,8 +60,8 @@ func TestGatewayPoolDegradedUsesFrozenHTTPRoute(t *testing.T) {
 	first.since = time.Now().Add(-3 * time.Minute)
 	first.firstSent = first.since
 	svc.codexCookies.poolPairs.Store(key, first)
-	svc.codexCookies.poolVerified.Store(key, gatewayPoolVerifiedMark{version: first.version, at: time.Now().Add(-time.Minute)})
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, gwpoolTestURL, strings.NewReader("{}"))
+	svc.codexCookies.poolVerified.Store(key, gatewayPoolVerifiedMark{version: first.version, at: time.Now().Add(-time.Minute), models: &map[string]time.Time{gatewayPoolProbeModelLuna: time.Now().Add(-time.Minute)}})
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, gwpoolTestURL, strings.NewReader(gwpoolEchoBody1))
 	require.NoError(t, err)
 	request.Header.Set(openAICodexTurnStateHeader, gwpoolEchoLiveTicket)
 	response, degraded, err := svc.doOpenAIUpstreamOnce(request, "", account)
