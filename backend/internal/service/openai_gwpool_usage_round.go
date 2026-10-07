@@ -5,10 +5,13 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"sort"
 	"sync"
 	"time"
+
+	dbent "github.com/Wei-Shaw/sub2api/ent"
 )
 
 const (
@@ -121,9 +124,10 @@ func readGatewayPoolUsageForIdentity(account *Account, identity string) gatewayP
 }
 
 // 配置周期一旦持久化就以新域为准；首次迁移才读取旧共享域，继承最新克隆快照。
-func (s *OpenAIGatewayService) gatewayPoolUsagePeers(ctx context.Context, identity string) ([]Account, bool, error) {
+func gatewayPoolUsagePeers(ctx context.Context, repo AccountRepository, identity string) ([]Account, bool, error) {
 	tag := gatewayPoolUsageTag(identity)
-	peers, err := s.gatewayPoolStatePeers(ctx, tag, "usage")
+	reader := &OpenAIGatewayService{accountRepo: repo}
+	peers, err := reader.gatewayPoolStatePeers(ctx, tag, "usage")
 	if err != nil {
 		return nil, false, err
 	}
@@ -136,7 +140,7 @@ func (s *OpenAIGatewayService) gatewayPoolUsagePeers(ctx context.Context, identi
 	if tag == legacyTag {
 		return peers, false, nil
 	}
-	peers, err = s.gatewayPoolStatePeers(ctx, legacyTag, "usage")
+	peers, err = reader.gatewayPoolStatePeers(ctx, legacyTag, "usage")
 	return peers, true, err
 }
 
@@ -152,6 +156,35 @@ func gatewayPoolUsagePeerView(account *Account, identity string, legacy bool) ga
 	state.Tag, state.Previous = gatewayPoolUsageTag(identity), &previous
 	return state
 }
+
+// 调用方事务的读写视图尚未提交，不能复用或发布进程级权威缓存。
+func gatewayPoolUsageCacheAllowed(ctx context.Context) bool {
+	return dbent.TxFromContext(ctx) == nil
+}
+
+// 并发提交/展示读回的快照按时间单调发布，旧提交不能覆盖较新的配置缓存。
+func (s *OpenAIGatewayService) cacheGatewayPoolUsage(tag string, state *gatewayPoolUsageLedger) {
+	for {
+		cached, loaded := s.codexCookies.poolUsageCache.LoadOrStore(tag, state)
+		if !loaded {
+			return
+		}
+		other, valid := cached.(*gatewayPoolUsageLedger)
+		if !valid || other == nil || !state.UpdatedAt.After(other.UpdatedAt) {
+			return
+		}
+		if s.codexCookies.poolUsageCache.CompareAndSwap(tag, cached, state) {
+			return
+		}
+	}
+}
+
+// 可选事务入口不放进通用 AccountRepository，避免轻量仓储误声明事务能力。
+type gatewayPoolUsageTransactionRepository interface {
+	WithGatewayPoolUsageTransaction(context.Context, string, int64, func(context.Context, AccountRepository) error) (bool, error)
+}
+
+var errGatewayPoolUsageIdentityChanged = errors.New("gateway usage identity changed")
 
 // The entire snapshot is serialized by ledger, including clones. Each write
 // first adopts the newest durable snapshot; no per-row totals are ever summed.
@@ -176,7 +209,7 @@ func (s *OpenAIGatewayService) changeGatewayPoolUsage(ctx context.Context, accou
 		return false
 	}
 	defer lock.Unlock()
-	if cached, exists := s.codexCookies.poolUsageCache.Load(tag); exists && len(alreadyRecorded) > 0 {
+	if cached, exists := s.codexCookies.poolUsageCache.Load(tag); exists && len(alreadyRecorded) > 0 && gatewayPoolUsageCacheAllowed(ctx) {
 		if state, ok := cached.(*gatewayPoolUsageLedger); ok && alreadyRecorded[0](state) {
 			return true
 		}
@@ -192,25 +225,61 @@ func (s *OpenAIGatewayService) changeGatewayPoolUsage(ctx context.Context, accou
 		return false
 	}
 	defer historyLock.Unlock()
-	fresh, err := s.accountRepo.GetByID(ctx, account.ID)
-	if err != nil || fresh == nil {
-		slog.Warn("gwpool_usage_read_failed", "account_id", account.ID)
+	var state *gatewayPoolUsageLedger
+	var authoritative bool
+	apply := func(txCtx context.Context, repo AccountRepository) error {
+		var err error
+		state, authoritative, err = s.changeGatewayPoolUsageLocked(txCtx, repo, account, identity, change)
+		return err
+	}
+	committed := true
+	var err error
+	if runner, ok := s.accountRepo.(gatewayPoolUsageTransactionRepository); ok {
+		committed, err = runner.WithGatewayPoolUsageTransaction(ctx, tag, account.ID, apply)
+	} else {
+		// 测试/轻量仓储沿用进程内串行化，生产仓储提供跨实例事务入口。
+		err = apply(ctx, s.accountRepo)
+	}
+	if err != nil {
+		if !errors.Is(err, errGatewayPoolUsageIdentityChanged) {
+			slog.Warn("gwpool_usage_update_failed", "account_id", account.ID, "error", err)
+		}
 		return false
 	}
+	// 临时迁移投影和调用方尚未提交的快照都不能发布为权威缓存。
+	if committed && authoritative {
+		s.cacheGatewayPoolUsage(tag, state)
+	}
+	return committed
+}
+
+// 生产路径在周期锁和账号行锁内调用，所有读取/写入使用同一个事务仓储。
+func (s *OpenAIGatewayService) changeGatewayPoolUsageLocked(ctx context.Context, repo AccountRepository, account *Account, identity string,
+	change func(*gatewayPoolUsageLedger) bool,
+) (*gatewayPoolUsageLedger, bool, error) {
+	tag := gatewayPoolUsageTag(identity)
+	fresh, err := repo.GetByID(ctx, account.ID)
+	if err != nil {
+		return nil, false, err
+	}
+	if fresh == nil {
+		return nil, false, ErrAccountNotFound
+	}
 	current, err := s.codexCookies.gatewayPoolIdentity(ctx, fresh)
-	if err != nil || gatewayPoolUsageTag(current) != tag {
-		return false // identity changed while an old request was in flight
+	if err != nil {
+		return nil, false, err
+	}
+	if gatewayPoolUsageTag(current) != tag {
+		return nil, false, errGatewayPoolUsageIdentityChanged
 	}
 	state := readGatewayPoolUsageForIdentity(fresh, identity)
 	blockedAt := gatewayPoolUsageBlockedAt(fresh)
 	stored := readGatewayPoolUsage(fresh, tag)
-	peers, legacy, err := s.gatewayPoolUsagePeers(ctx, identity)
+	peers, legacy, err := gatewayPoolUsagePeers(ctx, repo, identity)
 	if err != nil {
-		slog.Warn("gwpool_usage_peers_unavailable", "account_id", account.ID)
-		return false // do not overwrite a possibly newer clone snapshot
+		return nil, false, err
 	}
 	if !legacy && stored.UpdatedAt.IsZero() {
-		// 已迁移克隆的配置快照优先于旧版本后来写出的共享快照。
 		state = stored
 	}
 	for i := range peers {
@@ -230,8 +299,7 @@ func (s *OpenAIGatewayService) changeGatewayPoolUsage(ctx context.Context, accou
 	settled := state.settleFullUsage(s.codexCookies.gatewayPoolUsageLive(identity), s.codexCookies.gatewayPoolUsageSession(), time.Now())
 	boundary := state.applyGatewayPoolBlock(blockedAt)
 	if !change(&state) && !settled && !boundary {
-		s.codexCookies.poolUsageCache.Store(tag, &state)
-		return true
+		return &state, !legacy && !state.UpdatedAt.IsZero(), nil
 	}
 	state.prune()
 	updated := time.Now().UTC()
@@ -243,14 +311,12 @@ func (s *OpenAIGatewayService) changeGatewayPoolUsage(ctx context.Context, accou
 	if state.Previous != nil {
 		previousTag = state.Previous.Tag
 	}
-	if err := s.accountRepo.UpdateExtra(ctx, fresh.ID, map[string]any{
+	if err := repo.UpdateExtra(ctx, fresh.ID, map[string]any{
 		gatewayPoolUsageExtraKey: state, gatewayPoolUsageTagKey: tag, gatewayPoolUsagePreviousTagKey: previousTag,
 	}); err != nil {
-		slog.Warn("gwpool_usage_write_failed", "account_id", account.ID)
-		return false
+		return nil, false, err
 	}
-	s.codexCookies.poolUsageCache.Store(tag, &state)
-	return true
+	return &state, true, nil
 }
 
 func (r *gatewayPoolUsageLedger) note(model, ticket string, at time.Time, full bool) bool {

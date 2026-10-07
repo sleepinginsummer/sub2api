@@ -51,6 +51,8 @@ func (s *OpenAIGatewayService) GatewayPoolRuntimeProgress(ctx context.Context, i
 	}
 	historyPeers := map[string][]Account{}
 	restPeers := map[string][]Account{}
+	usageSnapshots := map[string][]Account{}
+	usageLegacy := map[string]bool{}
 	displayCache := gatewayPoolDisplayCache{}
 	for _, account := range accounts {
 		if account == nil || !s.codexCookies.gatewayPoolTakeover(account) {
@@ -72,25 +74,40 @@ func (s *OpenAIGatewayService) GatewayPoolRuntimeProgress(ctx context.Context, i
 		usageTag := gatewayPoolUsageTag(identity)
 		state := readGatewayPoolUsageForIdentity(account, identity)
 		stored := readGatewayPoolUsage(account, usageTag)
-		if cached, ok := s.codexCookies.poolUsageCache.Load(usageTag); ok {
-			if other, valid := cached.(*gatewayPoolUsageLedger); valid && (stored.UpdatedAt.IsZero() || other.UpdatedAt.After(state.UpdatedAt)) {
-				state = *other
-			}
-		} else {
-			usagePeers, legacy, err := s.gatewayPoolUsagePeers(ctx, identity)
+		// 其它实例可能已更新克隆快照；每次展示读取最新数据库投影，同配置只查一次。
+		usagePeers, loaded := usageSnapshots[usageTag]
+		if !loaded {
+			var legacy bool
+			usagePeers, legacy, err = gatewayPoolUsagePeers(ctx, s.accountRepo, identity)
 			if err != nil {
 				return nil, err
 			}
-			if !legacy && stored.UpdatedAt.IsZero() {
-				state = stored
-			}
-			for i := range usagePeers {
-				other := gatewayPoolUsagePeerView(&usagePeers[i], identity, legacy)
-				if other.UpdatedAt.After(state.UpdatedAt) {
-					state = other
+			usageSnapshots[usageTag], usageLegacy[usageTag] = usagePeers, legacy
+		}
+		legacy := usageLegacy[usageTag]
+		if !legacy && stored.UpdatedAt.IsZero() {
+			state = stored
+		}
+		if cached, ok := s.codexCookies.poolUsageCache.Load(usageTag); ok && gatewayPoolUsageCacheAllowed(ctx) {
+			if other, valid := cached.(*gatewayPoolUsageLedger); valid && other != nil {
+				if legacy || other.UpdatedAt.After(state.UpdatedAt) {
+					state = *other
+				}
+				// 已提交的配置快照优先于旧版本后来写出的共享快照。
+				if legacy {
+					legacy, usagePeers = false, nil
 				}
 			}
-			s.codexCookies.poolUsageCache.LoadOrStore(usageTag, &state)
+		}
+		for i := range usagePeers {
+			other := gatewayPoolUsagePeerView(&usagePeers[i], identity, legacy)
+			if other.UpdatedAt.After(state.UpdatedAt) {
+				state = other
+			}
+		}
+		// 旧共享域的临时迁移投影仍会变化，不能成为权威配置缓存。
+		if !legacy && !state.UpdatedAt.IsZero() && gatewayPoolUsageCacheAllowed(ctx) {
+			s.cacheGatewayPoolUsage(usageTag, &state)
 		}
 		runtime := &GatewayPoolRuntimeView{ObservedAt: time.Now().UTC(), Tickets: []GatewayPoolLiveTicket{},
 			Rounds: make([]GatewayPoolUsageRound, len(state.Rounds)), Archived: state.Archived, Incomplete: state.Incomplete}
