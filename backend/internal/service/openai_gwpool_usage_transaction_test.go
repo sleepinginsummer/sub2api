@@ -183,3 +183,35 @@ func TestGatewayPoolUsageDoesNotPublishBeforeCommit(t *testing.T) {
 		})
 	}
 }
+
+// 已结束业务区间在调用方事务未提交或提交失败时必须留在内存，成功提交后才释放。
+func TestGatewayPoolActiveUsageAcknowledgesOnlyCommittedEvents(t *testing.T) {
+	for _, pending := range []bool{true, false} {
+		t.Run(map[bool]string{true: "caller_transaction", false: "commit_failed"}[pending], func(t *testing.T) {
+			account := gwpoolTestAccount(1)
+			identity := openAIGatewayPoolAccountKey(account)
+			repo := &gatewayUsageTransactionRepo{gatewayRuntimeRepo: &gatewayRuntimeRepo{account: *account}, pending: pending}
+			if !pending {
+				repo.commitErr = errors.New("commit failed")
+			}
+			svc := &OpenAIGatewayService{accountRepo: repo}
+			tracker := svc.codexCookies.activeUsageTracker(identity)
+			start := time.Now().UTC().Add(-time.Minute)
+			attempt := &gatewayPoolActiveUseAttempt{}
+			attempt.event = gatewayPoolActiveUseEvent{ticket: "g\x00v", start: start, end: start.Add(time.Second),
+				sentAt: start, requestStarted: start, attempt: attempt}
+			tracker.attempts[attempt] = struct{}{}
+			change := func(*gatewayPoolUsageLedger) bool { return false }
+			require.False(t, svc.changeGatewayPoolUsage(context.Background(), account, identity, change))
+			require.Len(t, tracker.snapshot(), 1, "未提交的事件不能提前确认")
+			repo.pending, repo.commitErr = false, nil
+			require.True(t, svc.changeGatewayPoolUsage(context.Background(), account, identity, change))
+			require.Empty(t, tracker.snapshot())
+			fresh, err := repo.GetByID(context.Background(), account.ID)
+			require.NoError(t, err)
+			state := readGatewayPoolUsage(fresh, gatewayPoolUsageTag(identity))
+			require.Len(t, state.Rounds, 1)
+			require.EqualValues(t, 1000, state.Rounds[0].ActiveUsage.duration(time.Now()))
+		})
+	}
+}

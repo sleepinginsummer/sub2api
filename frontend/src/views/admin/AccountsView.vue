@@ -4,6 +4,7 @@
       <template #filters>
         <div class="flex flex-wrap-reverse items-start justify-between gap-3">
           <AccountTableFilters
+            class="lg:w-auto lg:flex-1"
             v-model:searchQuery="params.search"
             :filters="params"
             :groups="groups"
@@ -284,13 +285,14 @@
             </div>
           </template>
           <template #cell-capacity="{ row }">
-            <AccountCapacityCell :account="row" :gateway-progress="gatewayProgress[row.id]" :gateway-progress-unavailable="gatewayProgressUnavailable" />
+            <AccountCapacityCell :account="row" :gateway-progress="gatewayProgress[row.id]" :progress-paused="row.extra?.openai_gwpool === true && gatewayProgressPaused" />
           </template>
           <template #cell-status="{ row }">
             <div class="flex items-center gap-1.5">
               <AccountStatusIndicator :account="row"
-                :gateway-pool-rest="gatewayProgressUnavailable ? undefined : gatewayProgress[row.id]?.runtime?.rest"
-                :gateway-pool-rest-pending="row.extra?.openai_gwpool === true && (gatewayProgressUnavailable || !gatewayProgress[row.id]?.runtime?.rest)"
+                :gateway-pool-rest="gatewayProgress[row.id]?.runtime?.rest"
+                :gateway-pool-rest-pending="row.extra?.openai_gwpool === true && !gatewayProgress[row.id]?.runtime?.rest"
+                :progress-paused="row.extra?.openai_gwpool === true && gatewayProgressPaused"
                 @show-temp-unsched="handleShowTempUnsched" />
             </div>
           </template>
@@ -337,7 +339,7 @@
             </div>
           </template>
           <template #cell-gateway="{ row }">
-            <AccountGatewayCell :account="row" :progress="gatewayProgress[row.id]" :progress-unavailable="gatewayProgressUnavailable"
+            <AccountGatewayCell :account="row" :progress="gatewayProgress[row.id]" :progress-paused="row.extra?.openai_gwpool === true && gatewayProgressPaused"
               :retry-pending="retryingGatewayAccounts.has(row.id)" @retry="retryGatewayPool" />
           </template>
           <template #cell-proxy="{ row }">
@@ -1142,7 +1144,7 @@ const {
   }
 })
 
-const { progress: gatewayProgress, unavailable: gatewayProgressUnavailable } = useGatewayPoolProgress(computed(() =>
+const { progress: gatewayProgress, paused: gatewayProgressPaused } = useGatewayPoolProgress(computed(() =>
   hiddenColumns.has('gateway') && hiddenColumns.has('capacity') && hiddenColumns.has('status') ? [] : accounts.value
     .filter(account => account.extra?.openai_gwpool === true)
     .map(account => account.id)

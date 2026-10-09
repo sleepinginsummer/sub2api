@@ -26,6 +26,7 @@ func (u *gatewayPoolSnapshotUpstream) Do(req *http.Request, proxy string, id int
 	resp, err := u.cookieRecordingUpstream.Do(req, proxy, id, concurrency)
 	resp.Body = io.NopCloser(strings.NewReader(u.body))
 	resp.Request = u.responseRequest
+	resp.Header.Set(openAICodexTurnStateHeader, req.Header.Get(openAICodexTurnStateHeader))
 	return resp, err
 }
 
@@ -39,11 +40,12 @@ func TestGatewayPoolRouteSnapshotSurvivesCacheChanges(t *testing.T) {
 			upstream := &gatewayPoolSnapshotUpstream{responseRequest: redirect}
 			svc := &OpenAIGatewayService{httpUpstream: upstream}
 			account := pool.account(1)
-			account.Extra[openAIGatewayPoolGuardEnabledExtraKey] = false // 本组只验证传输快照。
 			svc.codexCookies.Store(account, gwpoolTestURL, codexCookieUpstreamResponse())
 			send := func() *http.Response {
+				gwpoolEchoSeedVerified(t, svc, account)
 				req, err := http.NewRequest(http.MethodPost, gwpoolTestURL, strings.NewReader("{}"))
 				require.NoError(t, err)
+				req.Header.Set(openAICodexTurnStateHeader, "snapshot-state")
 				resp, _, err := svc.doOpenAIUpstreamOnce(req, "", account)
 				require.NoError(t, err)
 				t.Cleanup(func() { _ = resp.Body.Close() })
@@ -103,13 +105,14 @@ func TestGatewayPoolRouteSnapshotForwardedToResults(t *testing.T) {
 				cfg := &config.Config{Gateway: config.GatewayConfig{MaxLineSize: defaultMaxLineSize, OpenAIFirstOutputTimeoutSeconds: 1}}
 				svc := &OpenAIGatewayService{cfg: cfg, httpUpstream: upstream, responseHeaderFilter: compileResponseHeaderFilter(cfg)}
 				account := pool.account(1)
-				account.Extra[openAIGatewayPoolGuardEnabledExtraKey] = false // 本组只验证出口快照及序列化。
 				account.Credentials["access_token"] = "test-access-token"
 				account.Extra["openai_passthrough"] = passthrough
+				gwpoolEchoSeedVerified(t, svc, account)
 				body := []byte(fmt.Sprintf(`{"model":"gpt-6-astra","input":"hi","instructions":"test","stream":%t}`, stream))
 				rec := httptest.NewRecorder()
 				c, _ := gin.CreateTestContext(rec)
 				c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(string(body)))
+				c.Request.Header.Set(openAICodexTurnStateHeader, "snapshot-state")
 				// OAuth 普通透传会强制流式；compact 路径覆盖真实非流式出口。
 				if passthrough && !stream {
 					c.Request.URL.Path = "/v1/responses/compact"

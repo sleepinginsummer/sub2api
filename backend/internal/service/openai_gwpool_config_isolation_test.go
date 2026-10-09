@@ -39,7 +39,7 @@ func TestGatewayPoolReleaseSeparatesAccountConfigurations(t *testing.T) {
 	require.NotNil(t, release)
 	require.NoError(t, attachRoute(context.Background(), store, b, gwpoolTestURL, http.Header{}))
 	release()
-	require.Equal(t, `{"cookie_version":"tkt-1"}`, poolA.nextRelease(t))
+	require.Zero(t, poolA.releaseHits.Load(), "未发送清理只处理本地票，不调用远端还票")
 	_, stateA := store.cachedPoolPair(openAIGatewayPoolCacheKey(a, gwpoolTestIdentity))
 	require.Equal(t, openAIGatewayPoolPairNone, stateA)
 	_, stateB := store.cachedPoolPair(openAIGatewayPoolCacheKey(b, gwpoolTestIdentity))
@@ -74,7 +74,11 @@ func TestGatewayPoolCacheSeparatesConsumerKeys(t *testing.T) {
 	calls := make(chan string, 4)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/gateways" {
-			_, _ = w.Write([]byte(`{"gateways":[]}`))
+			gateway := "unified-142"
+			if r.Header.Get("Authorization") == "Bearer second-key" {
+				gateway = "unified-84"
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"account": r.URL.Query().Get("account"), "live": 1, "gateways": []gwpoolFakeGateway{{Name: gateway, PairReady: true}}})
 			return
 		}
 		auth := r.Header.Get("Authorization")
@@ -83,7 +87,7 @@ func TestGatewayPoolCacheSeparatesConsumerKeys(t *testing.T) {
 		if auth == "Bearer second-key" {
 			pair = second
 		}
-		_ = json.NewEncoder(w).Encode(map[string]any{"cookie": pair, "valid_for_s": 150})
+		_ = json.NewEncoder(w).Encode(map[string]any{"cookie": pair, "gateway": openAICodexRouteGateway(pair), "cookie_version": "offline-version", "valid_for_s": 150})
 	}))
 	defer srv.Close()
 	store := &openAICodexCookieStore{}
@@ -121,12 +125,12 @@ func TestGatewayPoolConcurrentDifferentConfigurationsDoNotCoalesce(t *testing.T)
 	makePool := func(pair string) *httptest.Server {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.URL.Path == "/gateways" {
-				_, _ = w.Write([]byte(`{"gateways":[]}`))
+				_ = json.NewEncoder(w).Encode(map[string]any{"account": r.URL.Query().Get("account"), "live": 1, "gateways": []gwpoolFakeGateway{{Name: openAICodexRouteGateway(pair), PairReady: true}}})
 				return
 			}
 			entered <- pair
 			<-release
-			_ = json.NewEncoder(w).Encode(map[string]any{"cookie": pair, "valid_for_s": 150})
+			_ = json.NewEncoder(w).Encode(map[string]any{"cookie": pair, "gateway": openAICodexRouteGateway(pair), "cookie_version": "offline-version", "valid_for_s": 150})
 		}))
 		t.Cleanup(srv.Close)
 		return srv

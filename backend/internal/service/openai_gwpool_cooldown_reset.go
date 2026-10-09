@@ -109,9 +109,9 @@ func (c *gatewayPoolCooldown) resetBackoff(at, touched time.Time, base int) bool
 	c.WindowSeconds, c.LocalFloorSeconds, c.FixedSeconds = base, 0, 0
 	c.Until, c.ScheduleUpdatedAt = anchor.Add(time.Duration(base)*time.Second), at
 	c.AttemptAt, c.AttemptSeconds, c.ElapsedSeconds = time.Time{}, 0, 0
-	c.Early, c.Successes = false, nil
+	c.Successes = nil
 	c.LastSuccessAt, c.LastSuccessSeconds = time.Time{}, 0
-	c.RecommendedSeconds, c.RecommendationSource, c.RecommendationUntil = 0, "", time.Time{}
+	c.LegacyRecommendedSeconds, c.LegacyRecommendationSource, c.LegacyRecommendationUntil = 0, "", time.Time{}
 	return true
 }
 

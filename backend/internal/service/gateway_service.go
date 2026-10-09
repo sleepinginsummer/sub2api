@@ -703,6 +703,7 @@ type UpstreamFailoverError struct {
 	Reason                    GatewayFailureReason
 	NextAccountAction         NextAccountAction
 	GatewayPoolRotation       bool // availability-only; handler must enforce opt-in and same-group scope
+	GatewayPoolRetry          bool // pre-delivery recovery, bounded by the original request's wait policy
 	ClientStatusCode          int
 	ClientMessage             string
 	// RawRelayResponse：原样中继账号整体不可用。换号耗尽时 handler 把 StatusCode/
@@ -1547,6 +1548,21 @@ func explicitModelMappingClaims(account Account, model string) bool {
 	}
 	mapped, ok := stringMappingFromRaw(account.Credentials["model_mapping"])[model]
 	return ok && strings.TrimSpace(mapped) != ""
+}
+
+// GetCompositeRouteModels returns public IDs from enabled exact composite routes.
+func (s *GatewayService) GetCompositeRouteModels(ctx context.Context, groupID *int64, endpoint string, includeSystemOne bool) ([]string, error) {
+	if s == nil || s.compositeResolver == nil || groupID == nil {
+		return nil, nil
+	}
+	return s.compositeResolver.ListExactPublicModels(ctx, *groupID, endpoint, includeSystemOne)
+}
+
+func (s *GatewayService) FilterCompositeCodexModels(ctx context.Context, groupID int64, models []string) ([]string, error) {
+	if s == nil || s.compositeResolver == nil {
+		return models, nil
+	}
+	return s.compositeResolver.FilterCodexModels(ctx, groupID, models)
 }
 
 // GetSchedulablePlatforms returns the concrete platforms that currently have

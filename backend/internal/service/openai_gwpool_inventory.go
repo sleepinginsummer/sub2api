@@ -2,10 +2,10 @@ package service
 
 import (
 	"sync"
-	"time"
 )
 
-// 未实际验证的库存不能仅凭池端 UsedByYou 判为耗尽；代际用于发现并发取票或验证。
+// Rotation considers the current ticket and concurrent fetch/probe transitions,
+// never treating the pool's UsedByYou flag as proof of local consumption.
 type gatewayPoolInventoryState struct {
 	mu         sync.Mutex
 	generation uint64
@@ -14,7 +14,7 @@ type gatewayPoolInventoryState struct {
 }
 
 func (s *openAICodexCookieStore) gatewayPoolInventory(identity string) *gatewayPoolInventoryState {
-	value, _ := s.poolInventory.LoadOrStore(gatewayPoolLedgerIdentity(identity), &gatewayPoolInventoryState{})
+	value, _ := s.poolInventory.LoadOrStore(identity, &gatewayPoolInventoryState{})
 	state, _ := value.(*gatewayPoolInventoryState)
 	return state
 }
@@ -33,14 +33,14 @@ func (s *openAICodexCookieStore) gatewayPoolInventoryOperation(identity string) 
 	}
 }
 
-func (s *openAICodexCookieStore) gatewayPoolInventorySnapshot(identity string, account *Account) (generation uint64, pending bool) {
-	generation, active, candidates := s.gatewayPoolInventoryCandidates(identity, account)
+// No network and no ticket consumption. The generation rejects a listing observed
+// across an intervening fetch/probe, including one that has already completed.
+func (s *openAICodexCookieStore) gatewayPoolInventorySnapshot(identity string) (generation uint64, pending bool) {
+	generation, active, candidates := s.gatewayPoolInventoryCandidates(identity)
 	return generation, active || len(candidates) > 0
 }
 
-// 库存遍历只归并同配置的身份克隆；实际消耗读数使用独立的上游账号作用域。
-func (s *openAICodexCookieStore) gatewayPoolInventoryCandidates(identity string, account *Account) (generation uint64, active bool, candidates map[string]struct{}) {
-	identity = openAIGatewayPoolCacheKey(account, identity)
+func (s *openAICodexCookieStore) gatewayPoolInventoryCandidates(identity string) (generation uint64, active bool, candidates map[string]struct{}) {
 	state := s.gatewayPoolInventory(identity)
 	state.mu.Lock()
 	defer state.mu.Unlock()
@@ -48,29 +48,12 @@ func (s *openAICodexCookieStore) gatewayPoolInventoryCandidates(identity string,
 	if state.active > 0 {
 		return state.generation, true, candidates
 	}
-	domain := gatewayPoolLedgerIdentity(identity)
+	domain := identity
 	s.poolPairs.Range(func(key, _ any) bool {
 		other, ok := key.(string)
-		if ok && gatewayPoolLedgerIdentity(other) == domain {
+		if ok && other == domain {
 			if pair, live := s.cachedPoolPair(other); live == openAIGatewayPoolPairLive {
 				candidates[pair.gateway] = struct{}{}
-			}
-		}
-		return true
-	})
-	s.poolSpare.Range(func(key, value any) bool {
-		other, ok := key.(string)
-		if !ok || gatewayPoolLedgerIdentity(other) != domain {
-			return true
-		}
-		if batch, valid := value.(*gatewayPoolTicketBatch); valid {
-			for _, pair := range batch.pairs[batch.idx:] {
-				if pair.cookie == "" || pair.invalidated || pair.routeExpired(time.Now()) {
-					continue
-				}
-				if _, cooling := s.gatewayPoolUsedAt(identity, pair.gateway, account.gatewayPoolGatewayWindow(), account.gatewayPoolUseRecommendation()); !cooling {
-					candidates[pair.gateway] = struct{}{}
-				}
 			}
 		}
 		return true

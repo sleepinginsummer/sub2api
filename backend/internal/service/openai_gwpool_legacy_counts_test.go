@@ -12,7 +12,8 @@ func TestGatewayPoolLegacyCountsRemainUnmeasured(t *testing.T) {
 	repo := newTurnStateAutoRepo()
 	svc := &OpenAIGatewayService{accountRepo: repo}
 	old := map[string]any{"current": "unified-142", "pool_live": 62, "seen": map[string]any{}}
-	account := &Account{ID: 7, Extra: map[string]any{openAIGatewayHistoryExtraKey: old}}
+	account := gwpoolTestAccount(7)
+	account.Extra[openAIGatewayHistoryExtraKey] = old
 	require.NotContains(t, old, "pool_free")
 	// 升级前已有 live、没有 free；本次只刷新落点，没有取到新清单。
 	svc.noteOpenAIGatewayUse(context.Background(), account, "unified-84", "us-east", "full", true, 0, 0, 0)

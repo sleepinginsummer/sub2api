@@ -32,18 +32,14 @@ type openAICodexCookieStore struct {
 	poolClients sync.Map // base_url + "\x00" + consumer key → *gwpool.Client
 	// identity 解析凭证域身份（影子行按母账号算），与池配置指纹共同组成 pair 缓存键。
 	// 由构造器注入；裸结构体（单元测试）里为 nil，退回按本地行算。
-	identity       openAICodexCredentialIdentity
-	poolPairs      sync.Map // 凭证域身份 + 池配置指纹 → openAIGatewayPoolPair
-	poolFetch      gatewayPoolSharedWork[gatewayPoolFetchResult]
-	poolEarlyAt    sync.Map // 配置作用域 → 最近一次持久化 early 预留
-	poolEarlyLocks sync.Map // 配置作用域 → *sync.Mutex
-	poolEarlySkips sync.Map // account ID → 最近一次限频原因
-	poolEarlyClaim func(context.Context, *Account, string, time.Time) error
+	identity  openAICodexCredentialIdentity
+	poolPairs sync.Map // 凭证身份与池配置指纹共同隔离当前票。
+	poolFetch gatewayPoolSharedWork[gatewayPoolFetchResult]
 	// poolVerified 是「这个身份手上那张票**验过是满血**」（openai_gwpool_warm.go）。
 	//
 	// 必须单独记，**不能拿 poolPairs 的 Live 当「验过」**：Live 的唯一含义是取票那一刻写的
 	// route credential未到期且未被拒绝，和验没验过是两件事。两条路都会留下一张 Live 的未验票 ——
-	// 并发取票（singleflight 的 shared 对领头者也为真 ⇒ 谁都拿不到还票闭包），以及同一份凭据
+	// 并发取票（singleflight 的 shared 对领头者也为真 ⇒ 谁都拿不到本地丢弃闭包），以及同一份凭据
 	// 挂在多个账号行上（键是凭证域身份，别的行取的票这一行照样看得见）。换票即失效。
 	//
 	// 满血时刻用于观测窗口，验证标记与路由始终属于同一个配置作用域。
@@ -59,21 +55,24 @@ type openAICodexCookieStore struct {
 	poolRestState           sync.Map // ledger tag -> gatewayPoolRestState; includes fail-closed pending writes
 	poolUsageLocks          sync.Map // ledger tag -> *sync.Mutex, durable usage rounds
 	poolUsageCache          sync.Map // ledger tag -> *gatewayPoolUsageLedger, immutable committed snapshot
+	poolActiveUsage         sync.Map // ledger tag -> *gatewayPoolActiveUsageTracker, business intervals only
 	poolUsageSessionOnce    sync.Once
 	poolUsageSession        string
 	poolUsageAttempt        func(context.Context, *Account, string, string, OpenAIGatewayPoolApplied, time.Time, bool)
 	poolUsageFinished       func(context.Context, *Account)
-	poolUsageSettle         func(context.Context, *Account, string)
 	poolProgress            gatewayPoolProgressTracker
 	poolRotationAccounts    sync.Map // account ID -> fresh opt-in observed during preference hydration
 	// poolWarm 把同一张票上的并发预热判据收口成一次（openai_gwpool_warm.go）。
 	// 取票本身已经被 poolFetch 收成一次 ⇒ 同身份的并发请求手里是**同一张票**、同一个
 	// (上游账号 × 网关) 单元；跨模型共享 A/B，各自取消不影响其它等待者，
 	// 而供给只有个位数张/小时。键按票号分，换了票要重新验。
-	poolWarm            gatewayPoolProbeFlights
-	poolPrepare         gatewayPoolSharedWork[struct{}]
-	poolPrepareProgress sync.Map // full credential identity -> last shared *gatewayPoolProgressRun
-	poolCandidateQueues sync.Map // full credential identity -> *gatewayPoolCandidateQueue
+	poolWarm              gatewayPoolProbeFlights
+	poolPrepare           gatewayPoolSharedWork[struct{}]
+	poolPreparePoliciesMu sync.Mutex
+	poolPreparePolicies   map[string]map[*gatewayPoolPreparationPolicy]struct{}
+	poolPrepareProgress   sync.Map // full credential identity -> last shared *gatewayPoolProgressRun
+	poolContinuousWaiters sync.Map // full identity -> *atomic.Int32; request-owned shortage sleeps
+	poolCandidateQueues   sync.Map // full credential identity -> *gatewayPoolCandidateQueue
 	// poolUsed 是「这个凭证域身份最近碰过哪些网关」的本地账本，用来挑一个没烧过的落点，
 	// 并作为 /cookie 的 exclude 带给池子（裸取时也能避开烧过的落点）。
 	// 池子按它发的 consumer key 记账，认不出同一份凭据挂在多个账号行上（见 gatewayPoolLedgerKey）。
@@ -84,8 +83,6 @@ type openAICodexCookieStore struct {
 	poolCooldownReset      sync.Map // ledger identity -> last committed reset barrier; writes hold poolCooldownMu
 	poolCooldownClear      sync.Map // ledger identity -> last durable manual clear; history stays intact
 	poolCooldownResetLocks sync.Map // ledger identity -> *sync.Mutex; timer writes only
-	poolManualRetry        sync.Map // ledger identity -> an active administrator-triggered preparation
-	poolRecommendations    sync.Map // ledger identity × gateway → gatewayPoolRecommendation
 	poolCooldownPersist    func(context.Context, *Account, string)
 	poolHistoryLocks       sync.Map // 本地行 ID → *sync.Mutex，串行合并已有 history。
 	accountByID            func(context.Context, int64) (*Account, error)
@@ -93,18 +90,8 @@ type openAICodexCookieStore struct {
 	poolHistoryLoad        singleflight.Group
 	// poolBackoff 是「池子让这个身份先别取票」的到点（见 gatewayPoolBackoff）。
 	// 按**上游账号**记而不是按请求：退避只对本次请求生效的话，重试环照旧每轮都去敲池子。
-	poolBackoff sync.Map // 账本身份（上游账号粒度）→ time.Time
-	// poolSpare 是批量取票剩下的备用票（/cookie?count=，见 gatewayPoolTakeBatch）。
-	//
-	// 验满血那条路的形状是「取一张 → 验 → 不满血再取一张」，每轮一个 HTTP 往返，而池子内部
-	// 可能顺带现铸（取票超时默认 25s），三轮就能把 90 秒的预热预算花光在往返上。一发拿 N 张
-	// 之后第 2..N 轮**一个往返都不用打**。
-	//
-	// 架子上这张不是浪费而是预取：它在自己的满血窗口内对**后面的**业务请求一样有效。
-	// 窗口过了还没人用才算损失，而那只发生在这个身份突然没请求的时候。
-	// 键与 poolPairs 相同：凭证域身份和池配置相同的账号行共用库存。
-	poolSpare     sync.Map // 凭证域身份 + 池配置指纹 → *gatewayPoolTicketBatch
-	poolInventory sync.Map // 凭证域身份 + 池配置指纹 → *gatewayPoolInventoryState
+	poolBackoff   sync.Map // 配置作用域 → 取票退避。
+	poolInventory sync.Map // 配置作用域 → *gatewayPoolInventoryState
 }
 
 // openAICodexCookieJarKey：本地行 ID + 凭证域身份。同一行重新授权成另一个 ChatGPT 身份时

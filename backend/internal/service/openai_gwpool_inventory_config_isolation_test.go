@@ -18,32 +18,31 @@ func TestGatewayPoolInventorySeparatesConfigurationsAndSharesConsumption(t *test
 	a.Extra[OpenAIGatewayPoolConsumerKeyExtraKey] = "key-a"
 	b.Extra[OpenAIGatewayPoolConsumerKeyExtraKey] = "key-b"
 	store := &openAICodexCookieStore{}
-	keyA := openAIGatewayPoolCacheKey(a, gwpoolTestIdentity)
+	keyA, keyB := openAIGatewayPoolCacheKey(a, gwpoolTestIdentity), openAIGatewayPoolCacheKey(b, gwpoolTestIdentity)
 	finish := store.gatewayPoolInventoryOperation(keyA)
-	_, pendingA := store.gatewayPoolInventorySnapshot(gwpoolTestIdentity, a)
-	generationB, pendingB := store.gatewayPoolInventorySnapshot(gwpoolTestIdentity, b)
+	_, pendingA := store.gatewayPoolInventorySnapshot(keyA)
+	generationB, pendingB := store.gatewayPoolInventorySnapshot(keyB)
 	require.True(t, pendingA)
 	require.False(t, pendingB, "其它池的在途取票不能挡住本池耗尽确认")
 	finish()
-	generationAfter, pendingB := store.gatewayPoolInventorySnapshot(gwpoolTestIdentity, b)
+	generationAfter, pendingB := store.gatewayPoolInventorySnapshot(keyB)
 	require.False(t, pendingB)
-	require.Equal(t, generationB, generationAfter, "其它池操作不能改变本池库存代数")
-
-	pair := openAIGatewayPoolPair{cookie: "offline", gateway: "unified-142", version: "v", until: time.Now().Add(time.Minute * 3)}
-	store.gatewayPoolSpareShelve(keyA, &gatewayPoolTicketBatch{store: store, account: a, identity: gwpoolTestIdentity, pairs: []openAIGatewayPoolPair{pair}})
-	_, pendingA = store.gatewayPoolInventorySnapshot(gwpoolTestIdentity, a)
-	_, pendingB = store.gatewayPoolInventorySnapshot(gwpoolTestIdentity, b)
-	require.True(t, pendingA, "本池未尝试的库存仍可用")
-	require.False(t, pendingB, "其它池不能借用本池库存")
+	require.Equal(t, generationB, generationAfter)
+	pair := openAIGatewayPoolPair{cookie: "offline", gateway: "unified-142", version: "v", until: time.Now().Add(3 * time.Minute)}
+	store.poolPairs.Store(keyA, pair)
+	_, pendingA = store.gatewayPoolInventorySnapshot(keyA)
+	_, pendingB = store.gatewayPoolInventorySnapshot(keyB)
+	require.True(t, pendingA, "本配置的活票仍可复用")
+	require.False(t, pendingB, "其它配置不能借用本池的票")
 	clone := *a
 	clone.ID = 3
-	_, pendingClone := store.gatewayPoolInventorySnapshot(gwpoolTestIdentity, &clone)
-	require.True(t, pendingClone, "同凭据同池配置的克隆行仍共享库存")
-
-	store.gatewayPoolMarkUsed(gwpoolTestIdentity, pair.gateway)
-	_, pendingA = store.gatewayPoolInventorySnapshot(gwpoolTestIdentity, a)
-	require.False(t, pendingA, "其它请求已经消耗的真实网关不能再当作未尝试库存")
-	require.True(t, store.gatewayPoolUsedRecently(gwpoolTestIdentity, pair.gateway, b.gatewayPoolGatewayWindow()))
+	_, pendingClone := store.gatewayPoolInventorySnapshot(openAIGatewayPoolCacheKey(&clone, gwpoolTestIdentity))
+	require.True(t, pendingClone, "同配置克隆共享当前票")
+	store.gatewayPoolMarkUsed(keyA, pair.gateway)
+	store.gatewayPoolMarkStale(keyA, pair.version)
+	_, pendingA = store.gatewayPoolInventorySnapshot(keyA)
+	require.False(t, pendingA, "已失效票不能继续参与耗尽判定")
+	require.True(t, store.gatewayPoolUsedRecently(keyB, pair.gateway, b.gatewayPoolGatewayWindow()))
 }
 
 // 同凭据配置不同池时，耗尽判定不能让另一池退出调度；同配置克隆仍共享轮次。

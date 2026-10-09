@@ -53,10 +53,10 @@
             @select="editBaseUrl = $event"
           />
           <CnBaseUrlPresets
-            v-if="isCNApiKeyAccount && account.platform !== 'opencode_go'"
+            v-if="isCNApiKeyAccount && isCNProviderPlatform(account.platform)"
             class="mt-2"
             :platform="cnPresetPlatform"
-            :mode="editAccountMode"
+            :mode="cnPresetMode"
             :protocol="editApiProtocol"
             :current-url="editBaseUrl"
             @select="onCnPresetSelect"
@@ -72,7 +72,7 @@
               <input v-model="editAdaptiveBaseUrls[item.value]" type="text" class="input" />
             </div>
           </div>
-          <p v-if="!cnSupportsNativeResponses(account.platform)" class="input-hint">
+          <p v-if="!cnSupportsNativeResponses(account.platform, currentOpenCodeOrCNMode())" class="input-hint">
             {{ t('admin.accounts.cnProviders.apiProtocol.responsesFallbackDesc') }}
           </p>
         </div>
@@ -128,8 +128,28 @@
             </button>
           </div>
         </div>
+        <!-- Account Mode Selection (providers using the generic form) -->
+        <div v-if="isGenericMultiProtocolAccount && genericAccountModes.length > 1" data-testid="edit-generic-account-mode">
+          <label class="input-label">{{ t('admin.accounts.cnProviders.accountMode.title') }}</label>
+          <div class="mt-2 flex flex-wrap gap-2">
+            <button
+              v-for="mode in genericAccountModes"
+              :key="mode"
+              type="button"
+              :class="[
+                'rounded-lg border-2 px-3 py-1.5 text-xs transition-all',
+                editAccountMode === mode
+                  ? 'border-primary-500 bg-primary-50 font-medium text-primary-700 dark:bg-primary-900/30 dark:text-primary-300'
+                  : 'border-gray-200 text-gray-700 hover:border-gray-400 dark:border-dark-600 dark:text-gray-300 dark:hover:border-gray-600'
+              ]"
+              @click="editAccountMode = mode"
+            >
+              {{ providerModeLabel(mode, t) }}
+            </button>
+          </div>
+        </div>
         <!-- Account Mode Selection (CN providers) -->
-        <div v-if="isCNApiKeyAccount && account.platform !== 'opencode_go'">
+        <div v-if="isCNApiKeyAccount && isCNProviderPlatform(account.platform)">
           <label class="input-label">{{ t('admin.accounts.cnProviders.accountMode.title') }}</label>
           <div class="mt-2 flex flex-wrap gap-2">
             <button
@@ -171,9 +191,10 @@
           <p class="input-hint">{{ t(`admin.accounts.cnProviders.apiProtocol.${cnProtocolDescKey}Desc`) }}</p>
         </div>
         <OpenCodeGoProtocolRulesEditor
-          v-if="account.platform === 'opencode_go' && editApiProtocol === 'adaptive'"
+          v-if="isCNApiKeyAccount && providerRoutesByModel(account.platform) && editApiProtocol === 'adaptive'"
           v-model:rows="editOpenCodeGoProtocolRules"
-          :plan="editOpenCodeAccountMode"
+          :platform="account.platform"
+          :plan="currentOpenCodeOrCNMode()"
         />
         <!-- Zhipu 团队版 Coding Plan：组织/项目 ID（可选，填写后用量查询走团队版端点） -->
         <div v-if="account.platform === 'zhipu' && editAccountMode === 'coding'">
@@ -2619,22 +2640,20 @@
               />
               <p class="input-hint">{{ t('admin.accounts.openai.gwpoolConsumerKeyDesc') }}</p>
             </div>
+            <div class="flex items-center justify-between gap-4" data-testid="edit-openai-gwpool-wait-policy">
+              <div class="min-w-0">
+                <label class="input-label mb-0 text-xs">{{ t('admin.accounts.openai.gwpoolContinuousWait') }}</label>
+                <p class="input-hint">{{ t('admin.accounts.openai.gwpoolContinuousWaitDesc') }}</p>
+              </div>
+              <input v-model="openAIGwpoolContinuousWait" data-testid="edit-openai-gwpool-continuous-wait"
+                type="checkbox" class="h-4 w-4 flex-shrink-0 rounded border-gray-300 text-primary-600 focus:ring-primary-500" />
+            </div>
             <div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
             <div>
               <label class="input-label text-xs">{{ t('admin.accounts.openai.gwpoolProbeTimeout') }}</label>
               <input v-model.number="openAIGwpoolProbeTimeout" data-testid="edit-openai-gwpool-probe-timeout"
-                type="number" min="1" max="120" step="1" placeholder="35" class="input text-xs" />
+                type="number" min="1" max="120" step="1" placeholder="10" class="input text-xs" />
               <p class="input-hint">{{ t('admin.accounts.openai.gwpoolProbeTimeoutDesc') }}</p>
-            </div>
-            <div>
-              <label class="input-label text-xs">{{ t('admin.accounts.openai.gwpoolMaxWait') }}</label>
-              <input
-                v-model.number="openAIGwpoolMaxWait"
-                data-testid="edit-openai-gwpool-max-wait"
-                type="number" min="1" max="3600" step="1" placeholder="120"
-                class="input text-xs"
-              />
-              <p class="input-hint">{{ t('admin.accounts.openai.gwpoolMaxWaitDesc') }}</p>
             </div>
             <div>
               <label class="input-label text-xs">{{ t('admin.accounts.openai.gwpoolPrepareRetries') }}</label>
@@ -2643,45 +2662,18 @@
               <p class="input-hint">{{ t('admin.accounts.openai.gwpoolPrepareRetriesDesc') }}</p>
             </div>
             </div>
-            <div class="flex items-center justify-between gap-4">
-              <div class="min-w-0">
-                <label class="input-label mb-0 text-xs">{{ t('admin.accounts.openai.gwpoolEarlyProbe') }}</label>
-                <p class="input-hint">{{ t('admin.accounts.openai.gwpoolEarlyProbeDesc') }}</p>
-              </div>
-              <input v-model="openAIGwpoolEarlyProbe"
-                data-testid="edit-openai-gwpool-early-probe" type="checkbox"
-                class="h-4 w-4 flex-shrink-0 rounded border-gray-300 text-primary-600 focus:ring-primary-500" />
-            </div>
-            <div class="flex items-center justify-between gap-4">
-              <div class="min-w-0">
-                <label class="input-label mb-0 text-xs">{{ t('admin.accounts.openai.gwpoolMemberIsolation') }}</label>
-                <p class="input-hint">{{ t('admin.accounts.openai.gwpoolMemberIsolationDesc') }}</p>
-              </div>
-              <input v-model="openAIGwpoolMemberIsolation" data-testid="edit-openai-gwpool-member-isolation"
-                type="checkbox" class="h-4 w-4 flex-shrink-0 rounded border-gray-300 text-primary-600 focus:ring-primary-500" />
-            </div>
-            <div class="flex items-center justify-between gap-4">
-              <div class="min-w-0">
-                <label class="input-label mb-0 text-xs">{{ t('admin.accounts.openai.gwpoolUseRecommendation') }}</label>
-                <p class="input-hint">{{ t('admin.accounts.openai.gwpoolUseRecommendationDesc') }}</p>
-              </div>
-              <input v-model="openAIGwpoolUseRecommendation" data-testid="edit-openai-gwpool-use-recommendation"
-                type="checkbox" class="h-4 w-4 flex-shrink-0 rounded border-gray-300 text-primary-600 focus:ring-primary-500" />
-            </div>
-            <div class="grid grid-cols-1 gap-3 sm:grid-cols-2" data-testid="edit-openai-gwpool-thresholds">
-            <div>
-              <label class="input-label text-xs">{{ t('admin.accounts.openai.gwpoolRotationMinGateways') }}</label>
-              <input v-model.number="openAIGwpoolRotationMinGateways" type="number" min="1" max="512" step="1"
-                placeholder="1" class="input text-xs" data-testid="edit-openai-gwpool-rotation-min-gateways" />
-              <p class="input-hint">{{ t('admin.accounts.openai.gwpoolRotationMinGatewaysDesc') }}</p>
-            </div>
+            <p class="input-hint" data-testid="edit-openai-gwpool-credential-scope">
+              {{ t('admin.accounts.openai.gwpoolCredentialScope') }}
+            </p>
+            <fieldset :disabled="openAIGwpoolContinuousWait" class="grid grid-cols-1 gap-3 sm:grid-cols-2" data-testid="edit-openai-gwpool-thresholds">
             <div>
               <label class="input-label text-xs">{{ t('admin.accounts.openai.gwpoolResumeGateways') }}</label>
               <input v-model.number="openAIGwpoolResumeGateways" type="number" min="1" max="512" step="1"
                 placeholder="50" class="input text-xs" data-testid="edit-openai-gwpool-resume-gateways" />
               <p class="input-hint">{{ t('admin.accounts.openai.gwpoolResumeGatewaysDesc') }}</p>
             </div>
-            </div>
+            </fieldset>
+            <p v-if="openAIGwpoolContinuousWait" class="input-hint">{{ t('admin.accounts.openai.gwpoolContinuousWaitInactiveLimits') }}</p>
             <p class="input-hint">{{ t('admin.accounts.openai.gwpoolCandidatesHint') }}</p>
             <div>
               <div class="mt-2 grid grid-cols-1 gap-3 sm:grid-cols-2">
@@ -2728,7 +2720,7 @@
                     min="1"
                     max="86400"
                     step="1"
-                    placeholder="25"
+                    placeholder="10"
                     class="input text-xs"
                     data-testid="edit-openai-gwpool-fetch-timeout"
                     :title="t('admin.accounts.openai.gwpoolFetchTimeoutDesc')"
@@ -3557,7 +3549,14 @@ import {
   buildPlanTypeOptions,
   cloneOpenCodeGoProtocolRules,
   defaultOpenCodeProtocolRules,
+  defaultProviderProtocolRules,
+  isMultiProtocolApiKeyPlatform,
   parseOpenCodeGoProtocolRules,
+  providerAccountModes,
+  providerModeLabel,
+  providerNativeProtocols,
+  providerRoutesByModel,
+  resolveProviderAccountMode,
   readPlanType,
   resolveOpenCodeAccountMode,
   isCustomGrokBaseUrl,
@@ -3782,11 +3781,18 @@ const editCprAdminBaseUrl = ref('')
 // ── 国产供应商（Kimi / Zhipu / DeepSeek）account_mode / api_protocol 编辑 ──
 // account_mode 决定额度/余额监控路径，api_protocol 决定转发端点与格式；
 // 二者均可修正（早期创建的账号可能存错默认值），切换时重置 base_url 预置。
+// 覆盖全部多协议 API Key 供应商（国产厂商、OpenCode 与走通用表单的供应商）。
 const isCNApiKeyAccount = computed(
-  () =>
-    props.account?.type === 'apikey' &&
-    (isCNProviderPlatform(props.account.platform) || props.account.platform === 'opencode_go')
+  () => props.account?.type === 'apikey' && isMultiProtocolApiKeyPlatform(props.account.platform)
 )
+// 前端没有专属界面、走通用表单的多协议供应商：模式 / 协议 / 默认端点来自 profile。
+const isGenericMultiProtocolAccount = computed(
+  () =>
+    isCNApiKeyAccount.value &&
+    !isCNProviderPlatform(props.account?.platform ?? '') &&
+    props.account?.platform !== 'opencode_go'
+)
+const genericAccountModes = computed(() => providerAccountModes(props.account?.platform ?? ''))
 // CnBaseUrlPresets 的 platform prop 是平台字面量联合类型，模板里不能写
 // `as` 断言（其中的 `|` 会被 eslint 误判为 Vue2 filter 语法），经此 computed 传递。
 const cnPresetPlatform = computed<CnProviderPlatform>(() => {
@@ -3796,15 +3802,18 @@ const cnPresetPlatform = computed<CnProviderPlatform>(() => {
   }
   return 'kimi'
 })
-const adaptivePresetPlatform = computed<CnProviderPlatform | 'opencode_go'>(() => {
-  if (props.account?.platform === 'opencode_go') return 'opencode_go'
+const adaptivePresetPlatform = computed<string>(() => {
+  if (isCNApiKeyAccount.value) return props.account!.platform
   return cnPresetPlatform.value
 })
 const editApiProtocol = ref<CnApiProtocol>('adaptive')
 const editOpenCodeGoProtocolRules = ref<OpenCodeGoProtocolRule[]>(cloneOpenCodeGoProtocolRules())
-const editAccountMode = ref<CnAccountMode>('payg')
+// 多协议供应商（国产厂商与走通用表单的供应商）的接入模式；OpenCode 用 editOpenCodeAccountMode。
+const editAccountMode = ref<string>('payg')
 const editOpenCodeAccountMode = ref<OpenCodeAccountMode>('go')
-function currentOpenCodeOrCNMode(): CnAccountMode | OpenCodeAccountMode {
+// 国产厂商的接入模式只有 payg / coding。
+const cnPresetMode = computed<CnAccountMode>(() => (editAccountMode.value === 'coding' ? 'coding' : 'payg'))
+function currentOpenCodeOrCNMode(): string {
   return props.account?.platform === 'opencode_go' ? editOpenCodeAccountMode.value : editAccountMode.value
 }
 // 智谱团队版 Coding Plan：组织/项目 ID，写入 credentials 供额度探测切换团队端点
@@ -3832,25 +3841,22 @@ const cnAccountModeOptions = computed<Array<{ value: CnAccountMode; labelKey: 'p
     ]
   }
 )
-const cnProtocolOptions = computed<Array<{ value: CnApiProtocol; labelKey: string }>>(() => {
-  const opts: Array<{ value: CnApiProtocol; labelKey: string }> = [
-    { value: 'adaptive', labelKey: 'adaptive' },
-    { value: 'chat_completions', labelKey: 'chatCompletions' },
-    { value: 'anthropic', labelKey: 'anthropic' }
-  ]
-  if (cnSupportsNativeResponses(props.account?.platform ?? '')) {
-    opts.push({ value: 'responses', labelKey: 'responses' })
-  }
-  return opts
-})
-const editAdaptiveProtocolOptions = computed<Array<{ value: CnNativeApiProtocol; labelKey: string }>>(() => {
-  const opts: Array<{ value: CnNativeApiProtocol; labelKey: string }> = [
-    { value: 'chat_completions', labelKey: 'chatCompletions' },
-    { value: 'anthropic', labelKey: 'anthropic' }
-  ]
-  if (cnSupportsNativeResponses(props.account?.platform ?? '')) opts.push({ value: 'responses', labelKey: 'responses' })
-  return opts
-})
+const NATIVE_PROTOCOL_LABEL_KEYS: Record<CnNativeApiProtocol, string> = {
+  chat_completions: 'chatCompletions',
+  anthropic: 'anthropic',
+  responses: 'responses'
+}
+// 当前供应商与接入模式提供原生端点的协议（profile 中有默认基址的协议）。
+const editAdaptiveProtocolOptions = computed<Array<{ value: CnNativeApiProtocol; labelKey: string }>>(() =>
+  providerNativeProtocols(props.account?.platform ?? '', currentOpenCodeOrCNMode()).map(value => ({
+    value,
+    labelKey: NATIVE_PROTOCOL_LABEL_KEYS[value]
+  }))
+)
+const cnProtocolOptions = computed<Array<{ value: CnApiProtocol; labelKey: string }>>(() => [
+  { value: 'adaptive', labelKey: 'adaptive' },
+  ...editAdaptiveProtocolOptions.value
+])
 watch(editApiProtocol, (protocol, previousProtocol) => {
   if (!isCNApiKeyAccount.value || syncingForm.value) return
   if (protocol === 'adaptive') {
@@ -3874,11 +3880,19 @@ watch(editApiProtocol, (protocol, previousProtocol) => {
 watch(editAccountMode, (mode, previousMode) => {
   if (!isCNApiKeyAccount.value || syncingForm.value) return
   if (props.account?.platform === 'opencode_go') return
-  // deepseek 无 coding 套餐：防御性回退（UI 已隐藏该选项）。
-  const effectiveMode = props.account!.platform === 'deepseek' && mode === 'coding' ? 'payg' : mode
+  // 供应商没有的接入模式（如 deepseek 无 coding 套餐）防御性回退默认模式（UI 已隐藏该选项）。
+  const effectiveMode = resolveProviderAccountMode(props.account!.platform, mode)
   if (effectiveMode !== mode) {
     editAccountMode.value = effectiveMode
     return
+  }
+  if (providerRoutesByModel(props.account!.platform)) {
+    const previousRules = JSON.stringify(defaultProviderProtocolRules(props.account!.platform, previousMode))
+    if (JSON.stringify(editOpenCodeGoProtocolRules.value) === previousRules) {
+      editOpenCodeGoProtocolRules.value = cloneOpenCodeGoProtocolRules(
+        defaultProviderProtocolRules(props.account!.platform, mode)
+      )
+    }
   }
   if (editApiProtocol.value === 'adaptive') {
     const previousDefaults = defaultCNAdaptiveBaseUrls(adaptivePresetPlatform.value, previousMode)
@@ -4137,20 +4151,12 @@ const openAIGwpoolBaseURL = ref('')
 // 输入框恒为空：后端把已存的 key 脱敏成 true，页面从不回显原值。留空 = 不修改。
 const openAIGwpoolConsumerKey = ref('')
 const openAIGwpoolConsumerKeySaved = ref(false)
-const openAIGwpoolRotationMinGateways = ref<number | ''>('')
 const openAIGwpoolResumeGateways = ref<number | ''>('')
-const openAIGwpoolEarlyProbe = ref(false)
-const openAIGwpoolMemberIsolation = ref(false)
-const openAIGwpoolUseRecommendation = ref(false)
-const openAIGwpoolMaxWait = ref<number | ''>('')
+const openAIGwpoolContinuousWait = ref(false)
 const openAIGwpoolProbeTimeout = ref<number | ''>('')
 const openAIGwpoolPrepareRetries = ref<number | ''>('')
-// 降智防护**没有档位了**（2026-10-03）：三个老键 openai_gwpool_guard /
-// openai_gwpool_state_echo / openai_gwpool_degraded_retries 都不再读也不再写，页面上那个
-// select 一起删了。存量行里留着它们是无害的死键 —— 但别再接回来，后端也不读了。
-// 续期缺省即关：那一发要摘掉 __oailb 出站，是对真实 Codex 报文形状的偏离，而且从没单独实测过。
-// 三个「秒」旋钮：null = 留空 = 用后端默认值（1h / 25s / 2s），不往 extra 里写键。
-// 占位符要和后端那三个常量一致 —— 它展示的就是「留空会用什么」。
+// 秒数留空使用后端默认值：初始CD 1h、取票10s、清单2s。
+// 严格验证与Luna固定，不保存退役开关。
 const openAIGwpoolGatewayWindow = ref<number | null>(null)
 const gatewayPoolCooldownResetDefaultHours = 24
 const openAIGwpoolCooldownResetHours = ref<number | null>(gatewayPoolCooldownResetDefaultHours)
@@ -4542,12 +4548,7 @@ const defaultBaseUrl = computed(() => {
   if (props.account?.platform === 'typesafe') return 'https://api.typesafe.ai'
   // CN 供应商：按当前模式/协议回落到官方预设（清空输入框提交时使用），
   // 不能落到 anthropic 默认值（会被当 CC base 拼出错误端点）。
-  if (
-    props.account?.platform === 'kimi' ||
-    props.account?.platform === 'zhipu' ||
-    props.account?.platform === 'deepseek' ||
-    props.account?.platform === 'opencode_go'
-  ) {
+  if (props.account && isMultiProtocolApiKeyPlatform(props.account.platform)) {
     return defaultCNBaseUrl(props.account.platform, currentOpenCodeOrCNMode(), editApiProtocol.value)
   }
   return 'https://api.anthropic.com'
@@ -4711,12 +4712,8 @@ const syncFormFromAccount = (newAccount: Account | null) => {
 	openAIGwpoolConsumerKeySaved.value = extra?.openai_gwpool_consumer_key === true
 	openAIGwpoolConsumerKey.value = ''
 	// 网关池强制组内轮转，阈值留空沿用后端默认。
-	openAIGwpoolRotationMinGateways.value = typeof extra?.openai_gwpool_rotation_min_gateways === 'number' ? extra.openai_gwpool_rotation_min_gateways : ''
 	openAIGwpoolResumeGateways.value = typeof extra?.openai_gwpool_resume_gateways === 'number' ? extra.openai_gwpool_resume_gateways : ''
-	openAIGwpoolEarlyProbe.value = extra?.openai_gwpool_early_probe_enabled === true
-	openAIGwpoolMemberIsolation.value = extra?.openai_gwpool_member_isolation === true
-	openAIGwpoolUseRecommendation.value = extra?.openai_gwpool_use_recommended_cooldown === true
-	openAIGwpoolMaxWait.value = typeof extra?.openai_gwpool_max_wait_s === 'number' ? extra.openai_gwpool_max_wait_s : ''
+	openAIGwpoolContinuousWait.value = extra?.openai_gwpool_continuous_wait === true
 	openAIGwpoolProbeTimeout.value = typeof extra?.openai_gwpool_probe_timeout_s === 'number' ? extra.openai_gwpool_probe_timeout_s : ''
 	openAIGwpoolPrepareRetries.value = typeof extra?.openai_gwpool_prepare_retries === 'number' ? extra.openai_gwpool_prepare_retries : ''
 	// 续期缺省即关：只有显式 true 才算开（与后端 gatewayPoolRenew 同口径）。
@@ -4951,11 +4948,13 @@ const syncFormFromAccount = (newAccount: Account | null) => {
     const credentials = newAccount.credentials as Record<string, unknown>
     // 国产供应商：读取 account_mode 与 api_protocol 作为可编辑初始值
     // （编辑弹窗允许修正两者，用于修复早期存错默认值的账号）。
-    if (isCNProviderPlatform(newAccount.platform) || newAccount.platform === 'opencode_go') {
+    if (isMultiProtocolApiKeyPlatform(newAccount.platform)) {
       if (newAccount.platform === 'opencode_go') {
         editOpenCodeAccountMode.value = resolveOpenCodeAccountMode(credentials.account_mode)
-      } else {
+      } else if (isCNProviderPlatform(newAccount.platform)) {
         editAccountMode.value = credentials.account_mode === 'coding' ? 'coding' : 'payg'
+      } else {
+        editAccountMode.value = resolveProviderAccountMode(newAccount.platform, credentials.account_mode)
       }
       const storedProtocol = credentials.api_protocol
       editApiProtocol.value =
@@ -4965,7 +4964,7 @@ const syncFormFromAccount = (newAccount: Account | null) => {
         storedProtocol === 'responses'
           ? storedProtocol
           : 'chat_completions'
-      if (!cnSupportsNativeResponses(newAccount.platform) && editApiProtocol.value === 'responses') {
+      if (!cnSupportsNativeResponses(newAccount.platform, currentOpenCodeOrCNMode()) && editApiProtocol.value === 'responses') {
         editApiProtocol.value = 'chat_completions'
       }
       const adaptiveDefaults = defaultCNAdaptiveBaseUrls(newAccount.platform, currentOpenCodeOrCNMode())
@@ -5004,10 +5003,10 @@ const syncFormFromAccount = (newAccount: Account | null) => {
         editZhipuOrganization.value = typeof credentials.zhipu_organization === 'string' ? credentials.zhipu_organization : ''
         editZhipuProject.value = typeof credentials.zhipu_project === 'string' ? credentials.zhipu_project : ''
       }
-      if (newAccount.platform === 'opencode_go') {
+      if (providerRoutesByModel(newAccount.platform)) {
         editOpenCodeGoProtocolRules.value =
           parseOpenCodeGoProtocolRules(credentials.protocol_rules) ??
-          cloneOpenCodeGoProtocolRules(defaultOpenCodeProtocolRules(editOpenCodeAccountMode.value))
+          cloneOpenCodeGoProtocolRules(defaultProviderProtocolRules(newAccount.platform, currentOpenCodeOrCNMode()))
       }
     }
     const platformDefaultUrl =
@@ -5019,10 +5018,7 @@ const syncFormFromAccount = (newAccount: Account | null) => {
             ? 'https://api.x.ai/v1'
             : newAccount.platform === 'typesafe'
               ? 'https://api.typesafe.ai'
-            : newAccount.platform === 'kimi' ||
-                newAccount.platform === 'zhipu' ||
-                newAccount.platform === 'deepseek' ||
-                newAccount.platform === 'opencode_go'
+            : isMultiProtocolApiKeyPlatform(newAccount.platform)
               ? defaultCNBaseUrl(newAccount.platform, currentOpenCodeOrCNMode(), editApiProtocol.value)
               : 'https://api.anthropic.com'
     editBaseUrl.value = isCNApiKeyAccount.value && editApiProtocol.value === 'adaptive'
@@ -5780,7 +5776,7 @@ const handleSubmit = async () => {
         } else {
           delete newCredentials.api_base_urls
         }
-        if (props.account.platform === 'opencode_go') {
+        if (providerRoutesByModel(props.account.platform)) {
           applyOpenCodeGoProtocolRules(newCredentials, editOpenCodeGoProtocolRules.value, 'edit')
         }
         // 智谱团队版 Coding Plan：组织/项目 ID 写入凭据（非空才写，清空即移除回落个人版路径）
@@ -6339,48 +6335,33 @@ const handleSubmit = async () => {
         delete newExtra.openai_gwpool_steering
         delete newExtra.openai_gwpool_auto_wait
         delete newExtra.openai_gwpool_warm_tickets
+        delete newExtra.openai_gwpool_max_wait_s
+        if (openAIGwpoolEnabled.value && openAIGwpoolContinuousWait.value) {
+          newExtra.openai_gwpool_continuous_wait = true
+        } else {
+          delete newExtra.openai_gwpool_continuous_wait
+        }
         for (const [key, value] of [
-          ['openai_gwpool_max_wait_s', openAIGwpoolMaxWait.value],
           ['openai_gwpool_probe_timeout_s', openAIGwpoolProbeTimeout.value],
           ['openai_gwpool_prepare_retries', openAIGwpoolPrepareRetries.value]
         ] as const) {
           if (openAIGwpoolEnabled.value && value !== '') newExtra[key] = value
           else delete newExtra[key]
         }
-        if (openAIGwpoolEnabled.value && openAIGwpoolUseRecommendation.value) {
-          newExtra.openai_gwpool_use_recommended_cooldown = true
-        } else {
-          delete newExtra.openai_gwpool_use_recommended_cooldown
-        }
-        if (openAIGwpoolEnabled.value && openAIGwpoolMemberIsolation.value) {
-          newExtra.openai_gwpool_member_isolation = true
-        } else {
-          delete newExtra.openai_gwpool_member_isolation
-        }
-        if (openAIGwpoolEnabled.value && openAIGwpoolEarlyProbe.value) {
-          newExtra.openai_gwpool_early_probe_enabled = true
-        } else {
-          delete newExtra.openai_gwpool_early_probe_enabled
-        }
+        delete newExtra.openai_gwpool_use_recommended_cooldown
+        delete newExtra.openai_gwpool_member_isolation
+        delete newExtra.openai_gwpool_early_probe_enabled
+        delete newExtra.openai_gwpool_early_probe_state
         // 后台预热已移除，保存时清理旧键。
         delete newExtra.openai_gwpool_prewarm
         delete newExtra.openai_gwpool_rotation
-        if (openAIGwpoolEnabled.value) {
-          if (openAIGwpoolRotationMinGateways.value !== '') {
-            newExtra.openai_gwpool_rotation_min_gateways = openAIGwpoolRotationMinGateways.value
-          } else {
-            delete newExtra.openai_gwpool_rotation_min_gateways
-          }
-        } else {
-          delete newExtra.openai_gwpool_rotation_min_gateways
-        }
+        delete newExtra.openai_gwpool_rotation_min_gateways
         if (openAIGwpoolEnabled.value && openAIGwpoolResumeGateways.value !== '') {
           newExtra.openai_gwpool_resume_gateways = openAIGwpoolResumeGateways.value
         } else {
           delete newExtra.openai_gwpool_resume_gateways
         }
-        // Frontend fixed policy: quality protection on, default Luna preflight.
-        // The backend keeps compatibility with callers of the existing API.
+        // Strict verification and Luna are backend rules, not saved overrides.
         delete newExtra.openai_gwpool_probe_model
         delete newExtra.openai_gwpool_guard_enabled
         delete newExtra.openai_gwpool_guard

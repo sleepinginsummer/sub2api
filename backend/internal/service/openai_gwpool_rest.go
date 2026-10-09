@@ -44,8 +44,8 @@ func (s *openAICodexCookieStore) gatewayPoolLocalResumeAt(identity string, accou
 		if at.IsZero() {
 			continue
 		}
-		_, _ = s.gatewayPoolUsedAt(identity, gateway, account.gatewayPoolGatewayWindow(), account.gatewayPoolUseRecommendation())
-		base, _ := s.gatewayPoolInitialCooldown(identity, gateway, account.gatewayPoolGatewayWindow(), account.gatewayPoolUseRecommendation())
+		_, _ = s.gatewayPoolUsedAt(identity, gateway, account.gatewayPoolGatewayWindow())
+		base := gatewayPoolCooldownBase(account.gatewayPoolGatewayWindow())
 		until := at.Add(time.Duration(base) * time.Second)
 		if cooldown, found := s.cooldownEntry(identity, gateway); found {
 			until = cooldown.Until
@@ -70,6 +70,9 @@ func (s *openAICodexCookieStore) gatewayPoolRestDuration(identity string, accoun
 }
 
 func (s *OpenAIGatewayService) restGatewayPoolAccount(ctx context.Context, account *Account, identity string, group int64) {
+	if account.GatewayPoolContinuousWaitEnabled() {
+		return
+	}
 	now := time.Now()
 	until := s.codexCookies.gatewayPoolLocalResumeAt(identity, account)
 	if !until.After(now) {

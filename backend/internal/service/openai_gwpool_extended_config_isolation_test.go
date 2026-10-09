@@ -3,34 +3,36 @@ package service
 import (
 	"context"
 	"net/http"
-	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 )
 
-// 备用票必须留在交付它的池配置里；相同凭证身份切池后不能弹出旧池的票。
-func TestGatewayPoolSpareShelfSeparatesAccountConfigurations(t *testing.T) {
+// 单票轮换只能替换原池配置的缓存，不得触碰其它池的同号票。
+func TestGatewayPoolTicketRotationSeparatesAccountConfigurations(t *testing.T) {
 	poolA := newGwpoolFakePool(t, "", 150)
-	poolA.batchGateways = []string{"unified-11", "unified-22", "unified-33"}
-	poolB := newGwpoolFakePool(t, "", 150)
-	poolB.batchGateways = []string{"unified-44", "unified-55", "unified-66"}
+	poolA.cookieForHit = func(hit int64) string {
+		if hit == 1 {
+			return gwpoolTestPairCookie(t, "unified-11")
+		}
+		return gwpoolTestPairCookie(t, "unified-22")
+	}
+	poolB := newGwpoolFakePool(t, gwpoolTestPairCookie(t, "unified-44"), 150)
 	store := &openAICodexCookieStore{}
 	a, b := poolA.account(1), poolB.account(2)
 	require.NoError(t, attachRoute(context.Background(), store, a, gwpoolTestURL, http.Header{}))
-
-	headers := http.Header{}
-	require.NoError(t, attachRoute(context.Background(), store, b, gwpoolTestURL, headers))
-	require.Equal(t, "unified-44", openAICodexRouteGateway(headers.Get("Cookie")))
-	require.EqualValues(t, 1, poolB.hits.Load(), "切池必须向对应池取票")
-
-	keyA := openAIGatewayPoolCacheKey(a, gwpoolTestIdentity)
+	require.NoError(t, attachRoute(context.Background(), store, b, gwpoolTestURL, http.Header{}))
+	keyA, keyB := openAIGatewayPoolAccountKey(a), openAIGatewayPoolAccountKey(b)
 	pair, _ := store.cachedPoolPair(keyA)
-	store.gatewayPoolMarkStale(keyA, pair.version, pair.gateway)
-	rotated := http.Header{}
-	require.NoError(t, attachRoute(context.Background(), store, a, gwpoolTestURL, rotated))
-	require.Equal(t, "unified-22", openAICodexRouteGateway(rotated.Get("Cookie")))
-	require.EqualValues(t, 1, poolA.hits.Load(), "其它配置不能取走本池的备用票")
+	other, _ := store.cachedPoolPair(keyB)
+	store.gatewayPoolMarkStale(keyA, pair.version)
+	headers := http.Header{}
+	require.NoError(t, attachRoute(context.Background(), store, a, gwpoolTestURL, headers))
+	require.Equal(t, "unified-22", openAICodexRouteGateway(headers.Get("Cookie")))
+	require.EqualValues(t, 2, poolA.hits.Load())
+	unchanged, _ := store.cachedPoolPair(keyB)
+	require.Equal(t, other, unchanged)
+	require.EqualValues(t, 1, poolB.hits.Load())
 }
 
 // 同票号不意味着同一池票；验满血快路和探测结果必须随池配置隔离。
@@ -42,12 +44,6 @@ func TestGatewayPoolWarmVerificationSeparatesAccountConfigurations(t *testing.T)
 	first := &gwpoolWarmShooter{}
 	require.NoError(t, gwpoolWarmRun(t, svc, a, first))
 	require.Len(t, first.shots, 2)
-
-	// 未验的新配置不能借旧配置的快路跳过模型检查。
-	b.Extra[openAIGatewayPoolProbeModelExtraKey] = gatewayPoolProbeModelBusiness
-	req, err := http.NewRequest(http.MethodPost, gwpoolTestURL, strings.NewReader("not json"))
-	require.NoError(t, err)
-	require.ErrorIs(t, svc.gatewayPoolWarmUp(req, "", b), errOpenAIGatewayPoolWarmNoModel)
 
 	second := &gwpoolWarmShooter{}
 	require.NoError(t, gwpoolWarmRun(t, svc, b, second))

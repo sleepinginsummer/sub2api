@@ -3,8 +3,6 @@ package service
 import (
 	"context"
 	"errors"
-	"log/slog"
-	"net/http"
 	"strings"
 	"sync"
 	"time"
@@ -36,7 +34,7 @@ func (s *openAICodexCookieStore) rememberGatewayPoolBackoff(identity string, epo
 	if code == gwpool.CodeAllCooling && !epoch.Equal(s.gatewayPoolCooldownResetAt(identity)) {
 		return
 	}
-	s.poolBackoff.Store(gatewayPoolLedgerIdentity(identity), gatewayPoolBackoffEntry{Until: time.Now().Add(duration), Code: code})
+	s.poolBackoff.Store(identity, gatewayPoolBackoffEntry{Until: time.Now().Add(duration), Code: code})
 }
 
 func (c *gatewayPoolCooldown) clearCooldown(at time.Time, base int) bool {
@@ -245,8 +243,8 @@ func (s *OpenAIGatewayService) clearGatewayPoolManualRest(ctx context.Context, a
 	return nil
 }
 
-// An explicit administrator action creates one bounded waiter, not a permanent
-// background prewarmer. Existing business waiters continue sharing the worker.
+// The existing administrative endpoint only clears local cooldown/rest state.
+// Ticket acquisition and verification are deferred until real business arrives.
 func (s *OpenAIGatewayService) RetryGatewayPool(ctx context.Context, id int64) (GatewayPoolRetryResult, error) {
 	account, err := s.accountRepo.GetByID(ctx, id)
 	if err != nil {
@@ -259,16 +257,6 @@ func (s *OpenAIGatewayService) RetryGatewayPool(ctx context.Context, id int64) (
 	if err != nil {
 		return GatewayPoolRetryResult{}, err
 	}
-	key := gatewayPoolLedgerIdentity(identity)
-	if _, running := s.codexCookies.poolManualRetry.LoadOrStore(key, struct{}{}); running {
-		return GatewayPoolRetryResult{State: "preparing"}, nil
-	}
-	started := false
-	defer func() {
-		if !started {
-			s.codexCookies.poolManualRetry.Delete(key)
-		}
-	}()
 	unlock, err := s.lockGatewayPoolRest(ctx, gatewayPoolRestTag(identity))
 	if err != nil {
 		return GatewayPoolRetryResult{}, err
@@ -281,42 +269,7 @@ func (s *OpenAIGatewayService) RetryGatewayPool(ctx context.Context, id int64) (
 	if err != nil {
 		return GatewayPoolRetryResult{}, err
 	}
-	if s.codexCookies.gatewayPoolVerifiedFull(identity) {
-		return GatewayPoolRetryResult{State: "retained"}, nil
-	}
-	account, err = s.accountRepo.GetByID(ctx, id)
-	if err != nil {
-		return GatewayPoolRetryResult{}, err
-	}
-	if account == nil || !account.IsSchedulable() {
-		return GatewayPoolRetryResult{State: "blocked"}, nil
-	}
-	proxyURL := ""
-	if account.Proxy != nil {
-		proxyURL = account.Proxy.URL()
-	}
-	if err := requireOpenAIProxyBinding(account, proxyURL); err != nil {
-		return GatewayPoolRetryResult{}, err
-	}
-	work, cancel := context.WithTimeout(context.WithoutCancel(ctx), account.gatewayPoolMaxWait())
-	request, err := http.NewRequestWithContext(work, http.MethodPost, chatgptCodexAPIURL, nil)
-	if err != nil {
-		cancel()
-		return GatewayPoolRetryResult{}, err
-	}
-	started = true
-	go func() {
-		defer s.codexCookies.poolManualRetry.Delete(key)
-		defer cancel()
-		err := s.gatewayPoolWarmUpWith(request, account, identity, gatewayPoolProbeModelLuna,
-			func(ctx context.Context, cookie, state string) (int, string, error) {
-				return s.gatewayPoolWarmShot(ctx, account, proxyURL, cookie, gatewayPoolProbeModelLuna, state)
-			})
-		if err != nil {
-			slog.Warn("gwpool_manual_retry_finished", "account_id", id, "ready", false)
-		}
-	}()
-	return GatewayPoolRetryResult{State: "preparing"}, nil
+	return GatewayPoolRetryResult{State: "cleared"}, nil
 }
 
 func (s *adminServiceImpl) RetryGatewayPool(ctx context.Context, id int64) (GatewayPoolRetryResult, error) {
