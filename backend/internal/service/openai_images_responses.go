@@ -1979,8 +1979,6 @@ func (s *OpenAIGatewayService) forwardOpenAIImagesOAuth(
 				return &OpenAIForwardResult{
 					RequestID:                     resp.Header.Get("x-request-id"),
 					UpstreamHeaders:               resp.Header,
-					GatewayPoolRoutePair:          openAIGatewayPoolRoutePairFromResponse(resp),
-					GatewayPoolApplied:            openAIGatewayPoolAppliedFromResponse(resp),
 					Usage:                         usage,
 					Model:                         requestModel,
 					UpstreamModel:                 upstreamModel,
@@ -2033,8 +2031,6 @@ func (s *OpenAIGatewayService) forwardOpenAIImagesOAuth(
 	return &OpenAIForwardResult{
 		RequestID:                     resp.Header.Get("x-request-id"),
 		UpstreamHeaders:               resp.Header,
-		GatewayPoolRoutePair:          openAIGatewayPoolRoutePairFromResponse(resp),
-		GatewayPoolApplied:            openAIGatewayPoolAppliedFromResponse(resp),
 		Usage:                         usage,
 		Model:                         requestModel,
 		UpstreamModel:                 upstreamModel,

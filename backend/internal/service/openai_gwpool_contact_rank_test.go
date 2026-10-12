@@ -78,7 +78,6 @@ func TestGatewayPoolContactRankingDoesNotMixStrataOrScoreUnknown(t *testing.T) {
 
 func TestGatewayPoolContactRankingFreshReadAndEveryFifthExploration(t *testing.T) {
 	account := gwpoolTestAccount(1)
-	gwpoolTestIdentity := openAIGatewayPoolAccountKey(account)
 	svc, repo := gatewayRuntimeService(account)
 	now := time.Now().UTC()
 	tag := gatewayPoolLedgerTag(gwpoolTestIdentity)

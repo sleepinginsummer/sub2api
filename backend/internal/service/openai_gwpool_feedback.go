@@ -19,7 +19,7 @@ func gatewayPoolAccountTag(account *Account, identity string) string {
 		return ""
 	}
 	hash := hmac.New(sha256.New, []byte(key))
-	_, _ = hash.Write([]byte("gwpool-cooldown-v1\x00" + gatewayPoolConsumptionIdentity(identity)))
+	_, _ = hash.Write([]byte("gwpool-cooldown-v1\x00" + identity))
 	return hex.EncodeToString(hash.Sum(nil))
 }
 
@@ -33,12 +33,12 @@ func (s *OpenAIGatewayService) reportGatewayPoolCooldown(account *Account, ident
 	if sample.Full {
 		result = "full"
 	}
-	sum := sha256.Sum256([]byte(fmt.Sprintf("%s\x00%s\x00%d\x00%s",
-		tag, sample.Gateway, sample.AttemptAt.UnixNano(), result)))
+	id := gatewayPoolDigest(fmt.Sprintf("%s\x00%s\x00%d\x00%s",
+		tag, sample.Gateway, sample.AttemptAt.UnixNano(), result))
 	report := gwpool.CooldownReport{
-		ID: hex.EncodeToString(sum[:]), AccountTag: tag, Gateway: sample.Gateway,
+		ID: id, AccountTag: tag, Gateway: sample.Gateway,
 		WindowSeconds: sample.WindowSeconds, ElapsedSeconds: sample.ElapsedSeconds, Result: result,
 		ObservedAt: sample.AttemptAt.UTC(),
 	}
-	s.enqueueGatewayPoolReport(account, report)
+	s.enqueueGatewayPoolPending(account, gatewayPoolPendingReport{Report: report})
 }

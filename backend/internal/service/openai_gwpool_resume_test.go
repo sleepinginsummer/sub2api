@@ -24,13 +24,14 @@ func gatewayPoolRestDue(t *testing.T, svc *OpenAIGatewayService, repo gatewayRot
 	t.Helper()
 	fresh, err := repo.GetByID(context.Background(), id)
 	require.NoError(t, err)
-	state := readGatewayPoolRest(fresh, gatewayPoolRestTag(openAIGatewayPoolCacheKey(fresh, identity)))
-	state.NextCheck = time.Now().Add(-time.Second)
+	state := readGatewayPoolRest(fresh, gatewayPoolLedgerTag(identity))
 	state.advance(time.Now().UTC())
 	require.NoError(t, repo.UpdateExtra(context.Background(), id, map[string]any{gatewayPoolRestStateKey: state}))
 	svc.codexCookies.poolRestState.Store(state.Tag, state)
+	stored, err := repo.stored(id)
+	require.NoError(t, err)
 	past := time.Now().Add(-time.Second)
-	fresh.TempUnschedulableUntil = &past
+	stored.TempUnschedulableUntil = &past
 }
 
 func seedGatewayPoolLocalReady(svc *OpenAIGatewayService, ready, total int) {
@@ -71,24 +72,24 @@ func TestGatewayPoolResumeWaitsFor50LocalCooldownsAfterExhaustion(t *testing.T) 
 	fake.configure(account)
 	fake.listGateways = gatewayPoolReadyList(9)
 	repo := gatewayRotationRepo{schedulerTestOpenAIAccountRepo{accounts: []Account{*account}}}
-	svc := &OpenAIGatewayService{accountRepo: repo}
+	svc := withGatewayPoolRowRead(&OpenAIGatewayService{accountRepo: repo})
 	require.False(t, svc.gatewayPoolNoRemainingRoutes(context.Background(), account), "nine candidates are not exhausted")
 	fake.listGateways = []gwpoolFakeGateway{}
 	require.True(t, svc.gatewayPoolNoRemainingRoutes(context.Background(), account))
 	seedGatewayPoolLocalReady(svc, 9, 50)
-	svc.restGatewayPoolAccount(context.Background(), account, gwpoolTestIdentity, 7)
+	require.NoError(t, svc.restGatewayPoolAccount(context.Background(), account, gwpoolTestIdentity, 7))
 	for _, count := range []int{10, 49, 50} {
 		gatewayPoolRestDue(t, svc, repo, 1, gwpoolTestIdentity)
 		fake.listGateways = gatewayPoolReadyList(count)
 		// Restart before each recheck: passing may not depend on in-memory rest.
-		svc = &OpenAIGatewayService{accountRepo: repo}
+		svc = withGatewayPoolRowRead(&OpenAIGatewayService{accountRepo: repo})
 		seedGatewayPoolLocalReady(svc, count, 50)
 		allowed, err := svc.gatewayPoolResumeAllowed(context.Background(), account, true)
 		require.NoError(t, err)
 		require.Equal(t, count == 50, allowed, "count=%d", count)
 		fresh, err := repo.GetByID(context.Background(), 1)
 		require.NoError(t, err)
-		require.Equal(t, count != 50, readGatewayPoolRest(fresh, gatewayPoolRestTag(openAIGatewayPoolCacheKey(account, gwpoolTestIdentity))).Active)
+		require.Equal(t, count != 50, readGatewayPoolRest(fresh, gatewayPoolLedgerTag(gwpoolTestIdentity)).Active)
 	}
 	require.Zero(t, fake.hits.Load(), "recovery only lists existing candidates, never fetches/probes")
 }
@@ -99,13 +100,13 @@ func TestGatewayPoolResumeCloneTombstoneAndLateRestDoNotResurrect(t *testing.T) 
 	fake.configure(account, clone)
 	fake.listGateways = gatewayPoolReadyList(50)
 	repo := gatewayRotationRepo{schedulerTestOpenAIAccountRepo{accounts: []Account{*account, *clone}}}
-	svc := &OpenAIGatewayService{accountRepo: repo}
+	svc := withGatewayPoolRowRead(&OpenAIGatewayService{accountRepo: repo})
 	at := time.Now().UTC().Add(-time.Minute)
 	require.NoError(t, svc.enterGatewayPoolRest(context.Background(), account, gwpoolTestIdentity, at, at.Add(time.Second)))
 	allowed, err := svc.gatewayPoolResumeAllowed(context.Background(), clone, true)
 	require.NoError(t, err)
 	require.True(t, allowed)
-	restarted := &OpenAIGatewayService{accountRepo: repo}
+	restarted := withGatewayPoolRowRead(&OpenAIGatewayService{accountRepo: repo})
 	allowed, err = restarted.gatewayPoolResumeAllowed(context.Background(), account, false)
 	require.NoError(t, err)
 	require.True(t, allowed, "inactive peer is newer than the old owner's active snapshot")
@@ -123,7 +124,7 @@ func TestGatewayPoolResumeIgnoresSupplyButKeepsLocalCooldownAndInflightGuards(t 
 			fake.configure(account)
 			fake.listGateways = gatewayPoolReadyList(50)
 			repo := gatewayRotationRepo{schedulerTestOpenAIAccountRepo{accounts: []Account{*account}}}
-			svc := &OpenAIGatewayService{accountRepo: repo}
+			svc := withGatewayPoolRowRead(&OpenAIGatewayService{accountRepo: repo})
 			seedGatewayPoolLocalReady(svc, 50, 50)
 			at := time.Now().Add(-time.Minute)
 			require.NoError(t, svc.enterGatewayPoolRest(context.Background(), account, gwpoolTestIdentity, at, at))
@@ -131,10 +132,7 @@ func TestGatewayPoolResumeIgnoresSupplyButKeepsLocalCooldownAndInflightGuards(t 
 			case "list-error":
 				fake.listStatus = 503
 			case "unused-list-callback":
-				fake.onList = func() {
-					done := svc.codexCookies.gatewayPoolInventoryOperation(openAIGatewayPoolCacheKey(account, gwpoolTestIdentity))
-					done()
-				}
+				fake.onList = func() { done := svc.codexCookies.gatewayPoolInventoryOperation(gwpoolTestIdentity); done() }
 			case "cooling":
 				svc.codexCookies.gatewayPoolMarkUsed(gwpoolTestIdentity, "unified-1")
 			case "duplicate":
@@ -142,7 +140,7 @@ func TestGatewayPoolResumeIgnoresSupplyButKeepsLocalCooldownAndInflightGuards(t 
 			case "not-ready":
 				fake.listGateways[49].PairReady = false
 			case "pending":
-				finish := svc.codexCookies.gatewayPoolInventoryOperation(openAIGatewayPoolCacheKey(account, gwpoolTestIdentity))
+				finish := svc.codexCookies.gatewayPoolInventoryOperation(gwpoolTestIdentity)
 				defer finish()
 			}
 			allowed, err := svc.gatewayPoolResumeAllowed(context.Background(), account, true)
@@ -162,14 +160,12 @@ func TestGatewayPoolResumeDoesNotCountCachedOrInFlightAsLocalCooldowns(t *testin
 			account := rotationAccount(1, 7)
 			fake := newGwpoolFakePool(t, "offline", 150)
 			fake.configure(account)
-			gwpoolTestIdentity := openAIGatewayPoolAccountKey(account)
 			fake.listGateways = gatewayPoolReadyList(49)
 			repo := gatewayRotationRepo{schedulerTestOpenAIAccountRepo{accounts: []Account{*account}}}
-			svc := &OpenAIGatewayService{accountRepo: repo}
+			svc := withGatewayPoolRowRead(&OpenAIGatewayService{accountRepo: repo})
 			seedGatewayPoolLocalReady(svc, 49, 50)
 			pair := openAIGatewayPoolPair{
 				gateway: "unified-142", cookie: gwpoolTestPairCookie(t, "unified-142"),
-				until: time.Now().Add(time.Minute),
 			}
 			if cached {
 				svc.codexCookies.poolPairs.Store(gwpoolTestIdentity, pair)
@@ -200,7 +196,7 @@ func TestGatewayPoolResumeDoesNotClearAuthBlock(t *testing.T) {
 	until := time.Now().Add(time.Hour)
 	account.TempUnschedulableUntil, account.TempUnschedulableReason = &until, "auth"
 	repo := gatewayRotationRepo{schedulerTestOpenAIAccountRepo{accounts: []Account{*account}}}
-	svc := &OpenAIGatewayService{accountRepo: repo}
+	svc := withGatewayPoolRowRead(&OpenAIGatewayService{accountRepo: repo})
 	at := time.Now().Add(-time.Minute)
 	require.NoError(t, svc.enterGatewayPoolRest(context.Background(), account, gwpoolTestIdentity, at, at))
 	allowed, err := svc.gatewayPoolResumeAllowed(context.Background(), account, true)
@@ -219,7 +215,7 @@ func TestGatewayPoolResumeLastMileBlocksEvenWithVerifiedPair(t *testing.T) {
 	fake.configure(account)
 	repo := gatewayRotationRepo{schedulerTestOpenAIAccountRepo{accounts: []Account{*account}}}
 	upstream := &gwpoolEchoUpstream{}
-	svc := &OpenAIGatewayService{accountRepo: repo, httpUpstream: upstream}
+	svc := withGatewayPoolRowRead(&OpenAIGatewayService{accountRepo: repo, httpUpstream: upstream})
 	gwpoolEchoSeedVerified(t, svc, account)
 	require.NoError(t, svc.enterGatewayPoolRest(context.Background(), account, gwpoolTestIdentity, time.Now(), time.Now().Add(time.Minute)))
 	req, err := http.NewRequest(http.MethodPost, gwpoolTestURL, nil)
@@ -264,6 +260,14 @@ func (r *gatewayRestWriteFails) UpdateExtra(ctx context.Context, id int64, patch
 	return r.gatewayRotationRepo.UpdateExtra(ctx, id, patch)
 }
 
+// Ledger writes fail with the extra writes, as they did when they lived in extra.
+func (r *gatewayRestWriteFails) WriteGatewayPoolLedgers(ctx context.Context, id int64, ledgers, tags map[string]any) error {
+	if r.fail {
+		return errors.New("offline write failed")
+	}
+	return r.gatewayRotationRepo.WriteGatewayPoolLedgers(ctx, id, ledgers, tags)
+}
+
 func TestGatewayPoolResumeFirstRestPersistsTogetherWithTemporaryBlock(t *testing.T) {
 	account := rotationAccount(1, 7)
 	fake := newGwpoolFakePool(t, "offline", 150)
@@ -273,15 +277,15 @@ func TestGatewayPoolResumeFirstRestPersistsTogetherWithTemporaryBlock(t *testing
 		gatewayRotationRepo: gatewayRotationRepo{schedulerTestOpenAIAccountRepo{accounts: []Account{*account}}},
 		fail:                true, // the old independent UpdateExtra path fails
 	}
-	svc := &OpenAIGatewayService{accountRepo: repo}
+	svc := withGatewayPoolRowRead(&OpenAIGatewayService{accountRepo: repo})
 	seedGatewayPoolLocalReady(svc, 0, 50)
-	svc.restGatewayPoolAccount(context.Background(), account, gwpoolTestIdentity, 7)
+	require.NoError(t, svc.restGatewayPoolAccount(context.Background(), account, gwpoolTestIdentity, 7))
 	fresh, err := repo.GetByID(context.Background(), account.ID)
 	require.NoError(t, err)
 	require.NotNil(t, fresh.TempUnschedulableUntil)
-	require.True(t, readGatewayPoolRest(fresh, gatewayPoolRestTag(openAIGatewayPoolCacheKey(account, gwpoolTestIdentity))).Active)
+	require.True(t, readGatewayPoolRest(fresh, gatewayPoolLedgerTag(gwpoolTestIdentity)).Active)
 	gatewayPoolRestDue(t, svc, repo.gatewayRotationRepo, account.ID, gwpoolTestIdentity)
-	restarted := &OpenAIGatewayService{accountRepo: repo}
+	restarted := withGatewayPoolRowRead(&OpenAIGatewayService{accountRepo: repo})
 	seedGatewayPoolLocalReady(restarted, 49, 50)
 	allowed, err := restarted.gatewayPoolResumeAllowed(context.Background(), account, true)
 	require.NoError(t, err)
@@ -294,9 +298,9 @@ func TestGatewayPoolResumeFailedAtomicRestDoesNotLeavePartialTemporaryBlock(t *t
 		gatewayRotationRepo: gatewayRotationRepo{schedulerTestOpenAIAccountRepo{accounts: []Account{*account}}},
 		fail:                true, atomicFail: true,
 	}
-	svc := &OpenAIGatewayService{accountRepo: repo}
+	svc := withGatewayPoolRowRead(&OpenAIGatewayService{accountRepo: repo})
 	seedGatewayPoolLocalReady(svc, 0, 50)
-	svc.restGatewayPoolAccount(context.Background(), account, gwpoolTestIdentity, 7)
+	require.Error(t, svc.restGatewayPoolAccount(context.Background(), account, gwpoolTestIdentity, 7))
 	fresh, err := repo.GetByID(context.Background(), account.ID)
 	require.NoError(t, err)
 	require.Nil(t, fresh.TempUnschedulableUntil, "a block must not be acknowledged without the durable resume gate")
@@ -311,13 +315,13 @@ func TestGatewayPoolResumeGenerationChangesAtPersistenceCannotPublishRecovery(t 
 	fake.configure(account)
 	fake.listGateways = gatewayPoolReadyList(50)
 	repo := &gatewayRestWriteFails{gatewayRotationRepo: gatewayRotationRepo{schedulerTestOpenAIAccountRepo{accounts: []Account{*account}}}}
-	svc := &OpenAIGatewayService{accountRepo: repo}
+	svc := &OpenAIGatewayService{accountRepo: repo} // read ordinals below assume no injected row read
 	at := time.Now().Add(-time.Minute)
 	require.NoError(t, svc.enterGatewayPoolRest(context.Background(), account, gwpoolTestIdentity, at, at))
 	// loadGatewayPoolRest reads once; the second read is durable publication.
 	repo.beforeWriteRead = func() {
 		repo.beforeWriteRead = func() {
-			finish := svc.codexCookies.gatewayPoolInventoryOperation(openAIGatewayPoolCacheKey(account, gwpoolTestIdentity))
+			finish := svc.codexCookies.gatewayPoolInventoryOperation(gwpoolTestIdentity)
 			finish()
 		}
 	}
@@ -335,7 +339,7 @@ func TestGatewayPoolResumeWriteFailureCannotPublishRecovery(t *testing.T) {
 	fake.configure(account)
 	fake.listGateways = gatewayPoolReadyList(50)
 	repo := &gatewayRestWriteFails{gatewayRotationRepo: gatewayRotationRepo{schedulerTestOpenAIAccountRepo{accounts: []Account{*account}}}}
-	svc := &OpenAIGatewayService{accountRepo: repo}
+	svc := withGatewayPoolRowRead(&OpenAIGatewayService{accountRepo: repo})
 	at := time.Now().Add(-time.Minute)
 	require.NoError(t, svc.enterGatewayPoolRest(context.Background(), account, gwpoolTestIdentity, at, at))
 	repo.fail = true
@@ -353,8 +357,8 @@ func TestGatewayPoolResumeStrongBindingCannotBypassRestOrSwitchAccount(t *testin
 	fake := newGwpoolFakePool(t, "offline", 150)
 	fake.configure(account)
 	repo := gatewayRotationRepo{schedulerTestOpenAIAccountRepo{accounts: []Account{*account}}}
-	svc := &OpenAIGatewayService{accountRepo: repo, cfg: &config.Config{},
-		rateLimitService: newOpenAIAdvancedSchedulerRateLimitService("true")}
+	svc := withGatewayPoolRowRead(&OpenAIGatewayService{accountRepo: repo, cfg: &config.Config{},
+		rateLimitService: newOpenAIAdvancedSchedulerRateLimitService("true")})
 	calls, releases := 0, 0
 	svc.openaiScheduler = gatewayRoundSelectionRace{selectFn: func(context.Context, OpenAIAccountScheduleRequest) (*AccountSelectionResult, OpenAIAccountScheduleDecision, error) {
 		calls++
@@ -368,4 +372,35 @@ func TestGatewayPoolResumeStrongBindingCannotBypassRestOrSwitchAccount(t *testin
 	require.Nil(t, selection)
 	require.Equal(t, 1, calls)
 	require.Equal(t, 1, releases)
+}
+
+func TestGatewayPoolLoadRestAdoptsNewestRowPeerOrCacheExceptOnPartialRead(t *testing.T) {
+	ctx, now := context.Background(), time.Now().UTC()
+	tag := gatewayPoolLedgerTag(gwpoolTestIdentity)
+	at := func(minutes int) gatewayPoolRestState {
+		return gatewayPoolRestState{Tag: tag, Active: true, ChangedAt: now.Add(time.Duration(minutes) * time.Minute)}
+	}
+	account, peer := rotationAccount(1, 7), rotationAccount(2, 7)
+	account.Extra[gatewayPoolRestStateKey], account.Extra[gatewayPoolRestTagKey] = at(-3), tag
+	peer.Extra[gatewayPoolRestStateKey], peer.Extra[gatewayPoolRestTagKey] = at(-2), tag
+	repo := &gatewayQualityRestRepo{gatewayRotationRepo: gatewayRotationRepo{
+		schedulerTestOpenAIAccountRepo{accounts: []Account{*account, *peer}},
+	}}
+	svc := withGatewayPoolRowRead(&OpenAIGatewayService{accountRepo: repo})
+	load := func() gatewayPoolRestState {
+		state, fresh, err := svc.loadGatewayPoolRest(ctx, account, gwpoolTestIdentity)
+		require.NoError(t, err)
+		require.Equal(t, account.ID, fresh.ID)
+		return state
+	}
+	require.Equal(t, at(-2), load(), "a newer clone row wins over the own row")
+	svc.codexCookies.poolRestState.Store(tag, at(-1))
+	require.Equal(t, at(-1), load(), "a newer published cache wins over both rows")
+	repo.fail = true
+	state, _, err := svc.loadGatewayPoolRest(ctx, account, gwpoolTestIdentity)
+	require.Error(t, err)
+	require.Equal(t, at(-3), state, "a partial peer read reports only the own row, never the cache")
+	repo.fail = false
+	account.Extra[OpenAIGatewayPoolContinuousWaitKey] = true
+	require.Equal(t, at(-3), load(), "a continuous-wait row never adopts another clone's latch")
 }

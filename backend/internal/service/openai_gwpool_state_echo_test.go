@@ -140,15 +140,14 @@ func gwpoolEchoSeedVerified(t *testing.T, svc *OpenAIGatewayService, acct *Accou
 	if err != nil {
 		return // 解不出身份 ⇒ 预热那条路自己也会在这里返回，没什么要塞的
 	}
-	cacheKey := openAIGatewayPoolCacheKey(acct, identity)
-	if _, state := svc.codexCookies.cachedPoolPair(cacheKey); state != openAIGatewayPoolPairLive {
+	if _, state := svc.codexCookies.cachedPoolPair(identity); state != openAIGatewayPoolPairLive {
 		// release 刻意丢掉：这张票要留在缓存里给紧接着那一发业务请求用，还回去就白取了。
 		if _, err := svc.codexCookies.AttachRoute(ctx, acct, gwpoolTestURL, http.Header{}); err != nil {
 			return // 本来就不接管（没配池子）⇒ 预热也不会跑
 		}
 	}
-	pair, _ := svc.codexCookies.cachedPoolPair(cacheKey)
-	svc.codexCookies.gatewayPoolMarkVerifiedFull(cacheKey, pair.version, gatewayPoolProbeModelLuna)
+	pair, _ := svc.codexCookies.cachedPoolPair(identity)
+	svc.codexCookies.gatewayPoolMarkVerifiedFull(identity, pair.version, gatewayPoolProbeModelLuna)
 }
 
 // ---------------------------------------------------------------------------
@@ -170,10 +169,19 @@ func TestStateEchoDegradedTruncatesAndMarksPairStale(t *testing.T) {
 	acct := gwpoolEchoAccount(fake)
 
 	gwpoolEchoSeedVerified(t, svc, acct)
-	mark, ok := svc.codexCookies.gatewayPoolVerifiedMarkOf(openAIGatewayPoolCacheKey(acct, gwpoolTestIdentity))
+	mark, ok := svc.codexCookies.gatewayPoolVerifiedMarkOf(gwpoolTestIdentity)
 	require.True(t, ok)
 	mark.at = time.Now().Add(-75 * time.Second)
-	svc.codexCookies.poolVerified.Store(openAIGatewayPoolCacheKey(acct, gwpoolTestIdentity), mark)
+	svc.codexCookies.poolVerified.Store(gwpoolTestIdentity, mark)
+	// Verified 75s ago; business used it for 30s of that in this cycle.
+	pair, _ := svc.codexCookies.cachedPoolPair(gwpoolTestIdentity)
+	pair.firstSent = mark.at
+	svc.codexCookies.poolPairs.Store(gwpoolTestIdentity, pair)
+	tag := gatewayPoolLedgerTag(gwpoolTestIdentity)
+	svc.codexCookies.poolUsageCache.Store(tag, &gatewayPoolUsageLedger{Tag: tag, Rounds: []GatewayPoolUsageRound{{
+		ID: "cycle", Model: gatewayPoolUsageSharedModel, StartedAt: mark.at, ActiveUsage: &gatewayPoolActiveUsage{
+			Intervals: []gatewayPoolUsageInterval{{Start: mark.at.Add(10 * time.Second), End: mark.at.Add(40 * time.Second)}}},
+	}}})
 
 	ginCtx, resp, err := gwpoolEchoRun(t, svc, acct, gwpoolEchoLiveTicket)
 	require.Nil(t, resp, "截断不许把降智的响应交给调用方")
@@ -189,10 +197,10 @@ func TestStateEchoDegradedTruncatesAndMarksPairStale(t *testing.T) {
 	require.True(t, upstream.bodies[last].closed, "丢弃的响应体必须当场关掉")
 	require.Zero(t, upstream.bodies[last].reads, "判据只读响应头，一个字节的响应体都不许读")
 
-	_, state := svc.codexCookies.cachedPoolPair(openAIGatewayPoolCacheKey(acct, gwpoolTestIdentity))
+	_, state := svc.codexCookies.cachedPoolPair(gwpoolTestIdentity)
 	require.Equal(t, openAIGatewayPoolPairStale, state,
 		"标 Stale 而不是删：删掉之后下一发不带 force / exclude_versions，池子会把烧过的那张原样发回来")
-	cached, _ := svc.codexCookies.cachedPoolPair(openAIGatewayPoolCacheKey(acct, gwpoolTestIdentity))
+	cached, _ := svc.codexCookies.cachedPoolPair(gwpoolTestIdentity)
 	require.Equal(t, "tkt-1", cached.version, "票号要留着，它就是 exclude_versions 的内容")
 
 	// 本地账本按上游账号收敛记一笔（不按 sub2api 的账号行）。
@@ -202,8 +210,8 @@ func TestStateEchoDegradedTruncatesAndMarksPairStale(t *testing.T) {
 	discarded := takeDiscardedOpenAIGatewayPoolAttempts(ginCtx)
 	require.Len(t, discarded, 1)
 	require.Equal(t, "unified-142", discarded[0].Applied.Gateway)
-	require.InDelta(t, 75000, discarded[0].Applied.FullHeldMs, 3000,
-		"丢弃行必须携带这一张票刚量出的时长，不能发布计算前的旧快照")
+	require.InDelta(t, 30000, discarded[0].Applied.FullUseMs, 1000,
+		"丢弃行必须携带这张票本周期刚量出的满血使用时长（不是 75 秒的验满窗口），不能发布计算前的旧快照")
 	require.Empty(t, takeDiscardedOpenAIGatewayPoolAttempts(ginCtx), "读数取走即清，不许落重复行")
 }
 
@@ -212,20 +220,20 @@ func TestGatewayPoolSinkPublishesAttemptTimingWithoutLeakingToNextGateway(t *tes
 	sink.notePoolCounts(50, 12)
 	sink.mark(OpenAIGatewayPoolApplied{Gateway: "unified-142", Version: "first"})
 	firstAttempt := sink.snapshot()
-	sink.noteFullHeld(firstAttempt, 75*time.Second)
+	sink.noteFullUse(firstAttempt, 75*time.Second)
 	var first OpenAIForwardResult
 	sink.publish(&first)
-	require.EqualValues(t, 75000, first.GatewayPoolApplied.FullHeldMs)
+	require.EqualValues(t, 75000, first.GatewayPoolApplied.FullUseMs)
 	require.Equal(t, 50, first.GatewayPoolApplied.PoolLive)
 	require.Equal(t, 12, first.GatewayPoolApplied.PoolFree)
 
 	sink.mark(OpenAIGatewayPoolApplied{Gateway: "unified-143", Version: "second"})
-	sink.noteFullHeld(firstAttempt, 90*time.Second)
+	sink.noteFullUse(firstAttempt, 90*time.Second)
 	var second OpenAIForwardResult
 	sink.publish(&second)
-	require.Zero(t, second.GatewayPoolApplied.FullHeldMs,
+	require.Zero(t, second.GatewayPoolApplied.FullUseMs,
 		"换网关后不许把上一发的满血时长归到新网关")
-	require.Zero(t, sink.snapshot().FullHeldMs)
+	require.Zero(t, sink.snapshot().FullUseMs)
 }
 
 // 送了票 + 上游不回新票 ⇒ **满血**，原样透传，什么都不碰。
@@ -242,7 +250,7 @@ func TestStateEchoFullStrengthPassesThrough(t *testing.T) {
 	require.False(t, upstream.bodies[0].closed, "满血的响应要原样交给调用方，不许替它关掉")
 	_ = resp.Body.Close()
 
-	_, state := svc.codexCookies.cachedPoolPair(openAIGatewayPoolCacheKey(acct, gwpoolTestIdentity))
+	_, state := svc.codexCookies.cachedPoolPair(gwpoolTestIdentity)
 	require.Equal(t, openAIGatewayPoolPairLive, state)
 	require.Empty(t, takeDiscardedOpenAIGatewayPoolAttempts(ginCtx))
 	require.EqualValues(t, 1, fake.hits.Load(), "满血 ⇒ 不换票")
@@ -309,7 +317,7 @@ func TestStateEchoIgnoresNon200EvenWithFreshTicket(t *testing.T) {
 			_ = resp.Body.Close()
 
 			require.Len(t, upstream.sentBodies, 1, "不下结论 ⇒ 不换票、不重发")
-			_, state := svc.codexCookies.cachedPoolPair(openAIGatewayPoolCacheKey(gwpoolEchoAccount(fake), gwpoolTestIdentity))
+			_, state := svc.codexCookies.cachedPoolPair(gwpoolTestIdentity)
 			require.Equal(t, openAIGatewayPoolPairLive, state, "不许把限流当成坏路由")
 			require.Empty(t, takeDiscardedOpenAIGatewayPoolAttempts(ginCtx))
 		})
@@ -344,7 +352,7 @@ func TestGatewayPoolGuardHasNoModesLeft(t *testing.T) {
 	_, resp, err := gwpoolEchoRun(t, svc, acct, gwpoolEchoLiveTicket)
 	require.Nil(t, resp, "死键不许把降智的响应放出去")
 	require.ErrorIs(t, err, errOpenAIGatewayPoolRouteDegraded)
-	_, state := svc.codexCookies.cachedPoolPair(openAIGatewayPoolCacheKey(acct, gwpoolTestIdentity))
+	_, state := svc.codexCookies.cachedPoolPair(gwpoolTestIdentity)
 	require.Equal(t, openAIGatewayPoolPairStale, state, "判死之后照样标 Stale")
 }
 
@@ -402,7 +410,6 @@ func TestGatewayPoolMarkStaleOnlyTouchesTheNamedTicket(t *testing.T) {
 	store := &openAICodexCookieStore{}
 	live := openAIGatewayPoolPair{
 		cookie: "__cflb=a", gateway: "unified-142", version: "tkt-2",
-		until: time.Now().Add(time.Minute),
 	}
 	store.poolPairs.Store(gwpoolTestIdentity, live)
 
@@ -425,7 +432,6 @@ func TestGatewayPoolMarkStalePreservesReplacementOnSameGateway(t *testing.T) {
 	store := &openAICodexCookieStore{}
 	store.poolPairs.Store(gwpoolTestIdentity, openAIGatewayPoolPair{
 		cookie: "__cflb=a", gateway: "unified-142", version: "tkt-2", // 缓存里已经换成 tkt-2
-		until: time.Now().Add(time.Minute),
 	})
 
 	// B 手上还是换票前那张 tkt-1，但判死的是 unified-142 这个落点。

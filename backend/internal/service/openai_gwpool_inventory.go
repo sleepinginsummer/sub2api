@@ -10,13 +10,11 @@ type gatewayPoolInventoryState struct {
 	mu         sync.Mutex
 	generation uint64
 	active     int
-	requests   int // 准备等待者只用于用量空闲检测。
+	requests   int // Includes preparation waiters; only used for usage idle detection.
 }
 
 func (s *openAICodexCookieStore) gatewayPoolInventory(identity string) *gatewayPoolInventoryState {
-	value, _ := s.poolInventory.LoadOrStore(identity, &gatewayPoolInventoryState{})
-	state, _ := value.(*gatewayPoolInventoryState)
-	return state
+	return gatewayPoolLoadOrNew[gatewayPoolInventoryState](&s.poolInventory, identity)
 }
 
 func (s *openAICodexCookieStore) gatewayPoolInventoryOperation(identity string) func() {
@@ -35,11 +33,6 @@ func (s *openAICodexCookieStore) gatewayPoolInventoryOperation(identity string) 
 
 // No network and no ticket consumption. The generation rejects a listing observed
 // across an intervening fetch/probe, including one that has already completed.
-func (s *openAICodexCookieStore) gatewayPoolInventorySnapshot(identity string) (generation uint64, pending bool) {
-	generation, active, candidates := s.gatewayPoolInventoryCandidates(identity)
-	return generation, active || len(candidates) > 0
-}
-
 func (s *openAICodexCookieStore) gatewayPoolInventoryCandidates(identity string) (generation uint64, active bool, candidates map[string]struct{}) {
 	state := s.gatewayPoolInventory(identity)
 	state.mu.Lock()
@@ -48,15 +41,8 @@ func (s *openAICodexCookieStore) gatewayPoolInventoryCandidates(identity string)
 	if state.active > 0 {
 		return state.generation, true, candidates
 	}
-	domain := identity
-	s.poolPairs.Range(func(key, _ any) bool {
-		other, ok := key.(string)
-		if ok && other == domain {
-			if pair, live := s.cachedPoolPair(other); live == openAIGatewayPoolPairLive {
-				candidates[pair.gateway] = struct{}{}
-			}
-		}
-		return true
-	})
+	if pair, live := s.cachedPoolPair(identity); live == openAIGatewayPoolPairLive {
+		candidates[pair.gateway] = struct{}{}
+	}
 	return state.generation, false, candidates
 }

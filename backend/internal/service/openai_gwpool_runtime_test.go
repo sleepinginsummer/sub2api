@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"net/http/httptrace"
 	"net/url"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -25,7 +27,21 @@ type gatewayRuntimeRepo struct {
 	scans   chan struct{}
 }
 
-func (r *gatewayRuntimeRepo) GetByID(_ context.Context, _ int64) (*Account, error) {
+// GetByID returns the row the way the database does since migration 253: the
+// runtime ledgers live apart and come only through LoadGatewayPoolLedgers, so a
+// read that forgets to hydrate them sees none, as it would in production.
+func (r *gatewayRuntimeRepo) GetByID(_ context.Context, id int64) (*Account, error) {
+	account, err := r.stored(id)
+	if err == nil {
+		for _, key := range gatewayPoolLedgerKeys {
+			delete(account.Extra, key)
+		}
+	}
+	return account, err
+}
+
+// stored is an independent copy of the row with its ledgers, for assertions.
+func (r *gatewayRuntimeRepo) stored(_ int64) (*Account, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	raw, err := json.Marshal(r.account)
@@ -37,6 +53,74 @@ func (r *gatewayRuntimeRepo) GetByID(_ context.Context, _ int64) (*Account, erro
 	return &account, err
 }
 
+func (r *gatewayRuntimeRepo) LoadGatewayPoolLedgers(_ context.Context, ids []int64, keys []string) (map[int64]map[string]json.RawMessage, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return fakeGatewayPoolLedgers([]Account{r.account}, ids, keys)
+}
+
+// gatewayPoolWithoutLedgers is row as a database read returns it since
+// migration 253, on its own Extra map.
+func gatewayPoolWithoutLedgers(row Account) Account {
+	row.Extra = maps.Clone(row.Extra)
+	for _, key := range gatewayPoolLedgerKeys {
+		delete(row.Extra, key)
+	}
+	return row
+}
+
+// fakeGatewayPoolLedgers serves LoadGatewayPoolLedgers from rows that keep
+// their ledgers in Extra, as every row did before migration 253.
+func fakeGatewayPoolLedgers(rows []Account, ids []int64, keys []string) (map[int64]map[string]json.RawMessage, error) {
+	ledgers := map[int64]map[string]json.RawMessage{}
+	for _, row := range rows {
+		if !slices.Contains(ids, row.ID) {
+			continue
+		}
+		for _, key := range keys {
+			if value, ok := row.Extra[key]; ok {
+				raw, err := json.Marshal(value)
+				if err != nil {
+					return nil, err
+				}
+				if ledgers[row.ID] == nil {
+					ledgers[row.ID] = map[string]json.RawMessage{}
+				}
+				ledgers[row.ID][key] = raw
+			}
+		}
+	}
+	return ledgers, nil
+}
+
+// fakeGatewayPoolLedgerWithout serves LoadGatewayPoolLedgerWithout the same way.
+func fakeGatewayPoolLedgerWithout(rows []Account, id int64, kind string, omit []string) (json.RawMessage, error) {
+	loaded, err := fakeGatewayPoolLedgers(rows, []int64{id}, []string{kind})
+	if err != nil || loaded[id] == nil {
+		return nil, err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(loaded[id][kind], &fields); err != nil {
+		return nil, err
+	}
+	for _, field := range omit {
+		delete(fields, field)
+	}
+	return json.Marshal(fields)
+}
+
+func (r *gatewayRuntimeRepo) LoadGatewayPoolLedgerWithout(_ context.Context, id int64, kind string, omit ...string) (json.RawMessage, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return fakeGatewayPoolLedgerWithout([]Account{r.account}, id, kind, omit)
+}
+
+func (r *gatewayRuntimeRepo) WriteGatewayPoolLedgers(ctx context.Context, id int64, ledgers, tags map[string]any) error {
+	patch := maps.Clone(ledgers)
+	maps.Copy(patch, tags)
+	return r.UpdateExtra(ctx, id, patch)
+}
+
 func (r *gatewayRuntimeRepo) UpdateExtra(_ context.Context, _ int64, patch map[string]any) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -45,14 +129,6 @@ func (r *gatewayRuntimeRepo) UpdateExtra(_ context.Context, _ int64, patch map[s
 	}
 	if r.account.Extra == nil {
 		r.account.Extra = map[string]any{}
-	}
-	// 与真实仓储一致：历史增量在最新行上合并，不模拟成整段覆盖。
-	if _, hasHistory := patch[OpenAIGatewayHistoryExtraKey]; hasHistory {
-		merged, err := MergeOpenAIGatewayHistoryExtra(r.account.Extra, patch)
-		if err != nil {
-			return err
-		}
-		patch = merged
 	}
 	raw, _ := json.Marshal(patch)
 	var generic map[string]any
@@ -77,14 +153,13 @@ func (r *gatewayRuntimeRepo) FindByExtraField(ctx context.Context, _ string, _ a
 func gatewayRuntimeService(account *Account) (*OpenAIGatewayService, *gatewayRuntimeRepo) {
 	repo := &gatewayRuntimeRepo{account: *account}
 	svc := &OpenAIGatewayService{accountRepo: repo}
-	svc.codexCookies.accountByID = repo.GetByID
-	svc.codexCookies.poolProbeObserved = svc.noteGatewayPoolProbe
+	svc.codexCookies.accountByID = svc.gatewayPoolLedgerRow
 	return svc, repo
 }
 
 func TestGatewayPoolFirstSendDoesNotCountShelfWaitOrReset(t *testing.T) {
 	store := &openAICodexCookieStore{}
-	pair := openAIGatewayPoolPair{version: "a", gateway: "g", cookie: "offline-cookie", since: time.Now().Add(-3 * time.Minute), until: time.Now().Add(time.Minute)}
+	pair := openAIGatewayPoolPair{version: "a", gateway: "g", cookie: "offline-cookie"}
 	store.poolPairs.Store("id", pair)
 	first := time.Now()
 	store.gatewayPoolMarkSent("id", "a", first)
@@ -96,38 +171,11 @@ func TestGatewayPoolFirstSendDoesNotCountShelfWaitOrReset(t *testing.T) {
 	require.Less(t, age, time.Second, "备用架待了3分钟，首次接触仍然是年轻窗口")
 }
 
-func TestGatewayPoolProbeMetricsPersistObservedCounts(t *testing.T) {
-	account := gwpoolTestAccount(1)
-	svc, repo := gatewayRuntimeService(account)
-	shooter := &gwpoolWarmShooter{}
-	full, conclusive, _, first, err := svc.codexCookies.gatewayPoolWarmVerdict(
-		context.Background(), account, gwpoolTestIdentity, OpenAIGatewayPoolApplied{Gateway: "g", Version: "v"},
-		"offline-cookie", 1, shooter.shoot)
-	require.NoError(t, err)
-	require.True(t, full && conclusive)
-	require.False(t, first.IsZero())
-	background := context.WithValue(context.Background(), gatewayPoolProbeSourceKey{}, "background")
-	unknown := &gwpoolWarmShooter{replies: []gwpoolWarmReply{{status: http.StatusTooManyRequests}}}
-	_, _, _, _, _ = svc.codexCookies.gatewayPoolWarmVerdict(
-		background, account, gwpoolTestIdentity, OpenAIGatewayPoolApplied{Gateway: "g", Version: "v2"},
-		"offline-cookie", 1, unknown.shoot)
-	current, _ := repo.GetByID(context.Background(), 1)
-	raw, _ := json.Marshal(current.Extra[openAIGatewayPoolMetricsExtraKey])
-	var metrics gatewayPoolProbeMetrics
-	require.NoError(t, json.Unmarshal(raw, &metrics))
-	require.EqualValues(t, 2, metrics.Foreground.Requests)
-	require.EqualValues(t, 1, metrics.Foreground.Full)
-	require.EqualValues(t, 1, metrics.Background.Requests)
-	require.EqualValues(t, 1, metrics.Background.Inconclusive)
-	require.NotContains(t, string(raw), "offline-cookie")
-	require.NotContains(t, string(raw), "token")
-}
-
 func TestGatewayPoolOutboxPersistsBeforeSendAndResumesAfterRestart(t *testing.T) {
 	var reports []string
 	var repo *gatewayRuntimeRepo
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		account, _ := repo.GetByID(r.Context(), 1)
+		account, _ := repo.stored(1)
 		require.Len(t, readGatewayPoolOutbox(account, time.Now()).Pending, 1, "先持久再发")
 		raw, _ := io.ReadAll(r.Body)
 		reports = append(reports, string(raw))
@@ -147,7 +195,7 @@ func TestGatewayPoolOutboxPersistsBeforeSendAndResumesAfterRestart(t *testing.T)
 	})
 	require.Empty(t, reports, "入队本身不先发一次临时请求")
 	svc.flushGatewayPoolReports(context.Background())
-	current, _ := repo.GetByID(context.Background(), 1)
+	current, _ := repo.stored(1)
 	box := readGatewayPoolOutbox(current, time.Now())
 	require.Len(t, box.Pending, 1)
 	require.Equal(t, 1, box.Pending[0].Attempts)
@@ -157,7 +205,7 @@ func TestGatewayPoolOutboxPersistsBeforeSendAndResumesAfterRestart(t *testing.T)
 	}))
 	restarted := &OpenAIGatewayService{accountRepo: repo}
 	restarted.flushGatewayPoolReports(context.Background())
-	current, _ = repo.GetByID(context.Background(), 1)
+	current, _ = repo.stored(1)
 	box = readGatewayPoolOutbox(current, time.Now())
 	require.Empty(t, box.Pending)
 	require.EqualValues(t, 1, box.Sent)
@@ -173,13 +221,13 @@ func TestGatewayPoolOutboxWriteFailureAndChangedBindingNeverSend(t *testing.T) {
 	sample := &gatewayPoolCooldownSample{Gateway: "g", AttemptAt: time.Now(), WindowSeconds: 3600, ElapsedSeconds: 3600, Full: true}
 	repo.fail = true
 	svc.reportGatewayPoolCooldown(account, gwpoolTestIdentity, sample)
-	current, _ := repo.GetByID(context.Background(), 1)
+	current, _ := repo.stored(1)
 	require.Empty(t, readGatewayPoolOutbox(current, time.Now()).Pending)
 	repo.fail = false
 	svc.reportGatewayPoolCooldown(account, gwpoolTestIdentity, sample)
 	require.NoError(t, repo.UpdateExtra(context.Background(), 1, map[string]any{OpenAIGatewayPoolConsumerKeyExtraKey: "different-key"}))
 	svc.flushGatewayPoolReports(context.Background())
-	current, _ = repo.GetByID(context.Background(), 1)
+	current, _ = repo.stored(1)
 	box := readGatewayPoolOutbox(current, time.Now())
 	require.Empty(t, box.Pending)
 	require.EqualValues(t, 1, box.Discarded, "密钥/身份变更丢弃旧归属的报告，不能发到新配置")
@@ -195,7 +243,7 @@ func TestGatewayPoolOutboxBoundsAndPersistsExpiryWithoutSending(t *testing.T) {
 			Gateway: "g", AttemptAt: time.Now().Add(time.Duration(i)), WindowSeconds: 3600, ElapsedSeconds: 3600, Full: true,
 		})
 	}
-	current, _ := repo.GetByID(context.Background(), 1)
+	current, _ := repo.stored(1)
 	box := readGatewayPoolOutbox(current, time.Now())
 	require.Len(t, box.Pending, gatewayPoolOutboxLimit)
 	require.EqualValues(t, 3, box.Discarded)
@@ -206,7 +254,7 @@ func TestGatewayPoolOutboxBoundsAndPersistsExpiryWithoutSending(t *testing.T) {
 		}
 	}))
 	svc.flushGatewayPoolReports(context.Background())
-	current, _ = repo.GetByID(context.Background(), 1)
+	current, _ = repo.stored(1)
 	raw, _ := json.Marshal(current.Extra[openAIGatewayPoolOutboxExtraKey])
 	require.NoError(t, json.Unmarshal(raw, &box))
 	require.Empty(t, box.Pending, "数据库中的过期项也必须清理，不能只在读取时隐藏")
@@ -232,7 +280,7 @@ func TestGatewayPoolOutboxCompletionPreservesConcurrentAppend(t *testing.T) {
 		Gateway: "first", AttemptAt: time.Now(), WindowSeconds: 3600, ElapsedSeconds: 3600, Full: true,
 	})
 	svc.flushGatewayPoolReports(context.Background())
-	current, _ := repo.GetByID(context.Background(), 1)
+	current, _ := repo.stored(1)
 	box := readGatewayPoolOutbox(current, time.Now())
 	require.EqualValues(t, 1, box.Sent)
 	require.Len(t, box.Pending, 1)
@@ -264,10 +312,10 @@ func TestGatewayPoolProbePreflightFailureDoesNotCountAsSent(t *testing.T) {
 	for _, failure := range []error{gwpoolBareError(), &PluginTransportError{RequestSent: false, Code: "PLUGIN_X"}} {
 		account := gwpoolTestAccount(1)
 		account.Credentials["access_token"] = "fake-token"
-		svc, repo := gatewayRuntimeService(account)
+		svc, _ := gatewayRuntimeService(account)
 		svc.httpUpstream = &gwpoolErrorUpstream{err: failure}
-		svc.codexCookies.poolPairs.Store(openAIGatewayPoolCacheKey(account, gwpoolTestIdentity), openAIGatewayPoolPair{
-			cookie: "offline-cookie", gateway: "g", version: "v", until: time.Now().Add(time.Minute),
+		svc.codexCookies.poolPairs.Store(gwpoolTestIdentity, openAIGatewayPoolPair{
+			cookie: "offline-cookie", gateway: "g", version: "v",
 		})
 		_, conclusive, sent, first, err := svc.codexCookies.gatewayPoolWarmVerdict(
 			context.Background(), account, gwpoolTestIdentity, OpenAIGatewayPoolApplied{Gateway: "g", Version: "v"},
@@ -278,14 +326,8 @@ func TestGatewayPoolProbePreflightFailureDoesNotCountAsSent(t *testing.T) {
 		require.False(t, conclusive)
 		require.False(t, sent)
 		require.True(t, first.IsZero(), "明确未发出的错误不许启动票龄")
-		pair, _ := svc.codexCookies.cachedPoolPair(openAIGatewayPoolCacheKey(account, gwpoolTestIdentity))
+		pair, _ := svc.codexCookies.cachedPoolPair(gwpoolTestIdentity)
 		require.True(t, pair.firstSent.IsZero())
-		fresh, _ := repo.GetByID(context.Background(), 1)
-		raw, _ := json.Marshal(fresh.Extra[openAIGatewayPoolMetricsExtraKey])
-		var metrics gatewayPoolProbeMetrics
-		require.NoError(t, json.Unmarshal(raw, &metrics))
-		require.Zero(t, metrics.Foreground.Requests)
-		require.EqualValues(t, 1, metrics.Foreground.Inconclusive)
 	}
 }
 
@@ -305,7 +347,7 @@ func TestGatewayPoolProbeNoSendEvidenceDoesNotCreateContactOrReturnUncertainTick
 	require.False(t, conclusive)
 	require.True(t, mayHaveSent, "an uncertain transport error is still insufficient proof to return the ticket")
 	require.True(t, first.IsZero(), "no response or write evidence must not invent an actual send")
-	fresh, _ := repo.GetByID(context.Background(), 1)
+	fresh, _ := repo.stored(1)
 	require.Nil(t, fresh.Extra[openAIGatewayPoolContactsExtraKey])
 }
 
@@ -336,7 +378,7 @@ func TestGatewayPoolProbeWriteEvidenceSurvivesLostResponse(t *testing.T) {
 	require.False(t, conclusive)
 	require.True(t, sent)
 	require.False(t, first.IsZero())
-	fresh, _ := repo.GetByID(context.Background(), 1)
+	fresh, _ := repo.stored(1)
 	state := readGatewayPoolContacts(fresh, gatewayPoolLedgerTag(gwpoolTestIdentity))
 	require.Len(t, state.Rounds, 1)
 	require.Equal(t, "unknown", state.Rounds[0].Report.Outcome)
@@ -348,8 +390,8 @@ func TestGatewayPoolBusinessPreflightFailureDoesNotStartReusedPairAge(t *testing
 	account.Extra[openAIGatewayPoolBaseURLExtraKey] = "http://127.0.0.1:1"
 	account.Extra[OpenAIGatewayPoolConsumerKeyExtraKey] = "test-key"
 	svc := &OpenAIGatewayService{httpUpstream: &gwpoolErrorUpstream{err: &PluginTransportError{RequestSent: false}}}
-	svc.codexCookies.poolPairs.Store(openAIGatewayPoolCacheKey(account, gwpoolTestIdentity), openAIGatewayPoolPair{
-		cookie: "offline-cookie", gateway: "g", version: "v", until: time.Now().Add(time.Minute),
+	svc.codexCookies.poolPairs.Store(gwpoolTestIdentity, openAIGatewayPoolPair{
+		cookie: "offline-cookie", gateway: "g", version: "v",
 	})
 	svc.codexCookies.gatewayPoolMarkVerifiedFull(gwpoolTestIdentity, "v", gatewayPoolProbeModelLuna)
 	request, err := http.NewRequest(http.MethodPost, gwpoolTestURL, nil)
@@ -358,14 +400,14 @@ func TestGatewayPoolBusinessPreflightFailureDoesNotStartReusedPairAge(t *testing
 	ctx, _ := withOpenAIGatewayPoolSink(request.Context(), ginCtx)
 	_, _, err = svc.doOpenAIUpstreamOnce(request.WithContext(ctx), "", account)
 	require.Error(t, err)
-	pair, _ := svc.codexCookies.cachedPoolPair(openAIGatewayPoolCacheKey(account, gwpoolTestIdentity))
+	pair, _ := svc.codexCookies.cachedPoolPair(gwpoolTestIdentity)
 	require.True(t, pair.firstSent.IsZero(), "复用票未出站，也不能提前启动计时")
 }
 
 func TestGatewayPoolProbeDispatchedErrorRetainsContact(t *testing.T) {
 	account := gwpoolTestAccount(1)
 	account.Credentials["access_token"] = "fake-token"
-	svc, repo := gatewayRuntimeService(account)
+	svc, _ := gatewayRuntimeService(account)
 	svc.httpUpstream = &gwpoolErrorUpstream{err: &PluginTransportError{RequestSent: true, Code: "PLUGIN_X"}}
 	_, conclusive, sent, first, err := svc.codexCookies.gatewayPoolWarmVerdict(
 		context.Background(), account, gwpoolTestIdentity, OpenAIGatewayPoolApplied{Gateway: "g", Version: "v"},
@@ -376,11 +418,6 @@ func TestGatewayPoolProbeDispatchedErrorRetainsContact(t *testing.T) {
 	require.False(t, conclusive)
 	require.True(t, sent, "明确已发出但没响应的票不可当成未接触归还")
 	require.False(t, first.IsZero())
-	fresh, _ := repo.GetByID(context.Background(), 1)
-	raw, _ := json.Marshal(fresh.Extra[openAIGatewayPoolMetricsExtraKey])
-	var metrics gatewayPoolProbeMetrics
-	require.NoError(t, json.Unmarshal(raw, &metrics))
-	require.EqualValues(t, 1, metrics.Foreground.Requests)
 }
 
 func TestGatewayPoolStrictGuardReusesResolvedShadowIdentityForSentMark(t *testing.T) {
@@ -399,10 +436,10 @@ func TestGatewayPoolStrictGuardReusesResolvedShadowIdentityForSentMark(t *testin
 		}
 		return gwpoolTestIdentity, nil
 	}
-	svc.codexCookies.poolPairs.Store(openAIGatewayPoolCacheKey(account, gwpoolTestIdentity), openAIGatewayPoolPair{
-		cookie: "offline-cookie", gateway: "g", version: "v", until: time.Now().Add(time.Minute),
+	svc.codexCookies.poolPairs.Store(gwpoolTestIdentity, openAIGatewayPoolPair{
+		cookie: "offline-cookie", gateway: "g", version: "v",
 	})
-	svc.codexCookies.gatewayPoolMarkVerifiedFull(openAIGatewayPoolCacheKey(account, gwpoolTestIdentity), "v", "gpt-6-luna")
+	svc.codexCookies.gatewayPoolMarkVerifiedFull(gwpoolTestIdentity, "v", "gpt-6-luna")
 	request, err := http.NewRequest(http.MethodPost, gwpoolTestURL, nil)
 	require.NoError(t, err)
 	request.Header.Set(openAICodexTurnStateHeader, "business-state")
@@ -412,7 +449,7 @@ func TestGatewayPoolStrictGuardReusesResolvedShadowIdentityForSentMark(t *testin
 	require.NoError(t, err)
 	_ = response.Body.Close()
 	require.Equal(t, 2, resolutions, "AttachRoute 一次、末端验票一次；发送后必须复用")
-	pair, _ := svc.codexCookies.cachedPoolPair(openAIGatewayPoolCacheKey(account, gwpoolTestIdentity))
+	pair, _ := svc.codexCookies.cachedPoolPair(gwpoolTestIdentity)
 	require.False(t, pair.firstSent.IsZero())
 }
 
@@ -425,8 +462,8 @@ func TestGatewayPoolSideRequestsDoNotStartPairAgeFromSharedSink(t *testing.T) {
 		account.Extra[openAIGatewayPoolBaseURLExtraKey] = "http://127.0.0.1:1"
 		account.Extra[OpenAIGatewayPoolConsumerKeyExtraKey] = "test-key"
 		svc := &OpenAIGatewayService{httpUpstream: &cookieRecordingUpstream{}}
-		svc.codexCookies.poolPairs.Store(openAIGatewayPoolCacheKey(account, gwpoolTestIdentity), openAIGatewayPoolPair{
-			cookie: "offline-cookie", gateway: "g", version: "v", until: time.Now().Add(time.Minute),
+		svc.codexCookies.poolPairs.Store(gwpoolTestIdentity, openAIGatewayPoolPair{
+			cookie: "offline-cookie", gateway: "g", version: "v",
 		})
 		ginCtx, _ := gin.CreateTestContext(httptest.NewRecorder())
 		ctx, _ := withOpenAIGatewayPoolSink(context.Background(), ginCtx)
@@ -437,7 +474,27 @@ func TestGatewayPoolSideRequestsDoNotStartPairAgeFromSharedSink(t *testing.T) {
 		response, _, err := svc.doOpenAIUpstreamOnce(request, "", account)
 		require.NoError(t, err, "非接管请求不应套用主请求的严格票据闸")
 		_ = response.Body.Close()
-		pair, _ := svc.codexCookies.cachedPoolPair(openAIGatewayPoolCacheKey(account, gwpoolTestIdentity))
+		pair, _ := svc.codexCookies.cachedPoolPair(gwpoolTestIdentity)
 		require.True(t, pair.firstSent.IsZero(), "共享sink的侧请求没有使用池子票，不能给它计龄")
 	}
+}
+
+// Every requested ID is answered: a deleted or no-longer-pool row is explicitly
+// inactive, so the admin page's complete-batch freeze cannot wait forever.
+func TestGatewayPoolRuntimeProgressAnswersEveryRequestedID(t *testing.T) {
+	account := gwpoolTestAccount(1)
+	svc, _ := gatewayRuntimeService(account)
+	view, err := svc.GatewayPoolRuntimeProgress(context.Background(), []int64{1, 999}, true)
+	require.NoError(t, err)
+	require.NotNil(t, view[1].Runtime)
+	require.False(t, view[1].Inactive)
+	require.True(t, view[999].Inactive, "deleted row")
+	require.Nil(t, view[999].Runtime)
+
+	off := gwpoolTestAccount(1)
+	off.Extra[openAIGatewayPoolExtraKey] = false
+	svc, _ = gatewayRuntimeService(off)
+	view, err = svc.GatewayPoolRuntimeProgress(context.Background(), []int64{1}, true)
+	require.NoError(t, err)
+	require.True(t, view[1].Inactive, "pool switched off")
 }

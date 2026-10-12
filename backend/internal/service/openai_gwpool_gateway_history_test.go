@@ -15,8 +15,8 @@ import (
 // 这条记录每发请求都可能被写一次，所以三件事得钉住：换网关立刻写、同一个网关在节流窗口里
 // 不写、条目不会无限长。写爆了不是功能问题而是**每发请求一次 UPDATE + 一次调度快照同步**。
 func TestNoteOpenAIGatewayUse(t *testing.T) {
-	newSvc := func() (*OpenAIGatewayService, *turnStateAutoRepo) {
-		repo := newTurnStateAutoRepo()
+	newSvc := func() (*OpenAIGatewayService, *turnStateTestRepo) {
+		repo := newTurnStateTestRepo()
 		return &OpenAIGatewayService{accountRepo: repo}, repo
 	}
 
@@ -43,23 +43,20 @@ func TestNoteOpenAIGatewayUse(t *testing.T) {
 		rec, ok := readOpenAIGatewayHistory(acct)
 		require.True(t, ok)
 		require.Equal(t, 62, rec.PoolLive)
-		require.NotNil(t, rec.PoolFree)
-		require.Equal(t, 5, *rec.PoolFree)
+		require.Equal(t, 5, rec.PoolFree)
 
 		// 换个网关穿过节流，这一发没问到清单 ⇒ 旧的那一对留着。
 		svc.noteOpenAIGatewayUse(context.Background(), acct, "unified-73", "", "", true, 0, 0, 0)
 		rec, ok = readOpenAIGatewayHistory(acct)
 		require.True(t, ok)
 		require.Equal(t, 62, rec.PoolLive, "没问到清单的那一发把读数抹掉了")
-		require.NotNil(t, rec.PoolFree)
-		require.Equal(t, 5, *rec.PoolFree)
+		require.Equal(t, 5, rec.PoolFree)
 
 		// 可交付的全烧过了：free=0 是**真的 0**，照写。
 		svc.noteOpenAIGatewayUse(context.Background(), acct, "unified-99", "", "", true, 41, 0, 0)
 		rec, _ = readOpenAIGatewayHistory(acct)
 		require.Equal(t, 41, rec.PoolLive)
-		require.NotNil(t, rec.PoolFree)
-		require.Equal(t, 0, *rec.PoolFree)
+		require.Equal(t, 0, rec.PoolFree)
 	})
 
 	t.Run("同一个网关在节流窗口里不再写", func(t *testing.T) {
@@ -263,10 +260,10 @@ func TestPruneOpenAIGatewayHistory(t *testing.T) {
 
 func TestGatewayPoolCooldownFreshPersistenceAndCrossRowRestart(t *testing.T) {
 	account := gwpoolTestAccount(1)
-	repo := newTurnStateAutoRepo()
+	repo := newTurnStateTestRepo()
 	repo.latest = account
 	svc := &OpenAIGatewayService{accountRepo: repo}
-	svc.codexCookies.accountByID = repo.GetByID
+	svc.codexCookies.accountByID = svc.gatewayPoolLedgerRow
 	identity := openAIGatewayPoolAccountKey(account)
 	require.True(t, svc.codexCookies.beginGatewayPoolAttempt(identity, "unified-142", 30*time.Minute))
 	svc.codexCookies.observeGatewayPoolCooldown(identity, "unified-142", openAIGatewayVerdictDegraded, 30*time.Minute, time.Time{})
@@ -280,13 +277,13 @@ func TestGatewayPoolCooldownFreshPersistenceAndCrossRowRestart(t *testing.T) {
 	persisted.Extra = written
 	history, _ := readOpenAIGatewayHistory(&persisted)
 	require.NotNil(t, history.Seen["unified-142"].Cooldown)
-	require.EqualValues(t, 75000, history.Seen["unified-142"].FullHeldMs)
+	require.EqualValues(t, 75000, history.Seen["unified-142"].FullUseMs)
 
 	// 新进程从另一克隆行进入，仍从共享标签查回前一行持久化的状态。
 	clone := gwpoolTestAccount(35)
 	restarted := &openAICodexCookieStore{
-		accountByID: func(context.Context, int64) (*Account, error) { return clone, nil },
-		historyByTag: func(_ context.Context, tag string) ([]Account, error) {
+		accountByID: func(context.Context, int64, ...string) (*Account, error) { return clone, nil },
+		historyByTag: func(_ context.Context, tag string, _ ...string) ([]Account, error) {
 			if tag == persisted.Extra[openAIGatewayLedgerTagExtraKey] {
 				return []Account{persisted}, nil
 			}

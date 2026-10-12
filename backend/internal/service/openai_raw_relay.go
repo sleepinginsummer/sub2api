@@ -603,8 +603,6 @@ func (s *OpenAIGatewayService) openAIRawRelayResult(c *gin.Context, resp *http.R
 	result := &OpenAIForwardResult{
 		RequestID:                     resp.Header.Get("x-request-id"),
 		UpstreamHeaders:               resp.Header,
-		GatewayPoolRoutePair:          openAIGatewayPoolRoutePairFromResponse(resp),
-		GatewayPoolApplied:            openAIGatewayPoolAppliedFromResponse(resp),
 		ResponseID:                    relay.responseID,
 		Usage:                         relay.usage,
 		Model:                         reqModel,

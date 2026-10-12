@@ -15,7 +15,7 @@ func TestGatewayPoolPreparingWaiterCannotMaskExhaustion(t *testing.T) {
 	account.Extra[openAIGatewayPoolRotationMinGatewaysExtraKey] = 10
 	fake.configure(account)
 	svc, _ := gatewayRuntimeService(account)
-	identity := openAIGatewayPoolCacheKey(account, openAIGatewayPoolAccountKey(account))
+	identity := openAIGatewayPoolAccountKey(account)
 	require.True(t, svc.gatewayPoolNoRemainingRoutes(context.Background(), account))
 	waiter, finish := svc.beginGatewayPoolUsageRequest(context.Background(), account)
 	require.NotNil(t, finish)
@@ -45,7 +45,7 @@ func TestGatewayPoolBusinessBodyPinsInventoryUntilEOF(t *testing.T) {
 	_, response, err := gwpoolEchoRun(t, svc, account, "same-state", true)
 	require.NoError(t, err)
 	require.NotNil(t, response)
-	inventory := svc.codexCookies.gatewayPoolInventory(openAIGatewayPoolCacheKey(account, gwpoolTestIdentity))
+	inventory := svc.codexCookies.gatewayPoolInventory(gwpoolTestIdentity)
 	inventory.mu.Lock()
 	active, requests := inventory.active, inventory.requests
 	inventory.mu.Unlock()

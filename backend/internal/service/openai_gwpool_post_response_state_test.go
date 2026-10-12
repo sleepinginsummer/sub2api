@@ -52,9 +52,9 @@ func TestGatewayPoolPostResponseStateWithoutSent(t *testing.T) {
 			upstream := &gwpoolEchoUpstream{replies: []gwpoolEchoReply{tc.first, tc.second}}
 			svc := &OpenAIGatewayService{httpUpstream: upstream}
 			gwpoolEchoSeedVerified(t, svc, fake.account(1))
-			pair, _ := svc.codexCookies.cachedPoolPair(openAIGatewayPoolCacheKey(fake.account(1), gwpoolTestIdentity))
+			pair, _ := svc.codexCookies.cachedPoolPair(gwpoolTestIdentity)
 			pair.firstSent = time.Now().Add(-3 * time.Minute)
-			svc.codexCookies.poolPairs.Store(openAIGatewayPoolCacheKey(fake.account(1), gwpoolTestIdentity), pair)
+			svc.codexCookies.poolPairs.Store(gwpoolTestIdentity, pair)
 			c, response, err := gatewayPoolPostResponseRun(t, svc, fake.account(1), "")
 			if tc.wantErr == nil {
 				require.NoError(t, err)
@@ -87,7 +87,6 @@ func TestGatewayPoolPostResponseStateWithoutSent(t *testing.T) {
 				require.Empty(t, discarded)
 			}
 			require.Empty(t, OpenAITurnStateUsageSent(c), "confirmation state is not business outbound state")
-			require.Empty(t, OpenAITurnStateUsageSource(c))
 		})
 	}
 }
@@ -106,9 +105,9 @@ func TestGatewayPoolPostResponseStateUsesSameAgeBudgetWithoutSent(t *testing.T) 
 			svc := &OpenAIGatewayService{httpUpstream: upstream}
 			account := fake.account(1)
 			gwpoolEchoSeedVerified(t, svc, account)
-			pair, _ := svc.codexCookies.cachedPoolPair(openAIGatewayPoolCacheKey(account, gwpoolTestIdentity))
+			pair, _ := svc.codexCookies.cachedPoolPair(gwpoolTestIdentity)
 			pair.firstSent = time.Now().Add(-tc.age)
-			svc.codexCookies.poolPairs.Store(openAIGatewayPoolCacheKey(account, gwpoolTestIdentity), pair)
+			svc.codexCookies.poolPairs.Store(gwpoolTestIdentity, pair)
 			_, response, err := gatewayPoolPostResponseRun(t, svc, account, "")
 			require.ErrorIs(t, err, errOpenAIGatewayPoolRouteDegraded)
 			require.Nil(t, response)
@@ -182,7 +181,6 @@ func TestGatewayPoolPostResponseStateCompressedBuilders(t *testing.T) {
 			for _, field := range []string{"prompt_cache_key", "client_metadata.session_id", "client_metadata.thread_id"} {
 				require.Equal(t, gjson.GetBytes(business, field).Raw, gjson.GetBytes(confirmation, field).Raw)
 			}
-			require.NotContains(t, OpenAITurnStateUsageSource(c), "gwpool_")
 		})
 	}
 }

@@ -133,48 +133,51 @@ func gatewayPoolEchoStrikes(age time.Duration) int {
 // openAIGatewayPoolPairStale ⇒ 取票时 force=1 + exclude_versions=<这张> ⇒ 必定换一个网关。
 //
 // 票号对不上就什么都不做：那说明缓存里已经是另一张票了（并发换过、还过）。
-// 返回值是这张票的满血时长，0 = 没验过满血 / 没标上（见 gatewayPoolNoteFullWindow）。
+// 返回值是这张票本周期满血在用的业务时长（卡片上的「满血 Ns」），0 = 没量到。
 func (s *openAICodexCookieStore) gatewayPoolMarkStale(identity, version string) time.Duration {
-	held, _ := s.gatewayPoolMarkStaleMatched(identity, version)
-	return held
+	stale, _, marked := s.gatewayPoolMarkStaleMatched(identity, version)
+	if !marked {
+		return 0
+	}
+	return s.gatewayPoolTicketFullUse(identity, stale, stale.invalidatedAt)
 }
 
-func (s *openAICodexCookieStore) gatewayPoolMarkStaleMatched(identity, version string) (time.Duration, bool) {
+// 返回标上 Stale 的那张票，以及「验满 → 判降智」的墙钟窗口（给池子和本地排序的接触样本）。
+func (s *openAICodexCookieStore) gatewayPoolMarkStaleMatched(identity, version string) (openAIGatewayPoolPair, time.Duration, bool) {
 	if s == nil || identity == "" {
-		return 0, false
+		return openAIGatewayPoolPair{}, 0, false
 	}
 	value, ok := s.poolPairs.Load(identity)
 	if !ok {
-		return 0, false
+		return openAIGatewayPoolPair{}, 0, false
 	}
 	cached, isPair := value.(openAIGatewayPoolPair)
 	if !isPair {
-		return 0, false
+		return openAIGatewayPoolPair{}, 0, false
 	}
 	if cached.invalidated {
-		return 0, false
+		return openAIGatewayPoolPair{}, 0, false
 	}
 	// A late verdict cannot invalidate a replacement, even on the same gateway.
 	if version == "" || cached.version != version {
-		return 0, false
+		return openAIGatewayPoolPair{}, 0, false
 	}
 	next := cached
 	next.invalidated = true
 	next.invalidatedAt = time.Now().UTC()
 	if !s.poolPairs.CompareAndSwap(identity, cached, next) {
-		return 0, false
+		return openAIGatewayPoolPair{}, 0, false
 	}
 	s.invalidateGatewayPoolActiveUse(identity, cached.gateway, cached.version, next.invalidatedAt)
 	// CAS 成功后才结束这张票的统计窗口，避免重复记时。
-	return s.gatewayPoolNoteFullWindow(identity, cached.version), true
+	return next, s.gatewayPoolNoteFullWindow(identity, cached.version), true
 }
 
 // dropDegradedGatewayPoolRoute 丢掉这一发降智的响应，并把当前网关标成要换。
 //
 // 调用点在**读到响应头之后、往下游写第一个字节之前**：doOpenAIUpstream 是传输层，调用方要等它
 // 返回才开始解析响应、写下游。所以这里关掉响应体就是干净的截断，不会留一个半截的 SSE 流。
-// 不读响应体还有一个副作用是想要的：提前 Close 让 HTTP/2 发 RST_STREAM，上游立刻停止生成
-// （与猎手「头到手即断」同一手法，openai_turn_state_hunter.go）。
+// 不读响应体还有一个副作用是想要的：提前 Close 让 HTTP/2 发 RST_STREAM，上游立刻停止生成。
 //
 // 这条日志是**唯一**能事后回答「我的请求为什么被截断了」的东西。按明确约定：
 // 票本体、cookie 本体都不进日志，票只记 sha256 前缀指纹（openAICodexTurnStateKey，与溯源表同一个
@@ -188,32 +191,29 @@ func (s *OpenAIGatewayService) dropDegradedGatewayPoolRoute(
 	if resp.Body != nil {
 		_ = resp.Body.Close()
 	}
-	// HTTP 响应携带首发的完整快照，不能从可能已被后发覆盖的共享 sink 取路由。
-	applied := openAIGatewayPoolAppliedFromResponse(resp)
-	if applied.Cookie == "" {
-		applied = openAIGatewayPoolSinkFrom(request.Context()).snapshot()
-	}
+	applied := openAIGatewayPoolSinkFrom(request.Context()).snapshot()
 	// 身份解析对影子行要读一次库：用脱离取消的 ctx，否则客户端刚好断开的那一瞬连标 Stale 都做不了，
 	// 票会留在缓存里被下一发继续拿出去。
 	detached := context.WithoutCancel(request.Context())
 	if identity, err := s.codexCookies.gatewayPoolIdentity(detached, account); err == nil {
+		// 标 Stale 顺手量到这张票的满血时长 ⇒ 记进 sink，由用量侧落到这个网关的账本上。
 		if request.Context().Err() != nil {
 			return false
 		}
-		held, marked := s.codexCookies.gatewayPoolMarkStaleMatched(identity, applied.Version)
-		// 迟到响应仍记录原请求丢弃归因，只让匹配的当前票退休。
-		if marked {
-			openAIGatewayPoolSinkFrom(request.Context()).noteVerdict(applied.Gateway, openAIGatewayVerdictDegraded)
-			applied.Verdict = openAIGatewayVerdictDegraded
-			applied.FullHeldMs = held.Milliseconds()
-			s.finishGatewayPoolContact(detached, account, identity, applied, held)
-			openAIGatewayPoolSinkFrom(detached).noteFullHeld(applied, held)
-			// 账本记的是**实际交付的那个网关**：标 Stale 只让下一发换票，账本才是「这个上游账号
-			// 本地冷却内别再点这个落点」的依据。
-			s.codexCookies.gatewayPoolMarkUsed(identity, applied.Gateway, applied.cooldownResetAt)
-			s.noteGatewayPoolCooldownVerdict(detached, account, applied, openAIGatewayVerdictDegraded)
+		stale, window, marked := s.codexCookies.gatewayPoolMarkStaleMatched(identity, applied.Version)
+		if !marked {
+			return false
 		}
+		used := s.codexCookies.gatewayPoolTicketFullUse(identity, stale, stale.invalidatedAt)
+		openAIGatewayPoolSinkFrom(request.Context()).noteVerdict(applied.Gateway, openAIGatewayVerdictDegraded)
 		applied.Verdict = openAIGatewayVerdictDegraded
+		applied.FullUseMs = used.Milliseconds()
+		s.finishGatewayPoolContact(detached, account, identity, applied, window, used)
+		openAIGatewayPoolSinkFrom(detached).noteFullUse(applied, used)
+		// 账本记的是**实际交付的那个网关**：标 Stale 只让下一发换票，账本才是「这个上游账号
+		// 本地冷却内别再点这个落点」的依据。
+		s.codexCookies.gatewayPoolMarkUsed(identity, applied.Gateway, applied.cooldownResetAt)
+		s.noteGatewayPoolCooldownVerdict(detached, account, applied, openAIGatewayVerdictDegraded)
 	} else {
 		return false
 	}

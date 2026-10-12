@@ -118,9 +118,9 @@ func TestWarmUpSpendsNothingOnAVerifiedLivePair(t *testing.T) {
 	// 第一发：缓存里什么都没有 ⇒ 取票 + 验一次（假上游默认不下发新 state = 满血）。
 	require.NoError(t, gwpoolWarmRun(t, svc, acct, shooter))
 	require.Len(t, shooter.shots, 2, "一组判据恰好两发")
-	_, state := svc.codexCookies.cachedPoolPair(openAIGatewayPoolCacheKey(acct, gwpoolTestIdentity))
+	_, state := svc.codexCookies.cachedPoolPair(gwpoolTestIdentity)
 	require.Equal(t, openAIGatewayPoolPairLive, state)
-	require.True(t, svc.codexCookies.gatewayPoolVerifiedFull(openAIGatewayPoolCacheKey(acct, gwpoolTestIdentity)))
+	require.True(t, svc.codexCookies.gatewayPoolVerifiedFull(gwpoolTestIdentity))
 
 	// 第二发走**生产那条快路**（gatewayPoolWarmUp，不是注入 shooter 的那个）：票验过 + 还 Live
 	// ⇒ 一发都不打、也不再问池子。
@@ -148,16 +148,16 @@ func TestWarmUpStillProbesALivePairThatWasNeverVerified(t *testing.T) {
 
 	// 别人（并发取票的跟随者 / 克隆行 / retry 与 off 档）留下的一张 Live 票，没人验过。
 	require.NoError(t, attachRoute(context.Background(), &svc.codexCookies, acct, gwpoolTestURL, http.Header{}))
-	_, state := svc.codexCookies.cachedPoolPair(openAIGatewayPoolCacheKey(acct, gwpoolTestIdentity))
+	_, state := svc.codexCookies.cachedPoolPair(gwpoolTestIdentity)
 	require.Equal(t, openAIGatewayPoolPairLive, state)
-	require.False(t, svc.codexCookies.gatewayPoolVerifiedFull(openAIGatewayPoolCacheKey(acct, gwpoolTestIdentity)),
+	require.False(t, svc.codexCookies.gatewayPoolVerifiedFull(gwpoolTestIdentity),
 		"Live ≠ 验过 —— 快路判的是这个布尔值，它为真就一发不打直接放行")
 
 	// 预热照样跑一组判据（而不是看见 Live 就放行）。
 	shooter := &gwpoolWarmShooter{}
 	require.NoError(t, gwpoolWarmRun(t, svc, acct, shooter))
 	require.Len(t, shooter.shots, 2, "没验过的 Live 票必须验")
-	require.True(t, svc.codexCookies.gatewayPoolVerifiedFull(openAIGatewayPoolCacheKey(acct, gwpoolTestIdentity)))
+	require.True(t, svc.codexCookies.gatewayPoolVerifiedFull(gwpoolTestIdentity))
 	require.Equal(t, int64(1), fake.hits.Load(), "复用手上那张，不许为了验再取一张")
 }
 
@@ -216,13 +216,14 @@ func TestWarmUpRotatesPastADegradedGatewayAndServesTheFullOne(t *testing.T) {
 	}
 
 	// 缓存里留下的是满血那张 ⇒ 紧接着业务请求那一发原样复用它。
-	pair, state := svc.codexCookies.cachedPoolPair(openAIGatewayPoolCacheKey(gwpoolWarmAccount(fake), gwpoolTestIdentity))
+	pair, state := svc.codexCookies.cachedPoolPair(gwpoolTestIdentity)
 	require.Equal(t, openAIGatewayPoolPairLive, state)
 	require.Equal(t, "unified-84", pair.gateway)
 
 	// 两个落点都进账本（都真的被碰过了）：下一个窗口挑票时都要排掉。
-	burned := svc.codexCookies.gatewayPoolBurnedGateways(gwpoolTestIdentity, openAIGatewayPoolGatewayWindow, 8)
-	require.ElementsMatch(t, []string{"unified-142", "unified-84"}, burned)
+	for _, gateway := range []string{"unified-142", "unified-84"} {
+		require.True(t, svc.codexCookies.gatewayPoolUsedRecently(gwpoolTestIdentity, gateway, openAIGatewayPoolGatewayWindow))
+	}
 }
 
 // 试满了也没验出满血 ⇒ **按失败处理，绝不降级放行**（queue 档唯一的承诺）。
@@ -251,7 +252,7 @@ func TestWarmUpFailsClosedWhenNoTicketVerifiesFull(t *testing.T) {
 		"必须包着 ErrPool：classifyUpstreamTransportError 据此豁免「按代理持久故障停调度」")
 	require.Equal(t, gatewayPoolWarmExhaustedClientMsg, gatewayPoolClientMessage(err))
 	require.Len(t, shooter.shots, 2*candidateCount, "当前候选试尽后必须停止")
-	_, state := svc.codexCookies.cachedPoolPair(openAIGatewayPoolCacheKey(fake.account(1), gwpoolTestIdentity))
+	_, state := svc.codexCookies.cachedPoolPair(gwpoolTestIdentity)
 	require.NotEqual(t, openAIGatewayPoolPairLive, state, "不许留一张没验过的票给业务请求")
 }
 
@@ -272,18 +273,17 @@ func TestWarmUpBlocksInconclusiveShotsWithoutCallingThemDegraded(t *testing.T) {
 			shooter := &gwpoolWarmShooter{replies: replies}
 
 			account := gwpoolWarmAccount(fake)
-			account.Extra[openAIGatewayPoolRecoveryExtraKey] = 0
 			err := gwpoolWarmRun(t, svc, account, shooter)
 			require.Error(t, err, "严格模式下无法判断必须停止业务出站")
 			require.NotErrorIs(t, err, errOpenAIGatewayPoolRouteDegraded, "无法判断不能冒充明确降级")
 			require.LessOrEqual(t, len(shooter.shots), 2, "本轮就停，不许换票再试")
 			// **不标验过**：业务请求那一发的内嵌判据还要再判一次（退化成 retry 档）。
-			require.False(t, svc.codexCookies.gatewayPoolVerifiedFull(openAIGatewayPoolCacheKey(gwpoolWarmAccount(fake), gwpoolTestIdentity)),
+			require.False(t, svc.codexCookies.gatewayPoolVerifiedFull(gwpoolTestIdentity),
 				"没验出满血就不许标成验过，否则下一发连内嵌判据都跳了")
 			// 还不还槽位按「有没有确证送达上游」判，**不能指望业务请求那条路去还**：
 			// 那边的 gatewayPoolPair 命中「缓存里还 Live」的早返回 ⇒ 这次调用没向池子取票 ⇒
 			// release 恒为 nil ⇒ gatewayPoolDefinitelyUnsent 在 queue 档上是个空操作。
-			_, state := svc.codexCookies.cachedPoolPair(openAIGatewayPoolCacheKey(fake.account(1), gwpoolTestIdentity))
+			_, state := svc.codexCookies.cachedPoolPair(gwpoolTestIdentity)
 			if sent {
 				require.Zero(t, fake.releaseHits.Load(), "发出去过的票不许还回共享池")
 				// 票也不标坏：确证只是「这一发没下结论」，判坏它会白扔一个落点，
@@ -585,7 +585,7 @@ func TestGatewayPoolWarmModelPrefersTheSinkOverTheHeaderAndBody(t *testing.T) {
 	require.Equal(t, "gpt-6-astra", gatewayPoolWarmModel(all.WithContext(ctx)))
 
 	// 没有 sink 读数 ⇒ 读头。主转发入口上 sink **一定**有 model（buildUpstreamRequest 必然在
-	// doOpenAIUpstream 之前跑完），所以来源 #1 是常态；后两个来源兜的是桥接口、猎手那类
+	// doOpenAIUpstream 之前跑完），所以来源 #1 是常态；后两个来源兜的是桥接口那类
 	// 不经 buildUpstreamRequest 的调用方。双开账号：体是 zstd 字节，头里有本轮 model。
 	compressed, err := http.NewRequest(http.MethodPost, gwpoolTestURL, strings.NewReader("\x28\xb5\x2f\xfd zstd"))
 	require.NoError(t, err)

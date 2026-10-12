@@ -85,7 +85,7 @@ func (r *gatewayPoolRounds) exhaust(group int64, identity string, generation uin
 	}
 }
 
-func (r *gatewayPoolRounds) claim(group int64, identity string, limits ...int) bool {
+func (r *gatewayPoolRounds) claim(group int64, identity string, limit int) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	state := r.groupLocked(group)
@@ -93,10 +93,7 @@ func (r *gatewayPoolRounds) claim(group int64, identity string, limits ...int) b
 	if _, exhausted := state.exhausted[domain]; exhausted && !state.continuousDomain(domain) {
 		return false
 	}
-	limit := gatewayPoolActiveAccountsDefault
-	if len(limits) > 0 {
-		limit = normalizeGatewayPoolActiveAccounts(limits[0])
-	}
+	limit = normalizeGatewayPoolActiveAccounts(limit)
 	if len(state.active) == 0 && state.current != "" {
 		state.active = []string{state.current}
 	}
@@ -230,7 +227,7 @@ func (s *OpenAIGatewayService) gatewayPoolRoundSelectionAllowed(ctx context.Cont
 	account := selection.Account
 	known, _ := s.codexCookies.poolRotationAccounts.Load(account.ID)
 	if !gatewayPoolRotationAccount(account, *group) && known != true {
-		return true
+		return true // ordinary OAuth rows must not gain a new failure-prone DB gate
 	}
 	if s.accountRepo != nil {
 		fresh, err := s.accountRepo.GetByID(ctx, account.ID)
@@ -260,11 +257,13 @@ func (s *OpenAIGatewayService) gatewayPoolRoundSelectionAllowed(ctx context.Cont
 	if s.codexCookies.gatewayPoolVerifiedFull(identity) {
 		return bound || s.codexCookies.poolRounds.claim(*group, identity, s.gatewayPoolActiveAccountLimit(ctx, group))
 	}
-	if !account.GatewayPoolContinuousWaitEnabled() && s.gatewayPoolNoRemainingRoutes(ctx, account) &&
-		s.codexCookies.gatewayPoolLocalResumeAt(identity, account).After(time.Now()) {
-		s.codexCookies.poolRounds.exhaust(*group, identity, s.codexCookies.poolRounds.generation(*group))
-		s.restGatewayPoolAccount(ctx, account, identity, *group)
-		return false
+	if !account.GatewayPoolContinuousWaitEnabled() {
+		plan := s.gatewayPoolExhaustedRestQuality(ctx, account)
+		if now := time.Now(); plan != nil && s.codexCookies.gatewayPoolLocalResumeAt(identity, account, now, plan.qualityGateways...).After(now) {
+			plan.roundGeneration = s.codexCookies.poolRounds.generation(*group)
+			_ = s.restGatewayPoolAccount(ctx, account, identity, *group, *plan)
+			return false
+		}
 	}
 	return bound || s.codexCookies.poolRounds.claim(*group, identity, s.gatewayPoolActiveAccountLimit(ctx, group))
 }

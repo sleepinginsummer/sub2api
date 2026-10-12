@@ -47,8 +47,12 @@ func TestGatewayPoolClientDispatchDirectoryTimeoutIsUnknownAndRetryable(t *testi
 	gatewayPoolWaitFrom(ctx).sleep = func(context.Context, time.Duration) error { sleeps++; return nil }
 	_, err := svc.attachGatewayPoolRouteWithWait(ctx, account, gwpoolTestURL, http.Header{})
 	require.NoError(t, err, "directory timeout must not terminate a still-live request")
-	require.Equal(t, 1, sleeps)
+	require.Zero(t, sleeps, "a directory timeout must retry without an extra queue sleep")
 	require.EqualValues(t, 2, lists.Load())
+}
+
+func TestGatewayPoolClientDispatchDefaultDirectoryTimeoutIsFiveSeconds(t *testing.T) {
+	require.Equal(t, 5*time.Second, gwpoolTestAccount(1).gatewayPoolListTimeout())
 }
 
 func TestGatewayPoolClientDispatchMalformedCatalogIsNotExhaustion(t *testing.T) {
@@ -116,7 +120,7 @@ func TestGatewayPoolClientDispatchRefreshesEmptyAndMissing(t *testing.T) {
 				}
 			})
 			store := &openAICodexCookieStore{}
-			pair, fresh, err := store.gatewayPoolPair(context.Background(), account, openAIGatewayPoolAccountKey(account))
+			pair, fresh, err := store.gatewayPoolPair(context.Background(), account, gwpoolTestIdentity)
 			require.NoError(t, err)
 			require.True(t, fresh)
 			require.Equal(t, "new", pair.gateway)
@@ -144,7 +148,7 @@ func TestGatewayPoolClientDispatchRepeatedMissingIsBoundedNotExhausted(t *testin
 		fmt.Fprint(w, `{"error":{"code":"no_live_pair"}}`)
 	})
 	store := &openAICodexCookieStore{}
-	_, _, err := store.gatewayPoolPair(context.Background(), account, openAIGatewayPoolAccountKey(account))
+	_, _, err := store.gatewayPoolPair(context.Background(), account, gwpoolTestIdentity)
 	var refused *gwpool.PoolError
 	require.ErrorAs(t, err, &refused)
 	require.Equal(t, gwpool.CodeNoLivePair, refused.Code, "missing stock must not invent local exhaustion")
@@ -167,13 +171,13 @@ func TestGatewayPoolClientDispatchLocallyExcludesStaleRoute(t *testing.T) {
 				writeDispatchPair(w, "new", cookie, "new-version")
 			})
 			store := &openAICodexCookieStore{}
-			store.poolPairs.Store(openAIGatewayPoolAccountKey(account), openAIGatewayPoolPair{
+			store.poolPairs.Store(gwpoolTestIdentity, openAIGatewayPoolPair{
 				cookie: "__cflb=old; __oailb=old", gateway: "old", version: version, invalidated: true,
 			})
-			for i := range gwpool.MaxExcludeItems + 5 {
-				store.gatewayPoolMarkUsed(openAIGatewayPoolAccountKey(account), fmt.Sprintf("cooling-%d", i))
+			for i := range 64 + 5 { // past the 64-item wire limit
+				store.gatewayPoolMarkUsed(gwpoolTestIdentity, fmt.Sprintf("cooling-%d", i))
 			}
-			pair, _, err := store.gatewayPoolPair(context.Background(), account, openAIGatewayPoolAccountKey(account))
+			pair, _, err := store.gatewayPoolPair(context.Background(), account, gwpoolTestIdentity)
 			require.NoError(t, err)
 			require.Equal(t, "new", pair.gateway, "old gateway exclusion cannot depend on version presence or the 64-item wire limit")
 		})
@@ -198,12 +202,12 @@ func TestGatewayPoolClientDispatchRejectsMismatchedRouteAndVersion(t *testing.T)
 				writeDispatchPair(w, gateway, cookie, version)
 			})
 			store := &openAICodexCookieStore{}
-			store.poolPairs.Store(openAIGatewayPoolAccountKey(account), openAIGatewayPoolPair{
+			store.poolPairs.Store(gwpoolTestIdentity, openAIGatewayPoolPair{
 				cookie: "__cflb=old; __oailb=old", gateway: "old", version: "old-version", invalidated: true,
 			})
-			_, _, err := store.gatewayPoolPair(context.Background(), account, openAIGatewayPoolAccountKey(account))
+			_, _, err := store.gatewayPoolPair(context.Background(), account, gwpoolTestIdentity)
 			require.ErrorIs(t, err, gwpool.ErrPool)
-			current, state := store.cachedPoolPair(openAIGatewayPoolAccountKey(account))
+			current, state := store.cachedPoolPair(gwpoolTestIdentity)
 			require.Equal(t, openAIGatewayPoolPairStale, state)
 			require.Equal(t, "old-version", current.version)
 		})
@@ -224,7 +228,7 @@ func TestGatewayPoolClientDispatchConsumerLimitSharesBackoff(t *testing.T) {
 	})
 	store := &openAICodexCookieStore{}
 	for range 2 {
-		_, _, err := store.gatewayPoolPair(context.Background(), account, openAIGatewayPoolAccountKey(account))
+		_, _, err := store.gatewayPoolPair(context.Background(), account, gwpoolTestIdentity)
 		var refused *gwpool.PoolError
 		require.ErrorAs(t, err, &refused)
 		require.Equal(t, gwpool.CodeConsumerRateLimited, refused.Code)
@@ -233,8 +237,8 @@ func TestGatewayPoolClientDispatchConsumerLimitSharesBackoff(t *testing.T) {
 		require.False(t, gatewayPoolRotationFailure(err))
 	}
 	require.EqualValues(t, 1, tickets.Load(), "shared member backoff must stop subsequent pool traffic")
-	store.applyGatewayPoolCooldownClear(openAIGatewayPoolAccountKey(account), time.Now(), 3600)
-	left, code := store.gatewayPoolBackoffFor(openAIGatewayPoolAccountKey(account))
+	store.applyGatewayPoolCooldownClear(gwpoolTestIdentity, time.Now(), 3600)
+	left, code := store.gatewayPoolBackoffFor(gwpoolTestIdentity)
 	require.Positive(t, left)
 	require.Equal(t, gwpool.CodeConsumerRateLimited, code, "clearing local CD cannot clear a server consumer limit")
 }
@@ -265,11 +269,10 @@ func TestGatewayPoolClientDispatchWaitHonorsConsumerRetryAfter(t *testing.T) {
 	sleeps := 0
 	state.sleep = func(ctx context.Context, gap time.Duration) error {
 		sleeps++
-		// 等待上限来自绝对截止；扣除计算耗时后允许 1ms 时钟误差。
-		require.GreaterOrEqual(t, gap, 6*time.Second-time.Millisecond)
+		require.GreaterOrEqual(t, gap, 6*time.Second)
 		require.LessOrEqual(t, gap, 7*time.Second)
 		// Simulate expiry without spending seven wall-clock seconds.
-		svc.codexCookies.poolBackoff.Delete(openAIGatewayPoolAccountKey(account))
+		svc.codexCookies.poolBackoff.Delete(gwpoolTestIdentity)
 		limited.Store(false)
 		return nil
 	}
@@ -298,7 +301,7 @@ func TestGatewayPoolClientDispatchExhaustionRefreshesAndFailureIsUnknown(t *test
 	svc, _ := gatewayRuntimeService(account)
 	pool, err := svc.codexCookies.poolClient(account)
 	require.NoError(t, err)
-	_, err = pool.Catalog(context.Background(), "acc-a/user-a", gatewayPoolAccountTag(account, openAIGatewayPoolAccountKey(account)), "", 0)
+	_, err = pool.Catalog(context.Background(), "acc-a/user-a", gatewayPoolAccountTag(account, gwpoolTestIdentity), "", 0)
 	require.NoError(t, err)
 	mode.Store(1)
 	require.False(t, svc.gatewayPoolNoRemainingRoutes(context.Background(), account), "cached empty cannot prove exhaustion")
@@ -313,8 +316,7 @@ func TestGatewayPoolClientDispatchPoolTouchHistoryCannotRank(t *testing.T) {
 		{Name: "first", PairReady: true},
 		{Name: "second", PairReady: true},
 	}
-	account := gwpoolTestAccount(1)
-	got := store.gatewayPoolPick(context.Background(), account, openAIGatewayPoolAccountKey(account), candidates, nil)
+	got := store.gatewayPoolPick(context.Background(), gwpoolTestAccount(1), gwpoolTestIdentity, candidates, nil)
 	require.Equal(t, "first", got)
 	require.False(t, strings.Contains(got, "\x00"))
 }

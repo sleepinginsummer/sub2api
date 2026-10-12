@@ -42,15 +42,14 @@ func TestGatewayPoolUsageClosedCycleFreezesAndSameTicketCanStartNewCycle(t *test
 	state.note("luna", "v", at, true)
 	state.Rounds[0].syncActiveUsage([]gatewayPoolActiveUseEvent{
 		{roundID: state.Rounds[0].ID, ticket: "v", start: at, end: at.Add(time.Minute)},
-	}, "session", at.Add(time.Minute))
+	}, at.Add(time.Minute))
 	state.end(at.Add(time.Minute))
-	view := state.Rounds[0].fullUsageView("session", at.Add(time.Hour))
+	view := state.Rounds[0].fullUsageView(at.Add(time.Hour))
 	require.EqualValues(t, 60000, view.FullDurationMS)
-	require.Empty(t, view.FullActiveUntil)
 	require.True(t, state.note("luna", "v", at.Add(2*time.Minute), true))
 	state.Rounds[1].syncActiveUsage([]gatewayPoolActiveUseEvent{{
 		roundID: state.Rounds[1].ID, ticket: "v", start: at.Add(2 * time.Minute), end: at.Add(2*time.Minute + time.Second),
-	}}, "session", at.Add(2*time.Minute+time.Second))
+	}}, at.Add(2*time.Minute+time.Second))
 	require.Len(t, state.Rounds, 2)
 	require.EqualValues(t, 60000, state.Rounds[0].ActiveUsage.duration(at.Add(time.Hour)))
 	require.EqualValues(t, 1000, state.Rounds[1].ActiveUsage.duration(at.Add(2*time.Minute+time.Second)))
@@ -65,7 +64,7 @@ func TestGatewayPoolUsageArchivesWithoutLosingTotals(t *testing.T) {
 		round := &state.Rounds[len(state.Rounds)-1]
 		round.syncActiveUsage([]gatewayPoolActiveUseEvent{
 			{roundID: round.ID, ticket: fmt.Sprint(i), start: start, end: start.Add(20 * time.Second)},
-		}, "offline", start.Add(20*time.Second))
+		}, start.Add(20*time.Second))
 		state.end(start.Add(time.Minute))
 		state.prune()
 	}
@@ -73,17 +72,15 @@ func TestGatewayPoolUsageArchivesWithoutLosingTotals(t *testing.T) {
 	require.EqualValues(t, 3, state.Archived[gatewayPoolUsageSharedModel].Rounds)
 	require.EqualValues(t, 3, state.Archived[gatewayPoolUsageSharedModel].Attempted)
 	require.EqualValues(t, 3, state.Archived[gatewayPoolUsageSharedModel].Full)
-	require.Zero(t, state.Archived[gatewayPoolUsageSharedModel].DurationMS, "new cycles cannot write legacy held duration")
 	require.NotNil(t, state.Archived[gatewayPoolUsageSharedModel].ActiveDurationMS)
-	require.EqualValues(t, 60000, *state.Archived[gatewayPoolUsageSharedModel].ActiveDurationMS,
-		"archive new activity separately; do not overwrite legacy lifetime")
+	require.EqualValues(t, 60000, *state.Archived[gatewayPoolUsageSharedModel].ActiveDurationMS)
 }
 
 func TestGatewayPoolUsageConcurrentDedupPersistsAcrossRestart(t *testing.T) {
 	account := gwpoolTestAccount(1)
 	svc, repo := gatewayRuntimeService(account)
 	applied := OpenAIGatewayPoolApplied{AccountID: 1, Gateway: "g", Version: "v"}
-	identity := openAIGatewayPoolCacheKey(account, openAIGatewayPoolAccountKey(account))
+	identity := openAIGatewayPoolAccountKey(account)
 	at := time.Now().UTC()
 	var done sync.WaitGroup
 	for i := 0; i < 24; i++ {
@@ -94,15 +91,15 @@ func TestGatewayPoolUsageConcurrentDedupPersistsAcrossRestart(t *testing.T) {
 		}()
 	}
 	done.Wait()
-	fresh, _ := repo.GetByID(context.Background(), 1)
-	state := readGatewayPoolUsage(fresh, gatewayPoolUsageTag(identity))
+	fresh, _ := repo.stored(1)
+	state := readGatewayPoolUsage(fresh, gatewayPoolLedgerTag(identity))
 	require.Len(t, state.Rounds, 1)
 	require.Equal(t, 1, state.Rounds[0].Attempted)
 	require.Equal(t, 1, state.Rounds[0].Full)
 	restarted := &OpenAIGatewayService{accountRepo: repo}
 	restarted.noteGatewayPoolUsage(context.Background(), account, identity, "gpt-6-luna", applied, at.Add(time.Second), true)
-	fresh, _ = repo.GetByID(context.Background(), 1)
-	state = readGatewayPoolUsage(fresh, gatewayPoolUsageTag(identity))
+	fresh, _ = repo.stored(1)
+	state = readGatewayPoolUsage(fresh, gatewayPoolLedgerTag(identity))
 	require.Len(t, state.Rounds, 1)
 	require.Equal(t, 1, state.Rounds[0].Attempted)
 }
@@ -110,14 +107,14 @@ func TestGatewayPoolUsageConcurrentDedupPersistsAcrossRestart(t *testing.T) {
 func TestGatewayPoolUsageWriteFailureRemainsRetryable(t *testing.T) {
 	account := gwpoolTestAccount(1)
 	svc, repo := gatewayRuntimeService(account)
-	identity := openAIGatewayPoolCacheKey(account, openAIGatewayPoolAccountKey(account))
+	identity := openAIGatewayPoolAccountKey(account)
 	applied := OpenAIGatewayPoolApplied{AccountID: 1, Gateway: "g", Version: "v"}
 	repo.fail = true
 	svc.noteGatewayPoolUsage(context.Background(), account, identity, "gpt-6-luna", applied, time.Now(), true)
 	repo.fail = false
 	svc.noteGatewayPoolUsage(context.Background(), account, identity, "gpt-6-luna", applied, time.Now(), true)
-	fresh, _ := repo.GetByID(context.Background(), 1)
-	state := readGatewayPoolUsage(fresh, gatewayPoolUsageTag(identity))
+	fresh, _ := repo.stored(1)
+	state := readGatewayPoolUsage(fresh, gatewayPoolLedgerTag(identity))
 	require.Len(t, state.Rounds, 1)
 }
 
@@ -142,7 +139,7 @@ func TestGatewayPoolUsagePersistsWhileFirstResponseStillPending(t *testing.T) {
 	request, err := http.NewRequest(http.MethodPost, gwpoolTestURL, nil)
 	require.NoError(t, err)
 	applied := OpenAIGatewayPoolApplied{AccountID: 1, Gateway: "g", Version: "v"}
-	identity := openAIGatewayPoolCacheKey(account, openAIGatewayPoolAccountKey(account))
+	identity := openAIGatewayPoolAccountKey(account)
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -151,8 +148,8 @@ func TestGatewayPoolUsagePersistsWhileFirstResponseStillPending(t *testing.T) {
 		})
 	}()
 	<-upstream.written
-	fresh, _ := repo.GetByID(context.Background(), 1)
-	state := readGatewayPoolUsage(fresh, gatewayPoolUsageTag(identity))
+	fresh, _ := repo.stored(1)
+	state := readGatewayPoolUsage(fresh, gatewayPoolLedgerTag(identity))
 	close(upstream.release)
 	<-done
 	require.Len(t, state.Rounds, 1, "attempt is durable before response completion")
@@ -178,13 +175,13 @@ func TestGatewayPoolRuntimeViewOnlyShowsLiveExactModelProofWithoutPoolIO(t *test
 	fake := newGwpoolFakePool(t, "", 150)
 	account := fake.account(1)
 	svc, _ := gatewayRuntimeService(account)
-	identity := openAIGatewayPoolCacheKey(account, openAIGatewayPoolAccountKey(account))
-	pair := openAIGatewayPoolPair{cookie: "secret-cookie", gateway: "g", version: "v", until: time.Now().Add(time.Minute)}
+	identity := openAIGatewayPoolAccountKey(account)
+	pair := openAIGatewayPoolPair{cookie: "secret-cookie", gateway: "g", version: "v"}
 	svc.codexCookies.poolPairs.Store(identity, pair)
 	svc.codexCookies.gatewayPoolMarkVerifiedFull(identity, "v", "gpt-6-luna")
 	svc.noteGatewayPoolUsage(context.Background(), account, identity, "gpt-6-luna",
 		OpenAIGatewayPoolApplied{AccountID: 1, Gateway: "g", Version: "v"}, time.Now(), true)
-	snapshot, err := svc.GatewayPoolRuntimeProgress(context.Background(), []int64{1})
+	snapshot, err := svc.GatewayPoolRuntimeProgress(context.Background(), []int64{1}, true)
 	require.NoError(t, err)
 	require.Equal(t, "idle", snapshot[1].Phase)
 	require.Equal(t, []string{"gpt-6-luna"}, snapshot[1].Runtime.Tickets[0].VerifiedModels)
@@ -194,7 +191,7 @@ func TestGatewayPoolRuntimeViewOnlyShowsLiveExactModelProofWithoutPoolIO(t *test
 	require.Nil(t, snapshot[1].Runtime.Rounds[0].Tickets)
 	pair.routeExpiresAt = time.Now().Add(-time.Second)
 	svc.codexCookies.poolPairs.Store(identity, pair)
-	snapshot, err = svc.GatewayPoolRuntimeProgress(context.Background(), []int64{1})
+	snapshot, err = svc.GatewayPoolRuntimeProgress(context.Background(), []int64{1}, true)
 	require.NoError(t, err)
 	require.Empty(t, snapshot[1].Runtime.Tickets)
 	require.Zero(t, fake.hits.Load())
@@ -205,12 +202,12 @@ func TestGatewayPoolUsageEndsOnlyOnStableFreshZeroInventory(t *testing.T) {
 	fake := newGwpoolFakePool(t, "", 150)
 	account := fake.account(1)
 	svc, repo := gatewayRuntimeService(account)
-	identity := openAIGatewayPoolCacheKey(account, openAIGatewayPoolAccountKey(account))
+	identity := openAIGatewayPoolAccountKey(account)
 	svc.noteGatewayPoolUsage(context.Background(), account, identity, "gpt-6-luna",
 		OpenAIGatewayPoolApplied{AccountID: 1, Gateway: "g", Version: "v"}, time.Now().Add(-time.Minute), false)
 	ended := func() bool {
-		fresh, _ := repo.GetByID(context.Background(), 1)
-		state := readGatewayPoolUsage(fresh, gatewayPoolUsageTag(identity))
+		fresh, _ := repo.stored(1)
+		state := readGatewayPoolUsage(fresh, gatewayPoolLedgerTag(identity))
 		return !state.Rounds[0].EndedAt.IsZero()
 	}
 	finish := svc.codexCookies.gatewayPoolInventoryOperation(identity)
@@ -218,7 +215,7 @@ func TestGatewayPoolUsageEndsOnlyOnStableFreshZeroInventory(t *testing.T) {
 	require.False(t, ended())
 	require.Zero(t, fake.listHits.Load())
 	finish()
-	svc.codexCookies.poolPairs.Store(identity, openAIGatewayPoolPair{cookie: "offline", gateway: "g", version: "v", until: time.Now().Add(time.Minute)})
+	svc.codexCookies.poolPairs.Store(identity, openAIGatewayPoolPair{cookie: "offline", gateway: "g", version: "v"})
 	svc.finishGatewayPoolUsageIfExhausted(context.Background(), account)
 	require.False(t, ended())
 	svc.codexCookies.poolPairs.Delete(identity)
@@ -241,13 +238,13 @@ func TestGatewayPoolUsageLegacyEarlySettingDoesNotHoldCycleOpen(t *testing.T) {
 	account.Status, account.Schedulable = StatusActive, true
 	account.Extra["openai_gwpool_early_probe_enabled"] = true
 	svc, repo := gatewayRuntimeService(account)
-	identity := openAIGatewayPoolCacheKey(account, openAIGatewayPoolAccountKey(account))
+	identity := openAIGatewayPoolAccountKey(account)
 	svc.codexCookies.gatewayPoolMarkUsed(identity, "unified-80")
 	svc.noteGatewayPoolUsage(context.Background(), account, identity, "luna",
 		OpenAIGatewayPoolApplied{AccountID: 1, Gateway: "old", Version: "old"}, time.Now().Add(-time.Minute), false)
 	svc.finishGatewayPoolUsageIfExhausted(context.Background(), account)
-	fresh, _ := repo.GetByID(context.Background(), 1)
-	state := readGatewayPoolUsage(fresh, gatewayPoolUsageTag(identity))
+	fresh, _ := repo.stored(1)
+	state := readGatewayPoolUsage(fresh, gatewayPoolLedgerTag(identity))
 	require.False(t, state.Rounds[0].EndedAt.IsZero())
 	require.Nil(t, fresh.Extra["openai_gwpool_early_probe_state"], "settlement never creates an early probe budget")
 	require.Zero(t, fake.hits.Load())
@@ -270,7 +267,7 @@ func TestGatewayPoolUsageAbandonedFetchSettlesAfterStrictZero(t *testing.T) {
 	account := fake.account(1)
 	svc, repo := gatewayRuntimeService(account)
 	svc.codexCookies.poolUsageFinished = svc.finishGatewayPoolUsageIfExhausted
-	identity := openAIGatewayPoolCacheKey(account, openAIGatewayPoolAccountKey(account))
+	identity := openAIGatewayPoolAccountKey(account)
 	svc.noteGatewayPoolUsage(context.Background(), account, identity, gatewayPoolProbeModelLuna,
 		OpenAIGatewayPoolApplied{AccountID: 1, Gateway: "old", Version: "old"}, time.Now().Add(-time.Minute), false)
 	started, release := make(chan struct{}), make(chan struct{})
@@ -289,15 +286,15 @@ func TestGatewayPoolUsageAbandonedFetchSettlesAfterStrictZero(t *testing.T) {
 	// The canceled fetch may already have left the inventory operation. Its
 	// cleanup must still wait for a fresh successful directory before ending
 	// usage; whether its goroutine has exited is not a business invariant.
-	before, err := repo.GetByID(context.Background(), 1)
+	before, err := repo.stored(1)
 	require.NoError(t, err)
-	state := readGatewayPoolUsage(before, gatewayPoolUsageTag(identity))
+	state := readGatewayPoolUsage(before, gatewayPoolLedgerTag(identity))
 	require.Len(t, state.Rounds, 1)
 	require.True(t, state.Rounds[0].EndedAt.IsZero(), "cancellation alone is not confirmed exhaustion")
 	releaseOnce.Do(func() { close(release) })
 	require.Eventually(t, func() bool {
-		fresh, _ := repo.GetByID(context.Background(), 1)
-		state := readGatewayPoolUsage(fresh, gatewayPoolUsageTag(identity))
+		fresh, _ := repo.stored(1)
+		state := readGatewayPoolUsage(fresh, gatewayPoolLedgerTag(identity))
 		return len(state.Rounds) == 1 && !state.Rounds[0].EndedAt.IsZero()
 	}, time.Second, time.Millisecond, "the abandoned fetch's final zero must close the round without another business request")
 }

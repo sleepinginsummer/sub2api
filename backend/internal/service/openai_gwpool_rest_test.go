@@ -15,12 +15,11 @@ func TestGatewayPoolRotationThresholdCountsInFlightAndKeepsVerifiedWindow(t *tes
 	account.Extra[openAIGatewayPoolGuardEnabledExtraKey] = false // legacy unguarded threshold policy
 	account.Extra[openAIGatewayPoolRotationMinGatewaysExtraKey] = 2
 	fake.configure(account)
-	gwpoolTestIdentity := openAIGatewayPoolCacheKey(account, gwpoolTestIdentity)
 	svc := rotationService(account)
 	require.False(t, svc.gatewayPoolNoRemainingRoutes(context.Background(), account), "one candidate remains despite the retired stop threshold")
 	fake.listGateways = []gwpoolFakeGateway{}
 	require.True(t, svc.gatewayPoolNoRemainingRoutes(context.Background(), account))
-	current := openAIGatewayPoolPair{gateway: "unified-143", version: "current", cookie: "offline", until: time.Now().Add(2 * time.Minute)}
+	current := openAIGatewayPoolPair{gateway: "unified-143", version: "current", cookie: "offline"}
 	finish := svc.codexCookies.gatewayPoolInventoryOperation(gwpoolTestIdentity)
 	require.False(t, svc.gatewayPoolNoRemainingRoutes(context.Background(), account), "in-flight work is not exhaustion")
 	finish()
@@ -52,7 +51,7 @@ func TestGatewayPoolRestDoesNotShortenOtherBlockOrDisableAccount(t *testing.T) {
 	account.TempUnschedulableUntil = &later
 	account.TempUnschedulableReason = "auth"
 	svc := rotationService(account)
-	svc.restGatewayPoolAccount(context.Background(), account, gwpoolTestIdentity, 7)
+	require.NoError(t, svc.restGatewayPoolAccount(context.Background(), account, gwpoolTestIdentity, 7))
 	fresh, err := svc.accountRepo.GetByID(context.Background(), account.ID)
 	require.NoError(t, err)
 	require.Equal(t, later, *fresh.TempUnschedulableUntil)

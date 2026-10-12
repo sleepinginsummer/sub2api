@@ -41,16 +41,16 @@ func TestGatewayPoolNewSessionsFillPrimaryBeforeStandby(t *testing.T) {
 				a.ID: {AccountID: a.ID, CurrentConcurrency: 10, LoadRate: 100},
 				b.ID: {AccountID: b.ID, CurrentConcurrency: 0, LoadRate: 0},
 			}}
-			svc := &OpenAIGatewayService{
+			svc := withGatewayPoolRowRead(&OpenAIGatewayService{
 				accountRepo: gatewayRotationRepo{schedulerTestOpenAIAccountRepo{accounts: []Account{*a, *b}}},
 				cache:       &schedulerTestGatewayCache{}, cfg: cfg,
 				concurrencyService: NewConcurrencyService(cache),
 				rateLimitService:   gatewayPoolSchedulerTestSettings(mode),
-			}
-			identity := openAIGatewayPoolCacheKey(a, openAIGatewayPoolAccountKey(a))
-			svc.codexCookies.poolRounds.claim(group, identity)
+			})
+			identity := openAIGatewayPoolAccountKey(a)
+			svc.codexCookies.poolRounds.claim(group, identity, gatewayPoolActiveAccountsDefault)
 			svc.codexCookies.poolPairs.Store(identity, openAIGatewayPoolPair{
-				cookie: "offline", gateway: "unified-200", version: "full", until: time.Now().Add(time.Minute),
+				cookie: "offline", gateway: "unified-200", version: "full",
 			})
 			svc.codexCookies.gatewayPoolMarkVerifiedFull(identity, "full")
 			selection, _, err := svc.SelectAccountWithSchedulerForCapability(gatewayPoolTestGroupContext(group, 2), &group, "", "", "gpt-6-astra", nil,
@@ -120,12 +120,12 @@ func TestGatewayPoolFiftyRequestsStayInsideTwoActiveAccounts(t *testing.T) {
 			cfg := &config.Config{}
 			cfg.Gateway.OpenAIWS.LBTopK = 1
 			cfg.Gateway.Scheduling.LoadBatchEnabled = mode == "load-batch"
-			svc := &OpenAIGatewayService{
+			svc := withGatewayPoolRowRead(&OpenAIGatewayService{
 				accountRepo: gatewayRotationRepo{schedulerTestOpenAIAccountRepo{accounts: accounts}},
 				cache:       &schedulerTestGatewayCache{sessionBindings: map[string]int64{"openai:old-clone": clone.ID}},
 				cfg:         cfg, concurrencyService: NewConcurrencyService(slots),
 				rateLimitService: gatewayPoolSchedulerTestSettings(mode),
-			}
+			})
 			var releases []func()
 			defer func() {
 				for _, release := range releases {
@@ -160,7 +160,7 @@ func TestGatewayPoolFiftyRequestsStayInsideTwoActiveAccounts(t *testing.T) {
 			require.Equal(t, clone.ID, sticky.Account.ID, "deduplication must not move an old clone-bound session")
 			require.NotNil(t, sticky.ReleaseFunc)
 			releases = append(releases, sticky.ReleaseFunc)
-			svc.codexCookies.poolRounds.rest(group, openAIGatewayPoolCacheKey(&accounts[0], openAIGatewayPoolAccountKey(&accounts[0])), time.Now().Add(time.Minute))
+			svc.codexCookies.poolRounds.rest(group, openAIGatewayPoolAccountKey(&accounts[0]), time.Now().Add(time.Minute))
 			releases[10]()
 			releases[10] = func() {}
 			selection, _, err := svc.SelectAccountWithSchedulerForCapability(gatewayPoolTestGroupContext(group, 2), &group, "", "", "gpt-6-astra", nil,
@@ -186,14 +186,14 @@ func TestGatewayPool429OnlyDeprioritizesNewSessions(t *testing.T) {
 	fake.listGateways = []gwpoolFakeGateway{{Name: "unified-300", PairReady: true}}
 	fake.configure(a, b)
 	a.Concurrency, b.Concurrency = 100, 100
-	svc := &OpenAIGatewayService{
+	svc := withGatewayPoolRowRead(&OpenAIGatewayService{
 		accountRepo: gatewayRotationRepo{schedulerTestOpenAIAccountRepo{accounts: []Account{*a, *b}}},
 		cfg:         &config.Config{}, cache: &schedulerTestGatewayCache{sessionBindings: map[string]int64{"openai:old": a.ID}},
 		concurrencyService: NewConcurrencyService(schedulerTestConcurrencyCache{loadMap: map[int64]*AccountLoadInfo{
 			a.ID: {AccountID: a.ID}, b.ID: {AccountID: b.ID, LoadRate: 20, CurrentConcurrency: 20},
 		}}),
 		rateLimitService: gatewayPoolSchedulerTestSettings("legacy"),
-	}
+	})
 	start := time.Now()
 	svc.openaiOAuth429RetryStartedAt.Store(a.ID, start)
 	for session, want := range map[string]int64{"": b.ID, "old": a.ID} {
@@ -226,12 +226,12 @@ func TestGatewayPoolOldSessionOutsideActiveLimitKeepsAccount(t *testing.T) {
 					cfg := &config.Config{}
 					cfg.Gateway.Scheduling.LoadBatchEnabled = mode == "load-batch"
 					slots := &gatewayPoolCountingSlots{counts: map[int64]int{}}
-					svc := &OpenAIGatewayService{
+					svc := withGatewayPoolRowRead(&OpenAIGatewayService{
 						accountRepo: gatewayRotationRepo{schedulerTestOpenAIAccountRepo{accounts: []Account{*a, *b}}},
 						cache:       &schedulerTestGatewayCache{sessionBindings: map[string]int64{"openai:old-b": b.ID}},
 						cfg:         cfg, concurrencyService: NewConcurrencyService(slots),
 						rateLimitService: gatewayPoolSchedulerTestSettings(mode),
-					}
+					})
 					if !restarted {
 						require.True(t, svc.codexCookies.poolRounds.claim(group, openAIGatewayPoolAccountKey(a), 2))
 						require.True(t, svc.codexCookies.poolRounds.claim(group, openAIGatewayPoolAccountKey(b), 2))
@@ -285,12 +285,12 @@ func TestGatewayPoolDifferentGroupsUseDifferentActiveLimits(t *testing.T) {
 			cfg.Gateway.Scheduling.LoadBatchEnabled = mode == "load-batch"
 			cfg.Gateway.OpenAIWS.LBTopK = 1
 			slots := &gatewayPoolCountingSlots{counts: map[int64]int{}}
-			svc := &OpenAIGatewayService{
+			svc := withGatewayPoolRowRead(&OpenAIGatewayService{
 				accountRepo: gatewayRotationRepo{schedulerTestOpenAIAccountRepo{accounts: accounts}},
 				cfg:         cfg, cache: &schedulerTestGatewayCache{},
 				concurrencyService: NewConcurrencyService(slots),
 				rateLimitService:   gatewayPoolSchedulerTestSettings(mode),
-			}
+			})
 			settings, ok := svc.rateLimitService.settingService.settingRepo.(*openAIAdvancedSchedulerSettingRepoStub)
 			require.True(t, ok)
 			settings.values[SettingKeyOpenAIGatewayPoolActiveAccounts] = "64"

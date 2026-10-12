@@ -57,7 +57,6 @@ func gatewayPoolIdentityFailure(err error) bool {
 func (s *OpenAIGatewayService) gatewayPoolWarmUpWith(
 	request *http.Request, account *Account, identity, model string, shoot gatewayPoolWarmShooter,
 ) error {
-	identity = openAIGatewayPoolCacheKey(account, identity)
 	ctx := s.gatewayPoolWaitContext(request.Context(), account)
 	wait := gatewayPoolWaitFrom(ctx)
 	if wait == nil {

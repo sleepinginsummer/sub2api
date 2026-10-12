@@ -10,8 +10,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"github.com/Wei-Shaw/sub2api/internal/pkg/chatgptcookies"
 )
 
 func (s *OpenAIGatewayService) SetPluginManager(manager *PluginManager) {
@@ -30,7 +28,7 @@ func (s *OpenAIGatewayService) doOpenAIUpstreamAttempt(request *http.Request, pr
 			return nil, failure
 		}
 	}
-	if request != nil && request.URL != nil && chatgptcookies.IsChatGPTURL(request.URL) && request.URL.Path == openAIGatewayPoolInferencePath {
+	if request != nil && gatewayPoolInferenceURL(request.URL) {
 		if allowed, err := s.gatewayPoolResumeAllowed(request.Context(), account, true); err != nil || !allowed {
 			return nil, gatewayPoolRestError()
 		}
@@ -92,20 +90,9 @@ func (s *OpenAIGatewayService) doOpenAIUpstreamOnce(
 	if request != nil && request.URL != nil {
 		rawURL = request.URL.String()
 	}
-	// 每个实际 HTTP 请求单独收集并冻结票据，父上下文只继承模型及成对供给数。
-	parentSink := openAIGatewayPoolSinkFrom(request.Context())
-	requestCtx, poolSink := withOpenAIGatewayPoolSink(request.Context(), nil)
-	poolSink.noteModel(parentSink.modelOf())
-	parentApplied := parentSink.snapshot()
-	poolSink.notePoolCounts(parentApplied.PoolLive, parentApplied.PoolFree)
-	request = request.WithContext(requestCtx)
 	release, err := s.attachGatewayPoolRouteWithWait(request.Context(), account, rawURL, request.Header)
 	if err != nil {
 		return nil, false, err
-	}
-	if applied := poolSink.snapshot(); applied.Cookie != "" {
-		parentSink.mark(applied)
-		request = request.WithContext(context.WithValue(request.Context(), openAIGatewayPoolRoutePairContextKey{}, applied))
 	}
 	// 取到票之后、真正发出去之前，这一发还可能死在三处：客户端已经走了（ctx 取消）、
 	// 上游主机校验否掉、取 HTTP 客户端/并发槽失败。它们都在 httpUpstream.Do 进 http.Client
@@ -115,8 +102,7 @@ func (s *OpenAIGatewayService) doOpenAIUpstreamOnce(
 		return nil, false, ctxErr
 	}
 	applied := openAIGatewayPoolSinkFrom(request.Context()).snapshot()
-	poolRequest := s.codexCookies.gatewayPoolTakeover(account) && request.URL != nil &&
-		chatgptcookies.IsChatGPTURL(request.URL) && request.URL.Path == openAIGatewayPoolInferencePath
+	poolRequest := s.codexCookies.gatewayPoolTakeover(account) && gatewayPoolInferenceURL(request.URL)
 	var identity string
 	var identityErr error
 	if poolRequest && applied.AccountID == account.ID && applied.Version != "" {
@@ -152,7 +138,7 @@ func (s *OpenAIGatewayService) doOpenAIUpstreamOnce(
 		}
 	})
 	if !sentAt.IsZero() {
-		s.codexCookies.gatewayPoolMarkSent(openAIGatewayPoolCacheKey(account, identity), applied.Version, sentAt)
+		s.codexCookies.gatewayPoolMarkSent(identity, applied.Version, sentAt)
 	}
 	if err == nil && resp != nil {
 		var degraded bool
@@ -166,16 +152,6 @@ func (s *OpenAIGatewayService) doOpenAIUpstreamOnce(
 				_ = resp.Body.Close()
 			}
 			return nil, false, verifyErr
-		}
-		// 判据和接触记录完成后冻结本次 HTTP 响应，后续共享 sink 不能改写归因。
-		if applied := poolSink.snapshot(); applied.Cookie != "" {
-			parentSink.mark(applied)
-			parentSink.notePoolCounts(applied.PoolLive, applied.PoolFree)
-			parentSink.noteFullHeld(applied, time.Duration(applied.FullHeldMs)*time.Millisecond)
-			if resp.Request == nil {
-				resp.Request = request
-			}
-			resp.Request = resp.Request.WithContext(context.WithValue(resp.Request.Context(), openAIGatewayPoolRoutePairContextKey{}, applied))
 		}
 		if degraded {
 			return resp, true, nil

@@ -10,18 +10,23 @@ import (
 )
 
 func TestGatewayPoolFailedProbeRetiresTicketAndContinues(t *testing.T) {
-	svc, repo, fake, account, request, _ := ticketWaitFixture(t)
+	svc, repo, fake, account, request, wait := ticketWaitFixture(t)
 	repo.account = *account
 	fake.forceCookie = gwpoolTestPairCookie(t, "unified-84")
+	sleeps := 0
+	wait.sleep = func(context.Context, time.Duration) error { sleeps++; return nil }
+	// 142 两轮都在 B 超时：等一次、重验同一张票，第二次还超时才退休换 84。
 	shooter := &gwpoolWarmShooter{replies: []gwpoolWarmReply{
-		{status: http.StatusOK, minted: "state"},
-		{err: context.DeadlineExceeded},
+		{status: http.StatusOK, minted: "state"}, {err: context.DeadlineExceeded},
+		{status: http.StatusOK, minted: "state"}, {err: context.DeadlineExceeded},
 	}}
 
 	err := svc.gatewayPoolWarmUpWith(request, account, gwpoolTestIdentity, gwpoolWarmModel, shooter.shoot)
 	require.NoError(t, err, "an exhausted failed ticket must not end preparation while other candidates exist")
-	require.Len(t, shooter.shots, 4)
-	require.Equal(t, "unified-84", openAICodexRouteGateway(shooter.shots[2].cookie))
+	require.Equal(t, 1, sleeps)
+	require.Len(t, shooter.shots, 6)
+	require.Equal(t, "unified-142", openAICodexRouteGateway(shooter.shots[2].cookie), "重验的是同一张票")
+	require.Equal(t, "unified-84", openAICodexRouteGateway(shooter.shots[4].cookie))
 	_, cooling := svc.codexCookies.gatewayPoolUsedAt(gwpoolTestIdentity, "unified-142",
 		account.gatewayPoolGatewayWindow())
 	require.True(t, cooling)
@@ -37,30 +42,38 @@ func TestGatewayPoolFailedProbeRetiresTicketAndContinues(t *testing.T) {
 	require.Zero(t, svc.GatewayPoolProgress([]int64{account.ID})[account.ID].Rejected)
 }
 
-func TestGatewayPoolFailedProbeHonorsRecoveryThenMovesOn(t *testing.T) {
-	for _, retries := range []int{0, 1} {
-		t.Run(string(rune('0'+retries)), func(t *testing.T) {
-			svc, repo, fake, account, request, wait := ticketWaitFixture(t)
-			account.Extra[openAIGatewayPoolRecoveryExtraKey] = retries
-			repo.account = *account
-			fake.cookieForHit = func(hit int64) string {
-				if hit == 1 {
-					return gwpoolTestPairCookie(t, "unified-142")
-				}
-				return gwpoolTestPairCookie(t, "unified-84")
-			}
-			sleeps := 0
-			wait.sleep = func(context.Context, time.Duration) error { sleeps++; return nil }
-			shooter := &gwpoolWarmShooter{}
-			for i := 0; i <= retries; i++ {
-				shooter.replies = append(shooter.replies, gwpoolWarmReply{status: http.StatusOK}) // no state
-			}
-			require.NoError(t, svc.gatewayPoolWarmUpWith(request, account, gwpoolTestIdentity, gwpoolWarmModel, shooter.shoot))
-			require.Equal(t, retries, sleeps)
-			require.Len(t, shooter.shots, retries+3)
-			require.Equal(t, "unified-84", openAICodexRouteGateway(shooter.shots[retries+1].cookie))
-		})
+// 准备阶段与业务阶段同一条规则（gatewayPoolTransientAttemptsPerTicket）：送达过的票临时
+// 失败，等一次在同一张票上重验，第二次还失败才退休换票。
+func TestGatewayPoolFailedProbeRetriesTheTicketOnceThenMovesOn(t *testing.T) {
+	svc, _, fake, account, request, wait := ticketWaitFixture(t)
+	fake.cookieForHit = func(hit int64) string {
+		if hit == 1 {
+			return gwpoolTestPairCookie(t, "unified-142")
+		}
+		return gwpoolTestPairCookie(t, "unified-84")
 	}
+	sleeps := 0
+	wait.sleep = func(context.Context, time.Duration) error { sleeps++; return nil }
+	shooter := &gwpoolWarmShooter{replies: []gwpoolWarmReply{{status: http.StatusOK}, {status: http.StatusOK}}} // no state
+	require.NoError(t, svc.gatewayPoolWarmUpWith(request, account, gwpoolTestIdentity, gwpoolWarmModel, shooter.shoot))
+	require.Equal(t, 1, sleeps)
+	require.Len(t, shooter.shots, 4)
+	require.Equal(t, "unified-142", openAICodexRouteGateway(shooter.shots[1].cookie), "重验的是同一张票")
+	require.Equal(t, "unified-84", openAICodexRouteGateway(shooter.shots[2].cookie))
+}
+
+// 重验与退休同一组可恢复错误：送达后被取消不是临时故障，照旧直接结束准备。
+func TestGatewayPoolCanceledProbeIsNotRetried(t *testing.T) {
+	svc, _, _, account, request, wait := ticketWaitFixture(t)
+	sleeps := 0
+	wait.sleep = func(context.Context, time.Duration) error { sleeps++; return nil }
+	shooter := &gwpoolWarmShooter{replies: []gwpoolWarmReply{
+		{status: http.StatusOK, minted: "state"}, {err: context.Canceled},
+	}}
+	err := svc.gatewayPoolWarmUpWith(request, account, gwpoolTestIdentity, gwpoolWarmModel, shooter.shoot)
+	require.ErrorIs(t, err, errOpenAIGatewayPoolWarmUnverified)
+	require.Zero(t, sleeps)
+	require.Len(t, shooter.shots, 2)
 }
 
 func TestGatewayPoolFailedProbeProtectsNewTicketAndClearGeneration(t *testing.T) {
@@ -85,7 +98,9 @@ func TestGatewayPoolFailedProbeProtectsNewTicketAndClearGeneration(t *testing.T)
 }
 
 func TestGatewayPoolFailedProbeBeforeResponseStillCoolsLocally(t *testing.T) {
-	svc, repo, fake, account, request, _ := ticketWaitFixture(t)
+	svc, repo, fake, account, request, wait := ticketWaitFixture(t)
+	sleeps := 0
+	wait.sleep = func(context.Context, time.Duration) error { sleeps++; return nil }
 	fake.cookieForHit = func(hit int64) string {
 		if hit == 1 {
 			return gwpoolTestPairCookie(t, "unified-142")
@@ -95,6 +110,7 @@ func TestGatewayPoolFailedProbeBeforeResponseStillCoolsLocally(t *testing.T) {
 	shooter := &gwpoolWarmShooter{replies: []gwpoolWarmReply{{err: context.DeadlineExceeded}}}
 	require.NoError(t, svc.gatewayPoolWarmUpWith(request, account, gwpoolTestIdentity, gwpoolWarmModel, shooter.shoot))
 	require.Len(t, shooter.shots, 3)
+	require.Zero(t, sleeps, "没送达的票已在本地清掉，不等也不重验")
 	require.Zero(t, fake.releaseHits.Load(), "unsent retirement is local only")
 	_, cooling := svc.codexCookies.gatewayPoolUsedAt(gwpoolTestIdentity, "unified-142", account.gatewayPoolGatewayWindow())
 	require.True(t, cooling)

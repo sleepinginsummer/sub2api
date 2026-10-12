@@ -143,14 +143,12 @@ func (s *OpenAIGatewayService) ForwardAlphaSearch(
 		return nil, nil
 	}
 	return &OpenAIForwardResult{
-		RequestID:            strings.TrimSpace(resp.Header.Get("x-request-id")),
-		UpstreamHeaders:      resp.Header,
-		GatewayPoolRoutePair: openAIGatewayPoolRoutePairFromResponse(resp),
-		GatewayPoolApplied:   openAIGatewayPoolAppliedFromResponse(resp),
-		Model:                requestedModel,
-		UpstreamModel:        upstreamModel,
-		Duration:             time.Since(upstreamStart),
-		WebSearchCalls:       1,
+		RequestID:       strings.TrimSpace(resp.Header.Get("x-request-id")),
+		UpstreamHeaders: resp.Header,
+		Model:           requestedModel,
+		UpstreamModel:   upstreamModel,
+		Duration:        time.Since(upstreamStart),
+		WebSearchCalls:  1,
 	}, nil
 }
 
@@ -229,16 +227,14 @@ func (s *OpenAIGatewayService) forwardAlphaSearchViaResponsesWebSearch(
 	}
 	c.Data(http.StatusOK, "application/json", alphaRespBody)
 	return &OpenAIForwardResult{
-		RequestID:            strings.TrimSpace(resp.Header.Get("x-request-id")),
-		UpstreamHeaders:      resp.Header,
-		GatewayPoolRoutePair: openAIGatewayPoolRoutePairFromResponse(resp),
-		GatewayPoolApplied:   openAIGatewayPoolAppliedFromResponse(resp),
-		Model:                requestedModel,
-		UpstreamModel:        upstreamModel,
-		UpstreamEndpoint:     "/v1/responses",
-		ResponseHeaders:      resp.Header.Clone(),
-		Duration:             time.Since(upstreamStart),
-		WebSearchCalls:       1,
+		RequestID:        strings.TrimSpace(resp.Header.Get("x-request-id")),
+		UpstreamHeaders:  resp.Header,
+		Model:            requestedModel,
+		UpstreamModel:    upstreamModel,
+		UpstreamEndpoint: "/v1/responses",
+		ResponseHeaders:  resp.Header.Clone(),
+		Duration:         time.Since(upstreamStart),
+		WebSearchCalls:   1,
 	}, nil
 }
 
@@ -791,11 +787,7 @@ func (s *OpenAIGatewayService) openAIAlphaSearchURL(account *Account) (string, e
 	case AccountTypeCPR:
 		// CPR 的路径带 /v1 前缀（POST /v1/alpha/search）。同样不设默认值：
 		// 回落到官方端点会把 client key 发给 OpenAI。
-		baseURL := account.GetCPRGatewayBaseURL()
-		if baseURL == "" {
-			return "", fmt.Errorf("cpr account requires credentials.base_url")
-		}
-		validatedURL, err := s.validateUpstreamBaseURL(baseURL)
+		validatedURL, err := s.validatedCPRBaseURL(account)
 		if err != nil {
 			return "", err
 		}

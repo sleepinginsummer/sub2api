@@ -16,11 +16,10 @@ func TestGatewayPoolVerifiedTicketNeverStartsBackgroundPreparation(t *testing.T)
 	account.Extra["openai_gwpool_prewarm"] = true // An old saved setting must be inert.
 	svc := &OpenAIGatewayService{}
 	now := time.Now()
-	svc.codexCookies.poolPairs.Store(openAIGatewayPoolCacheKey(account, gwpoolTestIdentity), openAIGatewayPoolPair{
+	svc.codexCookies.poolPairs.Store(gwpoolTestIdentity, openAIGatewayPoolPair{
 		cookie: "offline-cookie", gateway: "unified-142", version: "live",
-		until: now.Add(40 * time.Second), since: now.Add(-110 * time.Second),
 	})
-	svc.codexCookies.poolVerified.Store(openAIGatewayPoolCacheKey(account, gwpoolTestIdentity), gatewayPoolVerifiedMark{
+	svc.codexCookies.poolVerified.Store(gwpoolTestIdentity, gatewayPoolVerifiedMark{
 		version: "live", at: now.Add(-110 * time.Second),
 		models: &map[string]time.Time{"gpt-6-luna": now.Add(-110 * time.Second)},
 	})
@@ -33,5 +32,5 @@ func TestGatewayPoolVerifiedTicketNeverStartsBackgroundPreparation(t *testing.T)
 		t.Fatal("a live verified ticket must not fetch a background candidate")
 	case <-time.After(100 * time.Millisecond):
 	}
-	require.True(t, svc.codexCookies.gatewayPoolVerifiedFull(openAIGatewayPoolCacheKey(account, gwpoolTestIdentity)))
+	require.True(t, svc.codexCookies.gatewayPoolVerifiedFull(gwpoolTestIdentity))
 }

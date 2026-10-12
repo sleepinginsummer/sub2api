@@ -123,7 +123,7 @@ func (s *OpenAIGatewayService) routePairInUse(
 		return applied.Cookie, true, poolGateway, poolVersion
 	}
 	probe := http.Header{}
-	s.codexCookies.Attach(account, openAITurnStatePairCookieURL, probe)
+	s.codexCookies.Attach(account, chatgptCodexURL, probe)
 	return openAICodexRoutePairFromCookie(probe), false, "", ""
 }
 
@@ -159,20 +159,24 @@ func openAICodexRouteGateway(pair string) string {
 	return ""
 }
 
-// usageCodexRoutePairPtr / usageCodexRouteGatewayPtr：写进使用记录的两个读数，空值给 NULL。
-// 列是 TEXT：截断不切多字节字符，非法字节剔掉，否则整行 INSERT 被 PostgreSQL 拒绝。
-func usageCodexRoutePairPtr(pair string) *string {
-	pair = strings.TrimSpace(pair)
-	if pair == "" {
+// usageTextPtr 是用量表 TEXT 读数列的共用收边：空值给 nil（列保持 NULL）；按字节上限截断但不切开
+// 多字节字符，再剔掉非法字节——否则整行 INSERT 被 PostgreSQL 拒绝。是否 TrimSpace 由调用方决定。
+func usageTextPtr(s string, maxBytes int) *string {
+	if s == "" {
 		return nil
 	}
-	v := strings.ToValidUTF8(truncateUTF8(pair, maxUsageRoutePairLen), "")
+	v := strings.ToValidUTF8(truncateUTF8(s, maxBytes), "")
 	return &v
 }
 
+// usageCodexRoutePairPtr / usageCodexRouteGatewayPtr：写进使用记录的两个读数，空值给 NULL。
+func usageCodexRoutePairPtr(pair string) *string {
+	return usageTextPtr(strings.TrimSpace(pair), maxUsageRoutePairLen)
+}
+
 // usageCodexRoutePairOverriddenPtr 记录这一发出站的路由对是不是网关池下发的
-// （使用记录里那张小卡片的「已覆写」徽标）。与 usageCodexTurnStateOverriddenPtr 同口径：
-// 账号类型不适用时返回 nil（列保持 NULL），与「接管着但这一发没覆写」区分开。
+// （使用记录里那张小卡片的「已覆写」徽标）。账号类型不适用时返回 nil（列保持 NULL），
+// 与「接管着但这一发没覆写」区分开。
 //
 // 只记「覆写了没有」和两个网关名，**不记 cookie 本体是从哪来的**——pair 全文已经在
 // route_pair 列里，卡片不展示它。
@@ -183,21 +187,9 @@ func usageCodexRoutePairOverriddenPtr(account *Account, fromPool bool) *bool {
 	return &fromPool
 }
 
-// usageCodexRouteRegion 判这一发的落点能不能归到池子说的那个大区上。
-//
-// 只有「池子说的网关 == 这一发实际在用的网关」时才算：不一致说明上游把这一发改派走了
-// （见 routePairInUse），池子那个大区讲的是另一个网关的事，记上去会把落点归到错的大区，
-// 于是账号卡片上「这个号在哪个大区还有没烧过的落点」直接答错。宁可留空（显示未归类）。
-func usageCodexRouteRegion(poolGateway, inUseGateway, region string) string {
-	if !usageCodexRouteLandedOnPoolGateway(poolGateway, inUseGateway) {
-		return ""
-	}
-	return strings.TrimSpace(region)
-}
-
-// usageCodexRouteLandedOnPoolGateway 是上面那道判断本身。抽出来是因为 state-echo 的判定读数
-// （openAIGatewaySeen.Verdict）要用**同一个**谓词：判据问的也是池子那个网关，改派时同样不能
-// 把结论挂到实际落点上。两处各写一份的话只在「名字两边没有空白」时同义。
+// usageCodexRouteLandedOnPoolGateway 判这一发是否落在池子说的那个网关上：只有「池子说的网关 ==
+// 这一发实际在用的网关」才算，不一致说明上游把这一发改派走了（见 routePairInUse）。state-echo 的
+// 判定读数（openAIGatewaySeen.Verdict）用它：判据问的是池子那个网关，改派时不能把结论挂到实际落点上。
 func usageCodexRouteLandedOnPoolGateway(poolGateway, inUseGateway string) bool {
 	poolGateway = strings.TrimSpace(poolGateway)
 	return poolGateway != "" && poolGateway == strings.TrimSpace(inUseGateway)
@@ -210,30 +202,15 @@ func usageCodexRouteLandedOnPoolGateway(poolGateway, inUseGateway string) bool {
 // 那张 ⇒ **没有观测到落点**，不是「注入被接受」的确认。健康请求本来就一个 cookie 都不回，
 // 所以那条「相同即接受」的读法恒为真、无法证伪（见 UsageLog.RouteGateway）。
 func usageCodexRoutePairPoolGatewayPtr(gateway string) *string {
-	gateway = strings.TrimSpace(gateway)
-	if gateway == "" {
-		return nil
-	}
-	v := strings.ToValidUTF8(truncateUTF8(gateway, maxUsageRouteGatewayLen), "")
-	return &v
+	return usageTextPtr(strings.TrimSpace(gateway), maxUsageRouteGatewayLen)
 }
 
 // usageCodexRoutePairPoolVersionPtr 记池子给这张票的身份（cookie_version），用来和池子侧的
 // 交付/验证日志对上账。池子没报时为 nil。长度上限与网关名同口径（池子侧已钳到 128 内）。
 func usageCodexRoutePairPoolVersionPtr(version string) *string {
-	version = strings.TrimSpace(version)
-	if version == "" {
-		return nil
-	}
-	v := strings.ToValidUTF8(truncateUTF8(version, maxUsageRoutePairVersionLen), "")
-	return &v
+	return usageTextPtr(strings.TrimSpace(version), maxUsageRoutePairVersionLen)
 }
 
 func usageCodexRouteGatewayPtr(pair string) *string {
-	gw := openAICodexRouteGateway(pair)
-	if gw == "" {
-		return nil
-	}
-	v := strings.ToValidUTF8(truncateUTF8(gw, maxUsageRouteGatewayLen), "")
-	return &v
+	return usageTextPtr(openAICodexRouteGateway(pair), maxUsageRouteGatewayLen)
 }

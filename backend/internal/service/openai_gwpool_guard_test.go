@@ -28,7 +28,6 @@ const (
 func TestGatewayPoolLegacyGuardFalseCannotSkipLunaVerification(t *testing.T) {
 	fake := newGwpoolFakePool(t, gwpoolTestPairCookie(t, "unified-142"), 150)
 	account := fake.account(1)
-	gwpoolTestIdentity := openAIGatewayPoolAccountKey(account)
 	account.Extra["openai_gwpool_guard_enabled"] = false
 	account.Extra["openai_gwpool_prewarm"] = true // Legacy setting is ignored.
 	account.Extra["openai_gwpool_probe_model"] = "business"
@@ -78,7 +77,7 @@ func TestGatewayPoolStrictGuardChecksTheActualPairBeforeBusinessSend(t *testing.
 	svc := &OpenAIGatewayService{httpUpstream: upstream}
 	account := fake.account(1)
 	// 上一张虽验过，但随后已经换到新票；末端必须核对实际附带的票。
-	svc.codexCookies.gatewayPoolMarkVerifiedFull(openAIGatewayPoolCacheKey(account, gwpoolTestIdentity), "old-verified")
+	svc.codexCookies.gatewayPoolMarkVerifiedFull(gwpoolTestIdentity, "old-verified")
 	request, err := http.NewRequest(http.MethodPost, gwpoolTestURL, strings.NewReader(gwpoolEchoBody1))
 	require.NoError(t, err)
 	ginCtx, _ := gin.CreateTestContext(httptest.NewRecorder())

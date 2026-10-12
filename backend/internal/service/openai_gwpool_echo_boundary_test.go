@@ -2,10 +2,8 @@ package service
 
 import (
 	"context"
-	"encoding/json"
 	"net/http"
 	"testing"
-	"time"
 
 	"github.com/klauspost/compress/zstd"
 	"github.com/stretchr/testify/require"
@@ -17,9 +15,9 @@ type gatewayEchoBoundaryRepo struct {
 	onContact func()
 }
 
-func (r *gatewayEchoBoundaryRepo) UpdateExtra(ctx context.Context, id int64, patch map[string]any) error {
-	err := r.gatewayRuntimeRepo.UpdateExtra(ctx, id, patch)
-	if patch[openAIGatewayPoolContactsExtraKey] != nil && r.onContact != nil {
+func (r *gatewayEchoBoundaryRepo) WriteGatewayPoolLedgers(ctx context.Context, id int64, ledgers, tags map[string]any) error {
+	err := r.gatewayRuntimeRepo.WriteGatewayPoolLedgers(ctx, id, ledgers, tags)
+	if ledgers[openAIGatewayPoolContactsExtraKey] != nil && r.onContact != nil {
 		r.onContact()
 	}
 	return err
@@ -37,31 +35,25 @@ func TestStateEchoFinalDeliveryRechecksAfterContactPersistence(t *testing.T) {
 			repo.onContact = func() {
 				calls++
 				if calls == atContact {
-					pair, _ := svc.codexCookies.cachedPoolPair(openAIGatewayPoolCacheKey(account, gwpoolTestIdentity))
+					pair, _ := svc.codexCookies.cachedPoolPair(gwpoolTestIdentity)
 					pair.version = "replacement"
-					svc.codexCookies.poolPairs.Store(openAIGatewayPoolCacheKey(account, gwpoolTestIdentity), pair)
+					svc.codexCookies.poolPairs.Store(gwpoolTestIdentity, pair)
 				}
 			}
 			_, resp, err := gwpoolEchoRun(t, svc, account, "old")
 			require.ErrorIs(t, err, errOpenAIGatewayPoolWarmUnverified)
 			require.Nil(t, resp)
 			require.True(t, upstream.bodies[0].closed)
-			current, _ := repo.GetByID(context.Background(), 1)
-			raw, _ := json.Marshal(current.Extra[openAIGatewayPoolMetricsExtraKey])
-			var metrics gatewayPoolProbeMetrics
-			require.NoError(t, json.Unmarshal(raw, &metrics))
-			require.EqualValues(t, 1, metrics.Confirmation.Requests)
-			require.Zero(t, metrics.Confirmation.Full+metrics.Confirmation.Degraded)
 		})
 	}
 }
 
 func TestStateEchoReferenceExpiryDoesNotSuppressConfirmedDegradation(t *testing.T) {
 	store := &openAICodexCookieStore{}
-	store.poolPairs.Store("identity", openAIGatewayPoolPair{cookie: "offline", version: "v", gateway: "g", until: time.Now().Add(-time.Second)})
-	_, marked := store.gatewayPoolMarkStaleMatched("identity", "v")
+	store.poolPairs.Store("identity", openAIGatewayPoolPair{cookie: "offline", version: "v", gateway: "g"})
+	_, _, marked := store.gatewayPoolMarkStaleMatched("identity", "v")
 	require.True(t, marked)
-	_, marked = store.gatewayPoolMarkStaleMatched("identity", "v")
+	_, _, marked = store.gatewayPoolMarkStaleMatched("identity", "v")
 	require.False(t, marked, "a confirmed rejection is recorded once")
 }
 

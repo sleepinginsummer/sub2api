@@ -89,6 +89,10 @@ func TestPeekCatalogDistinguishesEmptyFromRefreshFailure(t *testing.T) {
 	if _, _, ok := client.PeekCatalog("member", "", ""); ok {
 		t.Fatal("failed refresh must not resurrect the previous empty catalog")
 	}
+	stale, ok := client.PeekCatalogSnapshot("member", "", "")
+	if !ok || !stale.Stale || len(stale.Gateways) != 0 || stale.ObservedAt.IsZero() || stale.ValidUntil.IsZero() {
+		t.Fatalf("failed refresh must retain an explicitly stale successful snapshot: %+v %v", stale, ok)
+	}
 }
 
 func TestPeekCatalogCanceledRefreshStaysUnknownUntilSuccess(t *testing.T) {
@@ -134,6 +138,10 @@ func TestPeekCatalogCanceledRefreshStaysUnknownUntilSuccess(t *testing.T) {
 	if _, _, ok := client.PeekCatalog("member", "", ""); ok {
 		t.Fatal("canceled refresh resurrected a known-empty display snapshot")
 	}
+	stale, ok := client.PeekCatalogSnapshot("member", "", "")
+	if !ok || !stale.Stale || stale.Generation != initial.Generation {
+		t.Fatal("canceled refresh must keep the previous snapshot labeled stale")
+	}
 	// Display uncertainty must not change the business cache's reuse rules.
 	cached, err := client.Catalog(context.Background(), "member", "", "", 0)
 	if err != nil || cached.Generation != initial.Generation || hits.Load() != 2 {
@@ -150,4 +158,17 @@ func TestPeekCatalogCanceledRefreshStaysUnknownUntilSuccess(t *testing.T) {
 	if !ok || len(value.Gateways) != 0 || value.Generation != fresh.Generation || fresh.Generation <= initial.Generation {
 		t.Fatalf("successful refresh did not restore known empty inventory: %+v %v", value, ok)
 	}
+}
+
+// PeekCatalog is a test-only probe of the cache state machine: no network,
+// refresh, TTL extension, LRU touch or new entry; in-flight, missing and
+// expired snapshots remain unknown.
+func (c *Client) PeekCatalog(account, tag, model string) (Catalog, time.Time, bool) {
+	c.catalog.mu.Lock()
+	defer c.catalog.mu.Unlock()
+	entry := c.catalog.entries[makeCatalogKey(account, tag, model)]
+	if entry == nil || entry.flight != nil || entry.displayUnknown || entry.value.Generation == 0 || !c.catalog.timeNow().Before(entry.until) {
+		return Catalog{}, time.Time{}, false
+	}
+	return cloneCatalog(entry.value), entry.until, true
 }

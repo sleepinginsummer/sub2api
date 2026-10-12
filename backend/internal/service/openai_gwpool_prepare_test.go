@@ -53,7 +53,7 @@ func TestGatewayPoolPreparationSharesWholeRun(t *testing.T) {
 	require.Eventually(t, func() bool {
 		svc.codexCookies.poolPrepare.mu.Lock()
 		defer svc.codexCookies.poolPrepare.mu.Unlock()
-		call := svc.codexCookies.poolPrepare.calls[openAIGatewayPoolCacheKey(account, gwpoolTestIdentity)]
+		call := svc.codexCookies.poolPrepare.calls[gwpoolTestIdentity]
 		return call != nil && call.waiters == 2
 	}, time.Second, time.Millisecond)
 	svc.codexCookies.poolProgress.mu.Lock()
@@ -147,22 +147,11 @@ func TestGatewayPoolCandidateQueueRetainsOrderAndRejoinsAtTail(t *testing.T) {
 	require.Empty(t, queue.pick(nil))
 }
 
-func TestGatewayPoolPreparationSettingsDefaultsAndRecoveryBounds(t *testing.T) {
+func TestGatewayPoolPreparationIgnoresObsoleteAutoWaitSwitch(t *testing.T) {
 	account := gwpoolTestAccount(1)
-	require.True(t, account.GatewayPoolLongWaitEnabled())
+	require.True(t, account.UsesGatewayPool())
 	account.Extra[openAIGatewayPoolWaitEnabledExtraKey] = false
-	require.True(t, account.GatewayPoolLongWaitEnabled(), "obsolete auto-wait switch does not disable queue waiting")
-	require.Zero(t, account.gatewayPoolPreparationRecoveries())
-	for _, value := range []any{0, float64(0), int64(0)} {
-		account.Extra[openAIGatewayPoolRecoveryExtraKey] = value
-		require.Zero(t, account.gatewayPoolPreparationRecoveries())
-	}
-	account.Extra[openAIGatewayPoolRecoveryExtraKey] = 2
-	require.Equal(t, 2, account.gatewayPoolPreparationRecoveries())
-	for _, value := range []any{-1, 1.5, "2", 11} {
-		account.Extra[openAIGatewayPoolRecoveryExtraKey] = value
-		require.Zero(t, account.gatewayPoolPreparationRecoveries())
-	}
+	require.True(t, account.UsesGatewayPool(), "obsolete auto-wait switch does not disable queue waiting")
 }
 
 func TestGatewayPoolPreparationDoesNotImposeDeadlineOnSuccessfulBusiness(t *testing.T) {

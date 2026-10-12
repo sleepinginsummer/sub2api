@@ -54,8 +54,10 @@ func (s *OpenAIGatewayService) Forward(
 	// 靠它的 create_time 定位消息时刻、靠 content_item_kinds 判定哪段是 environment_context。
 	// 删掉之后再改写只会静默退化成 no-op。放在 prepareCodexAccountIdentitySource 之后是
 	// 因为双开判定读的就是它准备的身份来源。
-	// 各 builder 里的同名调用保留：图片等路径不经过 Forward；重复执行是幂等的
-	// （证据已被删 → no-op；未被删 → 值已是目标时区，next == text.Raw）。
+	// 这是唯一一遍：Chat Completions 与三个 WS 入口各自在归一化前投影；请求构造器
+	// （buildUpstreamRequest / 透传构造器）与 WS 帧收口不再重复——双开只对 OAuth 生效，
+	// 到那里时 OAuth 归一化已删掉证据。不经过任何入口投影的图片 / Messages 桥 / turn-state
+	// 探针的体由网关自造，本来就不带这份证据。
 	body = rewriteCodexEnvironmentTimezone(c, account, body)
 	startTime := time.Now()
 	// 固定渠道映射后的请求级 canonical body；账号 normalize/strip 不得改写跨 failover hint。
@@ -946,9 +948,6 @@ func (s *OpenAIGatewayService) Forward(
 			if reason == "previous_response_not_found" && recoverPrevResponseNotFound(attempt) {
 				continue
 			}
-			// 这里刻意不做 turn-state 失效归因：WS 路径整条都不参与自动接管
-			// （applyOpenAICodexTurnStateOverrideWSManualOnly 会给上下文打 skip 标记），
-			// 归因函数第一行就会返回，写了也是死代码。
 			if reason == "invalid_encrypted_content" && recoverInvalidEncryptedContent(attempt) {
 				continue
 			}
@@ -1148,11 +1147,6 @@ func (s *OpenAIGatewayService) Forward(
 					strings.Contains(upstreamMsg, "The encrypted content") &&
 					strings.Contains(upstreamMsg, "could not be verified") &&
 					strings.Contains(upstreamMsg, "could not be decrypted or parsed"))
-			if httpInvalidEncryptedContentRetryTried && resp.StatusCode == http.StatusBadRequest && invalidEncryptedContentError {
-				// 已经剥过一次 encrypted reasoning items 还是 400：排除掉 lineage
-				// 这个主因之后，才轮得到「注入的 turn-state 解不开」这个解释。
-				s.noteOpenAITurnStateRejected(c, account)
-			}
 			if !httpInvalidEncryptedContentRetryTried && resp.StatusCode == http.StatusBadRequest && invalidEncryptedContentError {
 				decoded, decodeErr := ensureReqBody()
 				if decodeErr != nil {
@@ -1175,9 +1169,6 @@ func (s *OpenAIGatewayService) Forward(
 					logger.LegacyPrintf("service.openai_gateway", "[OpenAI] Retrying non-WSv2 request once after invalid_encrypted_content (account: %s)", account.Name)
 					continue
 				}
-				// 请求体里压根没有 encrypted reasoning items，这条 400 就不可能是
-				// lineage 造成的；此时才把账归到本次注入的 turn-state 上。
-				s.noteOpenAITurnStateRejected(c, account)
 				logger.LegacyPrintf("service.openai_gateway", "[OpenAI] Skip non-WSv2 invalid_encrypted_content retry because encrypted reasoning items are missing (account: %s)", account.Name)
 			}
 			if retryBody, reason, changed, retryErr := normalizeOpenAIResponsesRejectedFieldRetryBody(resp.StatusCode, body, respBody); retryErr != nil {
@@ -1362,8 +1353,6 @@ func (s *OpenAIGatewayService) Forward(
 		forwardResult := &OpenAIForwardResult{
 			RequestID:                     resp.Header.Get("x-request-id"),
 			UpstreamHeaders:               resp.Header,
-			GatewayPoolRoutePair:          openAIGatewayPoolRoutePairFromResponse(resp),
-			GatewayPoolApplied:            openAIGatewayPoolAppliedFromResponse(resp),
 			ResponseID:                    responseID,
 			Usage:                         *usage,
 			Model:                         originalModel,
@@ -1453,11 +1442,7 @@ func (s *OpenAIGatewayService) buildUpstreamRequest(ctx context.Context, c *gin.
 	case AccountTypeCPR:
 		// CPR 中继：必须显式配置 base_url。这里**不能**回落到 openaiPlatformAPIURL——
 		// 那会把 CPR 的 client key 当成 OpenAI API key 发给官方。
-		baseURL := account.GetCPRGatewayBaseURL()
-		if baseURL == "" {
-			return nil, errors.New("cpr account requires credentials.base_url")
-		}
-		validatedURL, err := s.validateUpstreamBaseURL(baseURL)
+		validatedURL, err := s.validatedCPRBaseURL(account)
 		if err != nil {
 			return nil, err
 		}
@@ -1478,37 +1463,8 @@ func (s *OpenAIGatewayService) buildUpstreamRequest(ctx context.Context, c *gin.
 	// previous_response_id，避免携带状态字段被上游拒绝。
 	body = normalizeDeepSeekResponsesRequestBody(account, body)
 
-	body, err := filterCodexCompactAccessPrograms(c, account, body)
-	if err != nil {
-		return nil, fmt.Errorf("filter compact access programs: %w", err)
-	}
-
-	// codex 0.156 的两处体内形态：guardian 计费标记、turn-metadata 的 model 跟随出站体。
-	body = applyCodexGuardianCreditsRequested(c, account, wireTargetURL, body)
-	body = alignCodexTurnMetadataExecutionBody(c, account, wireTargetURL, body)
-
-	// 顶层键序：只重排，不改任何值（下面的时区改写与压缩仍会动体）。
-	body = applyCodexBodyFieldOrder(c, account, wireTargetURL, body)
-
-	// 双开出站时区收口：真客户端把本机时区与当天日期写进 environment_context，客户端在国内、
-	// 出口在美国时两者矛盾。按出口时区改写这两个标签（openai_codex_wire_timezone.go）。
-	body = rewriteCodexEnvironmentTimezone(c, account, body)
-	// 同一份出口解析结果的第二处投影：web_search 的 user_location 也要跟着改，
-	// 否则出站是"出口时区 + 客户端本机城市"（openai_codex_wire_user_location.go）。
-	body = rewriteCodexWebSearchUserLocation(c, account, body)
-
-	// 趁 body 还是明文，把出站模型名记进本次请求的网关池 sink：queue 档的预热垫话必须用同一个
-	// 模型（后置回声复验沿用本次业务模型），而它跑在传输层、只拿到 *http.Request ——
-	// 到那时双开账号的体已经是 zstd 了，解不出来（openai_gwpool_warm.go 的 gatewayPoolWarmModel）。
-	// 没挂 sink 的路径（猎手探测等）这一行是空操作。
-	openAIGatewayPoolSinkFrom(ctx).noteModel(gjson.GetBytes(body, "model").String())
-	if account.UsesGatewayPool() {
-		ctx = context.WithValue(ctx, gatewayPoolConfirmBodyKey{}, gatewayPoolConfirmBody(body))
-	}
-
-	// 上线字节：双开 /responses 的请求体按真客户端默认做 zstd 压缩（openai_codex_request_compression.go）。
-	// body 仍是明文 JSON，供下面的路由提示与诊断日志读取；每次构造独立压缩。
-	wireBody, contentEncoding, err := compressCodexRequestBody(c, account, wireTargetURL, body)
+	// 请求体定稿链（openai_codex_request_compression.go）。body 仍是明文 JSON，供下面的路由提示与诊断日志读取。
+	ctx, body, wireBody, contentEncoding, err := s.finalizeCodexWireBody(ctx, c, account, wireTargetURL, body)
 	if err != nil {
 		return nil, err
 	}
@@ -1554,10 +1510,7 @@ func (s *OpenAIGatewayService) buildUpstreamRequest(ctx context.Context, c *gin.
 	// 客户端回带的 x-codex-turn-state 若已知由其他账号铸造（failover 换号），
 	// 剥离后再出站——异账号 blob 与本账号的（指纹收敛后）出站身份自相矛盾。
 	s.guardOpenAICodexTurnStateEcho(c, account, req.Header)
-	s.applyOpenAICodexTurnStateOverrideHeader(c, account, req.Header)
-	if err := openAITurnStateHoldError(c); err != nil {
-		return nil, err
-	}
+	markOpenAITurnStateSent(c, account, req.Header.Get(openAICodexTurnStateHeader))
 	if account.UsesOpenAICodexProtocol() {
 		// 桥的判定：/v1/messages 入口置位的上下文键，或请求体里的桥标记（两层 sub2api 串联时前一层的桥
 		// 请求直连到这里的 /v1/responses）。双开账号不按请求体嗅探：真客户端每条 /responses 都无条件带

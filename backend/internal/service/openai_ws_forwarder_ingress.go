@@ -279,8 +279,8 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		// 时区投影必须抢在归一化之前：它会删掉 internal_chat_message_metadata_passthrough
 		// （上游 #7066，ChatGPT 拒收该字段），而本改写正是靠该字段的 create_time 定位消息
 		// 时刻、靠 content_item_kinds 判定哪段是 environment_context。删掉之后再改写只会
-		// 静默退化成 no-op。帧收口 applyCodexWSFrameWireProfile 里的同名调用保留：重复执行
-		// 幂等，且它还负责 user_location 那一半。
+		// 静默退化成 no-op。这是 ctx_pool 帧与 WS→HTTP 桥的唯一一遍，发送边界不再重复；
+		// 帧收口 applyCodexWSFrameWireProfile 只负责 user_location 那一半。
 		normalized = rewriteCodexEnvironmentTimezone(c, account, normalized)
 		if compatibilityBody, compatibilityChanged, compatibilityErr := normalizeOpenAIResponsesWebSocketCompatibilityBody(normalized, account, responsesLite); compatibilityErr != nil {
 			return openAIWSClientPayload{}, NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, "invalid websocket request payload", compatibilityErr)
@@ -543,13 +543,11 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 	useHTTPBridge := forceHTTPBridge || s.shouldBridgeOpenAIWSHTTP(account, firstPayload.payloadBytes, firstPayload.previousResponseID)
 	// 客户端回带的 turn-state：已知由其他账号铸造（failover 换号）则剥离。
 	turnState := s.guardOpenAICodexTurnStateValue(c, account, c.GetHeader(openAIWSTurnStateHeader))
-	turnState = s.applyOpenAICodexTurnStateOverrideWSManualOnly(c, account, turnState)
+	markOpenAITurnStateSent(c, account, turnState)
 	// clientTurnState 只保存"客户端自己持有的值"，双开的帧内只承载它：真客户端的 turn_state
 	// 是每轮新建的 OnceLock（core/src/client.rs:292、:522-526），只可能来自本轮上游的
 	// response.metadata 事件；网关握手铸出的值、会话存储里的旧值客户端从未收到过，复用连接
 	// 开新一轮时真客户端首帧确实不带（core/tests/suite/turn_state.rs:140、:152 断言 null）。
-	// 例外：账号配了 turn-state 覆写时，上面 applyOpenAICodexTurnStateOverrideWSManualOnly 已把
-	// turnState 换成覆写值，这里刻意让它一并进帧——双开握手头被删，帧内是唯一通道。
 	clientTurnState := turnState
 	stateStore := s.getOpenAIWSStateStore()
 	groupID := getOpenAIGroupIDFromContext(c)
@@ -575,7 +573,7 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		if turnState == "" && stateStore != nil && sessionHash != "" {
 			if savedTurnState, ok := stateStore.GetSessionTurnState(groupID, sessionHash); ok {
 				turnState = s.guardOpenAICodexTurnStateValue(c, account, savedTurnState)
-				turnState = s.applyOpenAICodexTurnStateOverrideWSManualOnly(c, account, turnState)
+				markOpenAITurnStateSent(c, account, turnState)
 			}
 		}
 

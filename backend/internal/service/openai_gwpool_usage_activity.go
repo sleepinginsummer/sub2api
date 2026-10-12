@@ -30,7 +30,7 @@ type gatewayPoolUsageActivity struct {
 func gatewayPoolUsageMarkSending(ctx context.Context, identity string) {
 	activity, _ := ctx.Value(gatewayPoolUsageActivityKey{}).(*gatewayPoolUsageActivity)
 	tag, _ := ctx.Value(gatewayPoolUsageIdentityKey{}).(string)
-	if activity == nil || tag != gatewayPoolUsageTag(identity) {
+	if activity == nil || tag != gatewayPoolLedgerTag(identity) {
 		return
 	}
 	inventory := activity.inventory
@@ -113,16 +113,22 @@ func (r *gatewayPoolUsageLedger) idleCutoff(now time.Time) time.Time {
 	if r.LastRequestStartedAt.After(last) {
 		last = r.LastRequestStartedAt
 	}
+	for _, round := range r.Rounds {
+		if round.Model != gatewayPoolUsageSharedModel || !round.EndedAt.IsZero() || round.ActiveUsage == nil {
+			continue
+		}
+		if n := len(round.ActiveUsage.Intervals); n > 0 && round.ActiveUsage.Intervals[n-1].End.After(last) {
+			last = round.ActiveUsage.Intervals[n-1].End // merged intervals: the last one ends latest
+		}
+	}
 	if last.IsZero() {
 		for _, round := range r.Rounds {
 			if round.Model != gatewayPoolUsageSharedModel || !round.EndedAt.IsZero() {
 				continue
 			}
 			for _, ticket := range round.Tickets {
-				for _, at := range []time.Time{ticket.At, ticket.UseObservedAt} {
-					if at.After(last) {
-						last = at
-					}
+				if ticket.At.After(last) {
+					last = ticket.At
 				}
 			}
 		}
@@ -146,7 +152,7 @@ func (s *OpenAIGatewayService) beginGatewayPoolUsageRequest(ctx context.Context,
 	}
 	at := time.Now().UTC()
 	var knownClosed time.Time
-	if cached, ok := s.codexCookies.poolUsageCache.Load(gatewayPoolUsageTag(identity)); ok {
+	if cached, ok := s.codexCookies.poolUsageCache.Load(gatewayPoolLedgerTag(identity)); ok {
 		if state, valid := cached.(*gatewayPoolUsageLedger); valid {
 			knownClosed = state.ClosedBefore[gatewayPoolUsageSharedModel]
 		}
@@ -176,7 +182,7 @@ func (s *OpenAIGatewayService) beginGatewayPoolUsageRequest(ctx context.Context,
 		return false
 	})
 	ctx = context.WithValue(ctx, gatewayPoolUsageRequestKey{}, at)
-	ctx = context.WithValue(ctx, gatewayPoolUsageIdentityKey{}, gatewayPoolUsageTag(identity))
+	ctx = context.WithValue(ctx, gatewayPoolUsageIdentityKey{}, gatewayPoolLedgerTag(identity))
 	ctx = context.WithValue(ctx, gatewayPoolUsageActivityKey{}, activity)
 	var once sync.Once
 	return ctx, func() {
@@ -218,7 +224,7 @@ func (s *OpenAIGatewayService) maintainGatewayPoolUsage(ctx context.Context, acc
 		return
 	}
 	// Quiet periodic scans do not need a DB write for accounts without a cycle.
-	state := readGatewayPoolUsageForIdentity(account, identity)
+	state := readGatewayPoolUsage(account, gatewayPoolLedgerTag(identity))
 	if len(state.Rounds) == 0 && state.VerificationSequence == 0 {
 		return
 	}

@@ -507,15 +507,6 @@ func (s *adminServiceImpl) CreateAccount(ctx context.Context, input *CreateAccou
 	if err := validateOpenAIUpstreamRecordingExtra(input.Platform, accountExtra); err != nil {
 		return nil, err
 	}
-	if err := ValidateOpenAITurnStateOverrideExtra(accountExtra); err != nil {
-		return nil, err
-	}
-	if err := ValidateOpenAITurnStateAutoExtra(accountExtra); err != nil {
-		return nil, err
-	}
-	if err := ValidateOpenAITurnStateHunterExtra(accountExtra); err != nil {
-		return nil, err
-	}
 
 	// 绑定分组
 	groupIDs := input.GroupIDs
@@ -639,15 +630,6 @@ func (s *adminServiceImpl) UpdateAccount(ctx context.Context, id int64, input *U
 		if err := validateOpenAIUpstreamRecordingExtra(account.Platform, normalizedExtra); err != nil {
 			return nil, err
 		}
-		if err := ValidateOpenAITurnStateOverrideExtra(normalizedExtra); err != nil {
-			return nil, err
-		}
-		if err := ValidateOpenAITurnStateAutoExtra(normalizedExtra); err != nil {
-			return nil, err
-		}
-		if err := ValidateOpenAITurnStateHunterExtra(normalizedExtra); err != nil {
-			return nil, err
-		}
 	}
 	previousProbeIdentity := upstreamBillingProbeIdentity(account)
 	previousOllamaUsageIdentity := ollamaCloudUsageIdentity(account)
@@ -730,12 +712,8 @@ func (s *adminServiceImpl) UpdateAccount(ctx context.Context, id int64, input *U
 		delete(normalizedExtra, OllamaCloudUsageSnapshotExtraKey)
 		delete(normalizedExtra, OpenCodeGoUsageAutoRefreshExtraKey)
 		delete(normalizedExtra, OpenCodeGoUsageSnapshotExtraKey)
-		// turn-state 候选池由网关在响应路径上维护（含 Failed 标记）。管理端提交的
-		// extra 是打开弹窗那一刻的快照，不剔掉就会把失效候选复活、甚至整池清空。
-		delete(normalizedExtra, openAITurnStatePoolExtraKey)
-		// 猎手运行态同理：小时计数、退避、出口冷却都在网关侧维护，快照回写会把它们全部倒回。
-		delete(normalizedExtra, openAITurnStateHuntExtraKey)
-		// 形态观测也是网关写的运行态：快照回写会把「最近铸出」倒回打开弹窗那一刻。
+		// 形态观测是网关写的运行态：管理端提交的 extra 是打开弹窗那一刻的快照，回写会把
+		// 「最近铸出」倒回那一刻。
 		delete(normalizedExtra, openAITurnStateObservedExtraKey)
 		// 保留配额用量和专用服务受管字段，防止普通账号编辑意外覆盖。
 		for _, key := range []string{
@@ -754,10 +732,14 @@ func (s *adminServiceImpl) UpdateAccount(ctx context.Context, id int64, input *U
 			OpenAIAutoResetCreditStateExtraKey,
 			OpenCodeGoUsageAutoRefreshExtraKey,
 			OpenCodeGoUsageSnapshotExtraKey,
-			openAITurnStatePoolExtraKey,
-			openAITurnStateHuntExtraKey,
 			openAITurnStateObservedExtraKey,
 		} {
+			if v, ok := account.Extra[key]; ok {
+				normalizedExtra[key] = v
+			}
+		}
+		for _, key := range gatewayPoolRuntimeExtraKeys {
+			delete(normalizedExtra, key)
 			if v, ok := account.Extra[key]; ok {
 				normalizedExtra[key] = v
 			}
@@ -778,6 +760,10 @@ func (s *adminServiceImpl) UpdateAccount(ctx context.Context, id int64, input *U
 			delete(account.Extra, modelRateLimitsKey)
 			delete(account.Extra, "antigravity_credits_overages") // 清理旧版 overages 运行态
 		}
+		// 网关池与 WS 上游互斥（openai_gwpool.go）：按合并后的最终 extra 判，否则改一半就绕过去了。
+		if err := validateOpenAIGatewayPoolAccountExtra(account, account.Extra); err != nil {
+			return nil, err
+		}
 		// 校验并预计算固定时间重置的下次重置时间
 		if err := ValidateQuotaResetConfig(account.Extra); err != nil {
 			return nil, err
@@ -787,12 +773,6 @@ func (s *adminServiceImpl) UpdateAccount(ctx context.Context, id int64, input *U
 	}
 	if input.Extra == nil {
 		account.Extra = prepareCodexFingerprintExtraForUpdate(account, account.Extra)
-	}
-	// 类型变更也可能激活已有网关池设置，必须在类型和 extra 都处理后校验最终配置。
-	if input.Extra != nil || input.Type != "" {
-		if err := validateOpenAIGatewayPoolAccountExtra(account, account.Extra); err != nil {
-			return nil, err
-		}
 	}
 	if requestedRateSyncEnabledUpdate != nil && *requestedRateSyncEnabledUpdate {
 		if requestedProbeEnabledUpdate != nil && !*requestedProbeEnabledUpdate {
@@ -1000,10 +980,7 @@ func (s *adminServiceImpl) UpdateAccountExtra(ctx context.Context, id int64, upd
 	delete(updates, OllamaCloudUsageSnapshotExtraKey)
 	delete(updates, OpenCodeGoUsageAutoRefreshExtraKey)
 	delete(updates, OpenCodeGoUsageSnapshotExtraKey)
-	// turn-state 运行态只由网关/猎手维护，与 UpdateAccount 同一份剔除名单：
-	// 不剔的话一次重授权就能把别的账号的候选池写进来（跨凭证域回放）。
-	delete(updates, openAITurnStatePoolExtraKey)
-	delete(updates, openAITurnStateHuntExtraKey)
+	// 形态观测只由网关维护，与 UpdateAccount 同一份剔除名单。
 	delete(updates, openAITurnStateObservedExtraKey)
 	// 网关池 consumer key：没带非空字符串就当没提，jsonb 合并天然不动库里那份。
 	mergeOpenAIGatewayPoolConsumerKey(nil, updates)
@@ -1045,13 +1022,10 @@ func (s *adminServiceImpl) UpdateAccountExtra(ctx context.Context, id int64, upd
 	return s.accountRepo.UpdateExtra(ctx, id, updates)
 }
 
-// ClearOpenAITurnStateRuntimeExtra 清掉 turn-state 的三个运行态键（写成 jsonb null，读侧按空处理）。
-// 重授权换了 ChatGPT 账号时用：旧账号铸的票对新凭据是跨凭证域回放，注进去只会换回 400，
-// 把候选池耗尽后还会把账号停掉。
+// ClearOpenAITurnStateRuntimeExtra 清掉 turn-state 形态观测（写成 jsonb null，读侧按空处理）。
+// 重授权换了 ChatGPT 账号时用：旧账号的读数不代表新凭据。
 func (s *adminServiceImpl) ClearOpenAITurnStateRuntimeExtra(ctx context.Context, id int64) error {
 	return s.accountRepo.UpdateExtra(ctx, id, map[string]any{
-		openAITurnStatePoolExtraKey:     nil,
-		openAITurnStateHuntExtraKey:     nil,
 		openAITurnStateObservedExtraKey: nil,
 	})
 }
@@ -1082,9 +1056,7 @@ func (s *adminServiceImpl) BulkUpdateAccounts(ctx context.Context, input *BulkUp
 	delete(input.Extra, OllamaCloudUsageSnapshotExtraKey)
 	delete(input.Extra, OpenCodeGoUsageAutoRefreshExtraKey)
 	delete(input.Extra, OpenCodeGoUsageSnapshotExtraKey)
-	// 批量最狠：payload 里混进一份候选池会被写进每一个目标账号。
-	delete(input.Extra, openAITurnStatePoolExtraKey)
-	delete(input.Extra, openAITurnStateHuntExtraKey)
+	// 批量共用一份 payload：混进来的形态观测会被写进每一个目标账号。
 	delete(input.Extra, openAITurnStateObservedExtraKey)
 	// 批量共用一份 input.Extra：绝不能从某个目标账号回填，否则会把它的凭据写进其它账号。
 	mergeOpenAIGatewayPoolConsumerKey(nil, input.Extra)

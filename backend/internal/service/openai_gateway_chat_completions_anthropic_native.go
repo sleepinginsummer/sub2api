@@ -284,18 +284,16 @@ func (s *OpenAIGatewayService) handleCCBufferedFromNativeAnthropic(
 	}
 
 	return &OpenAIForwardResult{
-		RequestID:            requestID,
-		UpstreamHeaders:      resp.Header,
-		GatewayPoolRoutePair: openAIGatewayPoolRoutePairFromResponse(resp),
-		GatewayPoolApplied:   openAIGatewayPoolAppliedFromResponse(resp),
-		Usage:                claudeUsageToOpenAIUsage(&usage),
-		Model:                originalModel,
-		BillingModel:         billingModel,
-		UpstreamModel:        upstreamModel,
-		UpstreamEndpoint:     "/v1/messages",
-		ReasoningEffort:      reasoningEffort,
-		Stream:               false,
-		Duration:             time.Since(startTime),
+		RequestID:        requestID,
+		UpstreamHeaders:  resp.Header,
+		Usage:            claudeUsageToOpenAIUsage(&usage),
+		Model:            originalModel,
+		BillingModel:     billingModel,
+		UpstreamModel:    upstreamModel,
+		UpstreamEndpoint: "/v1/messages",
+		ReasoningEffort:  reasoningEffort,
+		Stream:           false,
+		Duration:         time.Since(startTime),
 	}, nil
 }
 
@@ -340,20 +338,18 @@ func (s *OpenAIGatewayService) handleCCStreamingFromNativeAnthropic(
 
 	resultWithUsage := func() *OpenAIForwardResult {
 		return &OpenAIForwardResult{
-			RequestID:            requestID,
-			UpstreamHeaders:      resp.Header,
-			GatewayPoolRoutePair: openAIGatewayPoolRoutePairFromResponse(resp),
-			GatewayPoolApplied:   openAIGatewayPoolAppliedFromResponse(resp),
-			Usage:                claudeUsageToOpenAIUsage(&usage),
-			Model:                originalModel,
-			BillingModel:         billingModel,
-			UpstreamModel:        upstreamModel,
-			UpstreamEndpoint:     "/v1/messages",
-			ReasoningEffort:      reasoningEffort,
-			Stream:               true,
-			Duration:             time.Since(startTime),
-			FirstTokenMs:         firstTokenMs,
-			ClientDisconnect:     clientDisconnected,
+			RequestID:        requestID,
+			UpstreamHeaders:  resp.Header,
+			Usage:            claudeUsageToOpenAIUsage(&usage),
+			Model:            originalModel,
+			BillingModel:     billingModel,
+			UpstreamModel:    upstreamModel,
+			UpstreamEndpoint: "/v1/messages",
+			ReasoningEffort:  reasoningEffort,
+			Stream:           true,
+			Duration:         time.Since(startTime),
+			FirstTokenMs:     firstTokenMs,
+			ClientDisconnect: clientDisconnected,
 		}
 	}
 

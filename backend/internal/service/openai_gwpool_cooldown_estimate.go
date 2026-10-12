@@ -1,31 +1,23 @@
 package service
 
-import (
-	"sort"
-	"time"
-)
+import "time"
 
 // Display-only local cooldown estimate. It neither predicts pool inventory nor
-// changes the bounded rest recheck deadline.
+// changes the durable rest latch.
 type GatewayPoolCooldownEstimate struct {
 	ResumeGateways int       `json:"resume_gateways"`
 	EligibleAt     time.Time `json:"eligible_at,omitzero"`
 }
 
-func (s *openAICodexCookieStore) gatewayPoolCooldownEstimate(identity string, account *Account, history openAIGatewayHistory, now time.Time) GatewayPoolCooldownEstimate {
+// deadlines are the display cooldown deadlines and rest the merged rest
+// snapshot, both already computed for the same runtime view.
+func gatewayPoolCooldownEstimate(account *Account, deadlines map[string]time.Time, rest gatewayPoolRestState, now time.Time) GatewayPoolCooldownEstimate {
 	result := GatewayPoolCooldownEstimate{ResumeGateways: account.gatewayPoolResumeGateways()}
-	projected := s.gatewayPoolDisplayCooldownDeadlines(identity, account, history, now)
-	deadlines := make([]time.Time, 0, len(projected))
-	for _, until := range projected {
-		if !until.IsZero() {
-			deadlines = append(deadlines, until)
-		}
+	var qualityGateways []string
+	if rest.Active && !account.GatewayPoolContinuousWaitEnabled() {
+		qualityGateways = rest.QualityGateways
 	}
-	if len(deadlines) == 0 {
-		return result // no local cooldown to wait for
-	}
-	sort.Slice(deadlines, func(i, j int) bool { return deadlines[i].Before(deadlines[j]) })
-	result.EligibleAt = deadlines[min(result.ResumeGateways, len(deadlines))-1]
+	result.EligibleAt = gatewayPoolRecoveryDeadline(deadlines, result.ResumeGateways, qualityGateways, rest.since(now))
 	return result
 }
 
@@ -57,10 +49,7 @@ func (s *openAICodexCookieStore) gatewayPoolDisplayCooldownDeadlines(identity st
 			c.clearCooldown(reset.ClearedAt, base)
 			c.resetBackoff(reset.LastAt, touched, base)
 			s.refreshGatewayPoolCooldown(&c, identity, window, touched, now)
-			until = c.Until
-			if touchedUntil := touched.Add(time.Duration(c.WindowSeconds) * time.Second); !c.Cleared && !touched.IsZero() && touchedUntil.After(until) {
-				until = touchedUntil
-			}
+			until = c.deadline(touched)
 		} else if !touched.IsZero() {
 			until = touched.Add(time.Duration(base) * time.Second)
 		} else if !seen.At.IsZero() && !clearAt.IsZero() {

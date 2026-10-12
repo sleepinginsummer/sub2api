@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/chatgptcookies"
-	"golang.org/x/sync/singleflight"
 )
 
 // openAICodexCookieStore：推理面的 ChatGPT cookie 回放，按账号各一只罐。
@@ -30,10 +29,10 @@ type openAICodexCookieStore struct {
 	// 网关池接管（openai_gwpool.go）。配置全在账号 extra 上，客户端按 (base_url, consumer key)
 	// 缓存——每请求新建 gwpool.New 会各带一个 http.Transport，连接池永不复用。
 	poolClients sync.Map // base_url + "\x00" + consumer key → *gwpool.Client
-	// identity 解析凭证域身份（影子行按母账号算），与池配置指纹共同组成 pair 缓存键。
+	// identity 解析凭证域身份（影子行按母账号算），是 pair 缓存键。
 	// 由构造器注入；裸结构体（单元测试）里为 nil，退回按本地行算。
 	identity  openAICodexCredentialIdentity
-	poolPairs sync.Map // 凭证身份与池配置指纹共同隔离当前票。
+	poolPairs sync.Map // 凭证域身份 → openAIGatewayPoolPair
 	poolFetch gatewayPoolSharedWork[gatewayPoolFetchResult]
 	// poolVerified 是「这个身份手上那张票**验过是满血**」（openai_gwpool_warm.go）。
 	//
@@ -42,8 +41,8 @@ type openAICodexCookieStore struct {
 	// 并发取票（singleflight 的 shared 对领头者也为真 ⇒ 谁都拿不到本地丢弃闭包），以及同一份凭据
 	// 挂在多个账号行上（键是凭证域身份，别的行取的票这一行照样看得见）。换票即失效。
 	//
-	// 满血时刻用于观测窗口，验证标记与路由始终属于同一个配置作用域。
-	poolVerified            sync.Map // 凭证域身份 + 池配置指纹 → gatewayPoolVerifiedMark
+	// 判出满血的时刻用于观测窗口时长（openai_gwpool_window.go）。
+	poolVerified            sync.Map // 凭证域身份 → gatewayPoolVerifiedMark
 	poolProbeObserved       func(context.Context, *Account, gatewayPoolProbeObservation)
 	poolContactLocks        sync.Map // 凭证域摘要 -> *sync.Mutex；只协调本进程。
 	poolContactPicks        sync.Map // 凭证域摘要 -> *atomic.Uint64；每五次保留一次原顺序探索。
@@ -56,8 +55,6 @@ type openAICodexCookieStore struct {
 	poolUsageLocks          sync.Map // ledger tag -> *sync.Mutex, durable usage rounds
 	poolUsageCache          sync.Map // ledger tag -> *gatewayPoolUsageLedger, immutable committed snapshot
 	poolActiveUsage         sync.Map // ledger tag -> *gatewayPoolActiveUsageTracker, business intervals only
-	poolUsageSessionOnce    sync.Once
-	poolUsageSession        string
 	poolUsageAttempt        func(context.Context, *Account, string, string, OpenAIGatewayPoolApplied, time.Time, bool)
 	poolUsageFinished       func(context.Context, *Account)
 	poolProgress            gatewayPoolProgressTracker
@@ -85,13 +82,13 @@ type openAICodexCookieStore struct {
 	poolCooldownResetLocks sync.Map // ledger identity -> *sync.Mutex; timer writes only
 	poolCooldownPersist    func(context.Context, *Account, string)
 	poolHistoryLocks       sync.Map // 本地行 ID → *sync.Mutex，串行合并已有 history。
-	accountByID            func(context.Context, int64) (*Account, error)
-	historyByTag           func(context.Context, string) ([]Account, error)
-	poolHistoryLoad        singleflight.Group
+	accountByID            func(context.Context, int64, ...string) (*Account, error)
+	historyByTag           func(context.Context, string, ...string) ([]Account, error)
+	poolHistoryLoad        gatewayPoolSharedWork[struct{}]
 	// poolBackoff 是「池子让这个身份先别取票」的到点（见 gatewayPoolBackoff）。
 	// 按**上游账号**记而不是按请求：退避只对本次请求生效的话，重试环照旧每轮都去敲池子。
-	poolBackoff   sync.Map // 配置作用域 → 取票退避。
-	poolInventory sync.Map // 配置作用域 → *gatewayPoolInventoryState
+	poolBackoff   sync.Map // 账本身份（上游账号粒度）→ time.Time
+	poolInventory sync.Map // 凭证域身份 → *gatewayPoolInventoryState
 }
 
 // openAICodexCookieJarKey：本地行 ID + 凭证域身份。同一行重新授权成另一个 ChatGPT 身份时

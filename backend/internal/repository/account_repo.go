@@ -69,36 +69,18 @@ var schedulerNeutralExtraKeys = map[string]struct{}{
 	"codex_referral_snapshot":    {},
 	"grok_billing_snapshot":      {},
 	"session_window_utilization": {},
-	// turn-state 自动接管的候选池是运行态数据，上游每铸出一条健康 blob 就写一次，
-	// 不参与调度决策——不放进来的话每次响应都要重建一次调度快照。
-	"openai_turn_state_pool": {},
 	// 每个模型最近一次观测到的 turn-state 形态，所有 Codex 账号的响应路径上都会写
 	// （带节流），纯展示不参与调度。
 	"openai_turn_state_observed": {},
 	// CPR 侧的出站代理端点，跟着额度探测刷新，纯展示不参与调度。
 	"cpr_outbound_proxy": {},
-	// turn-state 猎手的运行态（下次窗口 / 本小时次数 / 最近 10 次），每次探测写一次，
-	// 纯展示不参与调度。配置键 openai_turn_state_hunter 由管理员写，不在此列。
-	"openai_turn_state_hunt": {},
-	// 降智恢复探测的运行态（连胜 / 下次窗口 / 已恢复时刻），每次探测写一次，纯展示不参与调度。
-	// 配置键 openai_turn_state_recovery 由管理员写，不在此列。
-	"openai_turn_state_recovery_state": {},
-	// 这个账号落过哪些网关、当前在哪个（openai_gwpool_gateway_history.go）。用量路径上
-	// 带节流地写，纯展示不参与调度。
-	"openai_gwpool_gateways":        {},
-	"openai_gwpool_metrics":         {},
-	"openai_gwpool_feedback_outbox": {},
-	"openai_gwpool_contacts":        {},
-	// 同一上游身份的历史查询标签；运行态中立键，消费端使用 GetByID / FindByExtraField 新鲜读取。
+	// 网关池运行态留在 extra 的部分：同一上游身份的查询标签与 rest/usage 状态（账本本体在
+	// gateway_pool_ledgers）。运行态中立键，消费端使用 GetByID / FindByExtraField 新鲜读取。
 	"openai_gwpool_ledger_tag":           {},
-	"openai_gwpool_previous_ledger_tag":  {},
-	"openai_gwpool_usage_rounds":         {},
 	service.GatewayPoolUsageBlockedAtKey: {},
 	"openai_gwpool_usage_tag":            {},
-	"openai_gwpool_usage_previous_tag":   {},
 	"openai_gwpool_rest_state":           {},
 	"openai_gwpool_rest_tag":             {},
-	"openai_gwpool_rest_previous_tag":    {},
 }
 
 const postgresParameterBatchSize = 50000
@@ -1435,7 +1417,7 @@ func (r *accountRepository) ListByPlatform(ctx context.Context, platform string)
 			dbaccount.PlatformEQ(platform),
 			dbaccount.StatusEQ(service.StatusActive),
 		).
-		// 次级按 ID：同 priority 的行没有次级键时顺序随堆序漂移，猎手的跨 tick 游标靠不住。
+		// 次级按 ID：同 priority 的行没有次级键时顺序随堆序漂移。
 		Order(dbent.Asc(dbaccount.FieldPriority), dbent.Asc(dbaccount.FieldID)).
 		All(ctx)
 	if err != nil {
@@ -2871,32 +2853,20 @@ func (r *accountRepository) UpdateExtra(ctx context.Context, id int64, updates m
 
 	clearProbeSnapshot := upstreamBillingProbeExplicitlyDisabled(updates) || upstreamBillingProbeSnapshotClearRequested(updates)
 	durableSchedulerChange := shouldEnqueueSchedulerOutboxForExtraUpdates(updates) || clearProbeSnapshot
-	_, mergeGatewayHistory := updates[service.OpenAIGatewayHistoryExtraKey]
 	baseCtx := ctx
 	contextTx := dbent.TxFromContext(ctx)
 	client := clientFromContext(ctx, r.client)
 	var tx *dbent.Tx
-	if (durableSchedulerChange || mergeGatewayHistory) && contextTx == nil {
+	if durableSchedulerChange && contextTx == nil {
 		var txErr error
 		tx, txErr = r.client.Tx(ctx)
-		if txErr != nil && (mergeGatewayHistory || !errors.Is(txErr, dbent.ErrTxStarted)) {
+		if txErr != nil && !errors.Is(txErr, dbent.ErrTxStarted) {
 			return txErr
 		}
 		if tx != nil {
 			defer func() { _ = tx.Rollback() }()
 			ctx = dbent.NewTxContext(ctx, tx)
 			client = tx.Client()
-		}
-	}
-	if mergeGatewayHistory {
-		// 行锁必须覆盖读取、合并和写入，进程内 mutex 无法保护多实例。
-		updates, err = mergeLockedGatewayHistoryExtra(ctx, client, id, updates)
-		if err != nil {
-			return err
-		}
-		payload, err = json.Marshal(updates)
-		if err != nil {
-			return err
 		}
 	}
 	extraExpression := "COALESCE(extra, '{}'::jsonb) || $1::jsonb"
@@ -2932,15 +2902,21 @@ func (r *accountRepository) UpdateExtra(ctx context.Context, id int64, updates m
 		if err := enqueueSchedulerOutbox(ctx, client, service.SchedulerOutboxEventAccountChanged, &id, nil, nil); err != nil {
 			return err
 		}
-	}
-	if tx != nil {
-		if err := tx.Commit(); err != nil {
-			return err
+		if tx != nil {
+			if err := tx.Commit(); err != nil {
+				return err
+			}
 		}
-	}
-	if contextTx == nil {
-		// 自有事务提交后才读取最新整行并刷新缓存，保持观测字段的调度中立语义。
-		r.syncSchedulerAccountSnapshot(baseCtx, id)
+		if contextTx == nil {
+			r.syncSchedulerAccountSnapshot(baseCtx, id)
+		}
+	} else {
+		// 观测型 extra 字段不需要触发 bucket 重建，但仍同步单账号快照，
+		// 让 sticky session / GetAccount 命中缓存时也能读到最新数据，
+		// 同时避免缓存局部 patch 覆盖掉并发写入的其它账号字段。
+		if dbent.TxFromContext(ctx) == nil {
+			r.syncSchedulerAccountSnapshot(ctx, id)
+		}
 	}
 	return nil
 }

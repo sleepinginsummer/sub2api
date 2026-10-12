@@ -20,41 +20,26 @@ func TestGatewayPoolFullUsageStopsWhenBusinessBodyFinishes(t *testing.T) {
 	_, err = io.ReadAll(response.Body)
 	require.NoError(t, err)
 	require.NoError(t, response.Body.Close())
-	view, err := svc.GatewayPoolRuntimeProgress(context.Background(), []int64{account.ID})
+	view, err := svc.GatewayPoolRuntimeProgress(context.Background(), []int64{account.ID}, true)
 	require.NoError(t, err)
-	round := view[account.ID].Runtime.Rounds[0]
-	require.Empty(t, round.FullActiveUntil, "EOF/Close must stop usage even while the verified ticket remains live")
-}
-
-func TestGatewayPoolLegacyHeldUsageIsReadOnlyAndNotDisplayed(t *testing.T) {
-	start := time.Now().UTC().Add(-time.Hour)
-	ticket := gatewayPoolUsageTicket{At: start, Full: true, UseStartedAt: start,
-		UseObservedAt: start.Add(20 * time.Second), UseExpiresAt: start.Add(time.Minute), UseSession: "before"}
-	round := GatewayPoolUsageRound{ID: "old", Model: gatewayPoolUsageSharedModel, StartedAt: start,
-		FullStartedAt: start, Full: 1, Attempted: 1, Tickets: map[string]gatewayPoolUsageTicket{"one": ticket}}
-	for _, session := range []string{"before", "after"} {
-		view := round.fullUsageView(session, time.Now())
-		require.Zero(t, view.FullDurationMS)
-		require.Empty(t, view.FullActiveUntil)
-		require.Empty(t, view.FullUsageMode)
-		require.Equal(t, ticket, round.Tickets["one"], "read-only projection cannot settle raw legacy timing")
-	}
-	require.EqualValues(t, 20000, round.legacyFullUseDuration(), "archival keeps observed history, not an unobserved open tail")
+	require.Equal(t, gatewayPoolActiveUsageMode, view[account.ID].Runtime.Rounds[0].FullUsageMode)
+	require.Empty(t, svc.codexCookies.activeUsageTracker(gwpoolTestIdentity).snapshot(),
+		"EOF/Close must stop usage even while the verified ticket remains live")
 }
 
 func TestGatewayPoolFullUsageKeepsEarliestOutOfOrderSend(t *testing.T) {
 	account := gwpoolTestAccount(1)
 	svc, repo := gatewayRuntimeService(account)
-	identity := openAIGatewayPoolCacheKey(account, openAIGatewayPoolAccountKey(account))
+	identity := openAIGatewayPoolAccountKey(account)
 	start := time.Now().UTC().Add(-time.Minute)
 	applied := OpenAIGatewayPoolApplied{AccountID: 1, Gateway: "g", Version: "v"}
 	svc.codexCookies.poolPairs.Store(identity, openAIGatewayPoolPair{cookie: "offline", gateway: "g", version: "v"})
 	svc.codexCookies.gatewayPoolMarkVerifiedFull(identity, "v", "luna")
 	svc.noteGatewayPoolFullUse(context.Background(), account, identity, applied, start.Add(2*time.Second))
 	svc.noteGatewayPoolFullUse(context.Background(), account, identity, applied, start)
-	fresh, err := repo.GetByID(context.Background(), 1)
+	fresh, err := repo.stored(1)
 	require.NoError(t, err)
-	state := readGatewayPoolUsage(fresh, gatewayPoolUsageTag(identity))
+	state := readGatewayPoolUsage(fresh, gatewayPoolLedgerTag(identity))
 	require.Equal(t, start, state.Rounds[0].Tickets[gatewayPoolUsageTicketKey("g", "v")].At)
 }
 
@@ -64,7 +49,7 @@ func TestGatewayPoolFullUsageStartsOnBusinessWriteBeforeResponse(t *testing.T) {
 	account.Credentials["access_token"] = "offline-token"
 	repo := &forkPerformanceRepo{gatewayRuntimeRepo: &gatewayRuntimeRepo{account: *account}}
 	svc := &OpenAIGatewayService{accountRepo: repo}
-	svc.codexCookies.accountByID = repo.GetByID
+	svc.codexCookies.accountByID = svc.gatewayPoolLedgerRow
 	gwpoolEchoSeedVerified(t, svc, account)
 	upstream := &gatewayPoolUsageHeldUpstream{written: make(chan struct{}), release: make(chan struct{})}
 	svc.httpUpstream = upstream
@@ -88,16 +73,17 @@ func TestGatewayPoolFullUsageStartsOnBusinessWriteBeforeResponse(t *testing.T) {
 		close(upstream.release)
 		t.Fatal("business write did not start")
 	}
-	fresh, readErr := repo.GetByID(context.Background(), 1)
+	fresh, readErr := repo.stored(1)
 	writesBeforeResponse := repo.writes
+	inFlight := svc.codexCookies.activeUsageTracker(gwpoolTestIdentity).snapshot()
 	close(upstream.release)
 	<-done
 	require.NoError(t, readErr)
-	state := readGatewayPoolUsage(fresh, gatewayPoolUsageTag(openAIGatewayPoolCacheKey(account, gwpoolTestIdentity)))
+	state := readGatewayPoolUsage(fresh, gatewayPoolLedgerTag(gwpoolTestIdentity))
 	require.Len(t, state.Rounds, 1)
 	require.NotNil(t, state.Rounds[0].ActiveUsage)
-	require.True(t, state.Rounds[0].ActiveUsage.Open)
-	require.Zero(t, state.Rounds[0].FullStartedAt)
+	require.Len(t, inFlight, 1)
+	require.True(t, inFlight[0].end.IsZero(), "the write happened while the business request was still running")
 	require.Equal(t, 1, state.Rounds[0].Full)
 	require.Equal(t, 1, state.Rounds[0].Attempted)
 	require.Equal(t, 2, writesBeforeResponse, "one request-begin write plus one combined business-send write")

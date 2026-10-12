@@ -19,7 +19,7 @@ import (
 func TestGatewayPoolFirstOutputBudgetStartsOnlyAtDispatchAndSurvivesRepair(t *testing.T) {
 	budget := &gatewayPoolFirstOutputBudget{timeout: 20 * time.Millisecond}
 	base := context.WithValue(context.Background(), gatewayPoolFirstOutputBudgetKey{}, budget)
-	ctx, guard := newGatewayPoolFirstOutputGuard(base, func() {}, budget)
+	ctx, guard := newGatewayPoolFirstOutputGuard(base, budget)
 	defer guard.close()
 	time.Sleep(40 * time.Millisecond)
 	require.NoError(t, ctx.Err(), "preparation cannot spend the business first-output budget")
@@ -35,7 +35,7 @@ func TestGatewayPoolFirstOutputBudgetStartsOnlyAtDispatchAndSurvivesRepair(t *te
 		t.Fatal("dispatch did not arm the header timeout")
 	}
 	require.True(t, guard.stopHeaderWait())
-	retry, next := newGatewayPoolFirstOutputGuard(base, func() {}, budget)
+	retry, next := newGatewayPoolFirstOutputGuard(base, budget)
 	defer next.close()
 	select {
 	case <-retry.Done():
@@ -48,7 +48,7 @@ func TestGatewayPoolFirstOutputBudgetStartsOnlyAtDispatchAndSurvivesRepair(t *te
 func TestGatewayPoolFirstOutputUnsentCancelDoesNotStartTimer(t *testing.T) {
 	budget := &gatewayPoolFirstOutputBudget{timeout: time.Second}
 	base, cancel := context.WithCancel(context.Background())
-	ctx, guard := newGatewayPoolFirstOutputGuard(base, func() {}, budget)
+	ctx, guard := newGatewayPoolFirstOutputGuard(base, budget)
 	cancel()
 	require.ErrorIs(t, ctx.Err(), context.Canceled)
 	require.False(t, guard.stopHeaderWait())
@@ -60,7 +60,7 @@ func TestGatewayPoolFirstOutputUnsentCancelDoesNotStartTimer(t *testing.T) {
 type gatewayPoolSlowAdmissionRepo struct{ *gatewayRuntimeRepo }
 
 func (r *gatewayPoolSlowAdmissionRepo) GetByID(ctx context.Context, id int64) (*Account, error) {
-	if err := gatewayPoolSleep(ctx, 60*time.Millisecond); err != nil {
+	if err := sleepWithContext(ctx, 60*time.Millisecond); err != nil {
 		return nil, err
 	}
 	return r.gatewayRuntimeRepo.GetByID(ctx, id)
@@ -72,7 +72,7 @@ func TestGatewayPoolFirstOutputWaitsForFinalFreshAdmission(t *testing.T) {
 	upstream := &gwpoolEchoUpstream{}
 	svc := &OpenAIGatewayService{accountRepo: repo, httpUpstream: upstream}
 	budget := &gatewayPoolFirstOutputBudget{timeout: 20 * time.Millisecond}
-	ctx, guard := newGatewayPoolFirstOutputGuard(context.Background(), func() {}, budget)
+	ctx, guard := newGatewayPoolFirstOutputGuard(context.Background(), budget)
 	defer guard.close()
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, gwpoolTestURL, nil)
 	require.NoError(t, err)
@@ -95,7 +95,7 @@ type gatewayPoolPreparedOutputUpstream struct {
 func (u *gatewayPoolPreparedOutputUpstream) Do(req *http.Request, proxy string, id int64, concurrency int) (*http.Response, error) {
 	if len(u.sentBodies) == 0 {
 		// Preparation takes longer than the configured 1s first-output timeout.
-		if err := gatewayPoolSleep(req.Context(), 1100*time.Millisecond); err != nil {
+		if err := sleepWithContext(req.Context(), 1100*time.Millisecond); err != nil {
 			return nil, err
 		}
 	}

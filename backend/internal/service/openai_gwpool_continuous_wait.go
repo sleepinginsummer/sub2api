@@ -16,16 +16,12 @@ const (
 	gatewayPoolAuthRefreshTimeout      = 35 * time.Second
 )
 
-// Only gateway shortages may wait indefinitely. Account health, request
+// Pool traffic searches until eligible candidates are exhausted; continuous
+// wait additionally waits across exhaustion/cooldown instead of resting. Only
+// gateway shortages may wait indefinitely. Account health, request
 // cancellation and each individual upstream operation retain their limits.
 func (a *Account) GatewayPoolContinuousWaitEnabled() bool {
 	return a != nil && a.UsesGatewayPool() && a.getExtraBool(OpenAIGatewayPoolContinuousWaitKey)
-}
-
-// Quality-protected traffic searches until eligible candidates are exhausted.
-// Continuous wait additionally waits across exhaustion/cooldown instead of resting.
-func (a *Account) GatewayPoolLongWaitEnabled() bool {
-	return a != nil && a.UsesGatewayPool()
 }
 
 func gatewayPoolWaitHealth(account *Account) bool {
@@ -41,7 +37,7 @@ func gatewayPoolWaitHealth(account *Account) bool {
 }
 
 func gatewayPoolWaitTransportMatches(fresh, original *Account) bool {
-	if !original.GatewayPoolLongWaitEnabled() {
+	if !original.UsesGatewayPool() {
 		return true
 	}
 	if (fresh.ProxyID == nil) != (original.ProxyID == nil) {
@@ -178,11 +174,7 @@ func (s *OpenAIGatewayService) gatewayPoolPrepareUntilReady(
 		if shortage, ok := gatewayPoolRetryableShortage(err); ok && shortage.RetryAfter > 0 {
 			gap = shortage.RetryAfter
 		}
-		counter, _ := s.codexCookies.poolContinuousWaiters.LoadOrStore(identity, &atomic.Int32{})
-		waiters, valid := counter.(*atomic.Int32)
-		if !valid {
-			return errors.New("gateway wait counter unavailable")
-		}
+		waiters := gatewayPoolLoadOrNew[atomic.Int32](&s.codexCookies.poolContinuousWaiters, identity)
 		waiters.Add(1)
 		retry, waitErr := s.waitGatewayPoolRetry(ctx, account, gap)
 		waiters.Add(-1)

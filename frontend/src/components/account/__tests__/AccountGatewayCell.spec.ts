@@ -1,8 +1,11 @@
 import { describe, expect, it, vi } from 'vitest'
 import { mount } from '@vue/test-utils'
 import AccountGatewayCell from '../AccountGatewayCell.vue'
+import GatewayQueueCards from '../GatewayQueueCards.vue'
+import GatewayUsedHistory from '../GatewayUsedHistory.vue'
 import type { Account } from '@/types'
 import type { GatewayPoolProgress } from '@/api/admin/accounts'
+import { formatRelativeTime } from '@/utils/format'
 import { gatewayRegionDisplayKey } from '@/utils/gatewayRegionDisplay'
 
 // 只替 useI18n，其余保留真实导出：src/utils/format.ts 会 import src/i18n/index.ts，
@@ -30,6 +33,46 @@ const account = (gateways: unknown, extra: Record<string, unknown> = {}): Accoun
   }) as unknown as Account
 
 const render = (acc: Account) => mount(AccountGatewayCell, { props: { account: acc } })
+// The caption renders the two cooldown counts as separate localized parts.
+const windowUsage = (w: ReturnType<typeof render>) => {
+  const count = (id: string) => JSON.parse(w.get(`[data-testid="gateway-window-${id}"]`).text().replace(/^[^{]*/, '')).count
+  return { used: count('cooling'), cooled: count('cooled') }
+}
+
+it('进度单行只留编号、状态和秒数，尝试/未通过/并发详情保留在提示里', () => {
+  const w = mount(AccountGatewayCell, { props: { account: account({}), progress: {
+    phase: 'ready', sequence: 12, attempt: 23, rejected: 2, elapsed_ms: 46999,
+    active_requests: 3, limit: 0, started_at: '', updated_at: ''
+  } } })
+  const progress = w.get('[data-testid="account-gateway-progress"]')
+  expect(progress.findAll('p')).toHaveLength(0)
+  expect(progress.text()).toContain('gatewayProgress.run:{"id":12}')
+  expect(progress.text()).toContain('gatewayProgress.ready')
+  expect(progress.text()).toContain('gatewayProgress.elapsed:{"seconds":46}')
+  expect(progress.text()).not.toContain('gatewayProgress.count')
+  expect(progress.text()).not.toContain('gatewayProgress.rejected')
+  expect(progress.attributes('title')).toContain('gatewayProgress.count:{"attempt":23,"seconds":46}')
+  expect(progress.attributes('title')).toContain('gatewayProgress.rejected:{"count":2}')
+  expect(progress.attributes('title')).toContain('gatewayProgress.concurrent:{"count":3}')
+  w.unmount()
+})
+
+it.each([
+  [-1000, '00:00:00'], [0, '00:00:00'], [59000, '00:00:59'],
+  [60000, '00:01:00'], [1938000, '00:32:18'], [3600000, '01:00:00'],
+  [90061000, '25:01:01']
+])('时长 %i 毫秒显示为 %s，不在一天后回绕', (ms, expected) => {
+  const w = mount(AccountGatewayCell, { props: { account: account({}), progress: {
+    phase: 'idle', attempt: 0, rejected: 0, elapsed_ms: 0, active_requests: 0, limit: 0,
+    started_at: '', updated_at: '', runtime: {
+      observed_at: '', tickets: [], archived: null,
+      rounds: [{ id: 'r', model: 'all', started_at: isoAgo(1000), full: 1, attempted: 1,
+        full_usage_mode: 'business_active_v1', full_duration_ms: ms }]
+    }
+  } } })
+  expect(w.get('[data-testid="gateway-cycle-duration"]').text()).toBe(expected)
+  w.unmount()
+})
 
 it('验证候选与取票空档不回跳历史票，验满后显示新票', async () => {
   const at = new Date().toISOString()
@@ -49,7 +92,8 @@ it('验证候选与取票空档不回跳历史票，验满后显示新票', asyn
       expect(current).not.toContain('✓')
       await w.setProps({ progress: { ...progress, phase: 'fetching', gateway } })
       const waiting = w.get('[data-testid="account-gateway-current"]').text()
-      expect(waiting).toContain('gatewayProgress.fetching')
+      expect(waiting).toContain('gatewayRuntime.noTicket')
+      expect(w.get('[data-testid="account-gateway-progress"]').text()).toContain('gatewayProgress.fetching')
       expect(waiting).not.toContain('unified-11')
       expect(waiting).not.toContain(gateway)
     }
@@ -84,7 +128,7 @@ it('失焦保留最后一帧，跨过票到期与相对时间边界也不变，�
   const w = mount(AccountGatewayCell, { props: { account: account(history), progress } })
   try {
     const frame = w.html()
-    expect(w.get('[data-testid="account-gateway-window-usage"]').text()).toContain('"used":1,"cooled":1')
+    expect(windowUsage(w)).toEqual({ used: 1, cooled: 1 })
     await w.setProps({ progressPaused: true })
     expect(w.html()).toBe(frame)
     await vi.advanceTimersByTimeAsync(1000)
@@ -99,7 +143,7 @@ it('失焦保留最后一帧，跨过票到期与相对时间边界也不变，�
     await w.setProps({ progressPaused: false, progress: { ...progress, runtime: {
       ...progress.runtime!, observed_at: new Date(Date.now()).toISOString(), tickets: []
     } } })
-    expect(w.get('[data-testid="account-gateway-window-usage"]').text()).toContain('"used":0,"cooled":2')
+    expect(windowUsage(w)).toEqual({ used: 0, cooled: 2 })
     expect(w.get('[data-testid="account-gateway-current-ticket"]').attributes('data-tone')).toBe('idle')
     expect(w.html()).not.toBe(frame)
   } finally {
@@ -146,8 +190,7 @@ it('手动重试只发出账号动作，清冷却墓碑不被最近历史染红'
   } }))
   expect(w.get('[data-testid="account-gateway-current-ticket"]').attributes('data-tone')).toBe('idle')
   const retry = w.get('[data-testid="account-gateway-retry"]')
-  expect(retry.element.parentElement?.classList.contains('justify-end')).toBe(true)
-  expect(retry.element.parentElement).toBe(w.get('[data-testid="account-gateway-window-usage"]').element.parentElement)
+  expect(retry.element.parentElement).toBe(w.get('[data-testid="account-gateway-status-row"]').element)
   expect(retry.classes()).toContain('border')
   expect(retry.get('svg').attributes('aria-hidden')).toBe('true')
   expect(retry.text()).toBe('admin.accounts.openai.gwpoolManualRetry')
@@ -237,9 +280,9 @@ it('网关落点在没有历史时也显示真实验证进度，空快照显示�
     phase: 'verifying', attempt: 2, limit: 5, rejected: 1, elapsed_ms: 8200,
     started_at: new Date().toISOString(), updated_at: new Date().toISOString(), active_requests: 1
   } } })
-  expect(wrapper.get('[data-testid="account-gateway-progress"]').text()).toContain('"attempt":2,"seconds":8')
-  expect(wrapper.get('[data-testid="account-gateway-progress"]').classes()).toContain('whitespace-normal')
-  expect(wrapper.get('[data-testid="account-gateway-progress"]').classes()).toContain('break-words')
+  expect(wrapper.get('[data-testid="account-gateway-progress"]').text()).toContain('"seconds":8')
+  expect(wrapper.get('[data-testid="account-gateway-progress"]').attributes('title')).toContain('"attempt":2,"seconds":8')
+  expect(wrapper.find('[data-testid="account-gateway-progress"] .truncate').exists()).toBe(true)
   await wrapper.setProps({ progress: undefined })
   expect(wrapper.find('[data-testid="account-gateway-progress"]').exists()).toBe(true)
   expect(wrapper.find('[data-testid="account-gateway-progress-unavailable"]').exists()).toBe(false)
@@ -291,7 +334,7 @@ it('失联仍保留已观测时长，归档同排展示且不混入旧模型墙�
   } })
   const current = wrapper.get('[data-testid="account-gateway-usage-round"]').text()
   expect(current).toContain('"full":7,"attempted":9')
-  expect(current).toContain('\\"minutes\\":1,\\"seconds\\":1')
+  expect(wrapper.get('[data-testid="gateway-cycle-duration"]').text()).toBe('00:01:01')
   const history = wrapper.get('[data-testid="account-gateway-usage-history"]').text()
   expect(history).toContain('"count":2')
   expect(history).not.toContain('legacyArchived')
@@ -301,15 +344,324 @@ it('失联仍保留已观测时长，归档同排展示且不混入旧模型墙�
   wrapper.unmount()
 })
 
+it('时长不带下界标记：统计不到的部分直接不计', () => {
+  // Fields an older backend still sends for unobserved time must not bring back a marker.
+  const wrapper = mount(AccountGatewayCell, { props: {
+    account: account(undefined),
+    progress: {
+      phase: 'idle', attempt: 0, limit: 8, rejected: 0, elapsed_ms: 0,
+      started_at: '', updated_at: '', active_requests: 0,
+      runtime: {
+        observed_at: new Date().toISOString(), tickets: [],
+        rounds: [
+          { id: 'active', model: 'all', started_at: isoAgo(1000), full: 1, attempted: 1, full_duration_ms: 5000, full_usage_mode: 'business_active_v1', duration_incomplete: true },
+          { id: 'ended', model: 'all', started_at: isoAgo(3000), ended_at: isoAgo(2000), full: 1, attempted: 1, full_duration_ms: 2000, full_usage_mode: 'business_active_v1', duration_incomplete: true }
+        ],
+        archived: { all: { rounds: 1, full: 1, attempted: 1, active_duration_ms: 1000, active_duration_incomplete: true } }
+      }
+    }
+  } })
+  expect(wrapper.get('[data-testid="gateway-cycle-duration"]').text()).toBe('00:00:05')
+  expect(wrapper.get('[data-testid="gateway-total-duration"]').text()).toBe('00:00:03')
+  for (const id of ['account-gateway-usage-round', 'account-gateway-usage-history']) {
+    expect(wrapper.get(`[data-testid="${id}"]`).attributes('title')).toBe('admin.accounts.openai.gatewayRuntime.activeHint')
+  }
+  wrapper.unmount()
+})
+
+const idleProgress = (runtime: Record<string, unknown> = {}): GatewayPoolProgress => {
+  const at = new Date().toISOString()
+  return {
+    phase: 'idle', attempt: 0, limit: 0, rejected: 0, elapsed_ms: 0, active_requests: 0, started_at: at, updated_at: at,
+    runtime: { observed_at: at, tickets: [], rounds: [], archived: null, ...runtime }
+  }
+}
+
+it('全部历史浮层当前验满置顶、其余按最近排列，失焦期间整帧冻结', async () => {
+  vi.useFakeTimers()
+  const now = Date.now()
+  const iso = (ms: number) => new Date(now - ms).toISOString()
+  const seen = {
+    'unified-1': { at: iso(60_000), region: 'europe', verdict: 'degraded', full_use_ms: 43_000 },
+    'unified-2': { at: iso(120_000), region: 'east-asia' },
+    'unified-3': { at: iso(2 * 3_600_000), region: 'us-east' }
+  }
+  const runtime = (live: boolean) => ({ history: { current: 'unified-2', seen }, tickets: live
+    ? [{ gateway: 'unified-2', region: 'east-asia', verified_at: iso(120_000), verified_models: ['gpt-6-luna'] }] : [] })
+  const w = mount(AccountGatewayCell, { props: { account: account({ seen }), progress: idleProgress(runtime(true)) },
+    global: { stubs: { teleport: true } } })
+  const entries = () => w.findAll('[data-testid="gateway-used-history-entry"]')
+  const panel = () => w.get('[data-testid="gateway-used-history-panel"]').html()
+  try {
+    await w.get('[data-testid="gateway-used-history-trigger"]').trigger('click')
+    expect(entries().map(row => row.attributes('data-gateway'))).toEqual(['unified-2', 'unified-1', 'unified-3'])
+    expect(entries()[0].text()).toContain('gatewayUsed.live')
+    expect(entries()[1].text()).toContain('43s')
+    expect(entries()[1].text()).toContain('gatewayUsed.cooling')
+    expect(entries()[1].attributes('title')).toContain('gatewayHistory.verdicts.degraded')
+    const frame = panel()
+    await w.setProps({ progressPaused: true })
+    await w.setProps({ progress: idleProgress(runtime(false)) })
+    await vi.advanceTimersByTimeAsync(5 * 60_000)
+    expect(panel()).toBe(frame)
+    await w.setProps({ progressPaused: false })
+    expect(entries().map(row => row.attributes('data-gateway'))).toEqual(['unified-1', 'unified-2', 'unified-3'])
+    expect(panel()).not.toBe(frame)
+  } finally {
+    w.unmount()
+    vi.useRealTimers()
+  }
+})
+
+it('全部历史浮层关上期间所选大区消失过，再打开时筛选已回到全部', async () => {
+  const both = { 'unified-1': { at: isoAgo(60), region: 'europe' }, 'unified-2': { at: isoAgo(60), region: 'east-asia' } }
+  const w = mount(AccountGatewayCell, { props: { account: account({ seen: both }) }, global: { stubs: { teleport: true } } })
+  const region = () => (w.get('[data-testid="gateway-used-history-region"]').element as HTMLSelectElement).value
+  try {
+    await w.get('[data-testid="gateway-used-history-trigger"]').trigger('click')
+    await w.get('[data-testid="gateway-used-history-region"]').setValue('europe')
+    await w.get('[data-testid="gateway-used-history-close"]').trigger('click')
+    await w.setProps({ account: account({ seen: { 'unified-2': both['unified-2'] } }) })
+    await w.setProps({ account: account({ seen: both }) })
+    await w.get('[data-testid="gateway-used-history-trigger"]').trigger('click')
+    expect(region()).toBe('all')
+  } finally { w.unmount() }
+})
+
+it('全部历史浮层关上、轮询、再打开，仍停在所选大区与页码', async () => {
+  const seen: Record<string, { at: string; region: string }> = { 'unified-9': { at: isoAgo(90), region: 'europe' } }
+  for (let index = 0; index < 6; index++) seen[`unified-${index}`] = { at: isoAgo(60 + index), region: 'us-east' }
+  const w = mount(AccountGatewayCell, { props: { account: account({ seen }) }, global: { stubs: { teleport: true } } })
+  const region = () => w.get('[data-testid="gateway-used-history-region"]')
+  const page = () => w.get('[data-testid="gateway-used-history-page"]').text()
+  try {
+    await w.get('[data-testid="gateway-used-history-trigger"]').trigger('click')
+    await region().setValue('north-america')
+    await w.get('[data-testid="gateway-used-history-next"]').trigger('click')
+    expect(page()).toBe('2/2 · 6')
+    await w.get('[data-testid="gateway-used-history-close"]').trigger('click')
+    await w.setProps({ account: account({ seen: JSON.parse(JSON.stringify(seen)) }) })
+    await w.get('[data-testid="gateway-used-history-trigger"]').trigger('click')
+    expect((region().element as HTMLSelectElement).value).toBe('north-america')
+    expect(page()).toBe('2/2 · 6')
+  } finally { w.unmount() }
+})
+
+it('失焦期间才打开全部历史，浮层仍是失焦那一刻的读数', async () => {
+  vi.useFakeTimers()
+  const now = Date.now()
+  const iso = (ms: number) => new Date(now - ms).toISOString()
+  const seen = {
+    'unified-1': { at: iso(60_000), region: 'europe', verdict: 'degraded', full_use_ms: 43_000 },
+    'unified-2': { at: iso(120_000), region: 'east-asia' }
+  }
+  const runtime = (live: boolean) => ({ history: { current: 'unified-2', seen }, tickets: live
+    ? [{ gateway: 'unified-2', region: 'east-asia', verified_at: iso(120_000), verified_models: ['gpt-6-luna'] }] : [] })
+  const w = mount(AccountGatewayCell, { props: { account: account({ seen }), progress: idleProgress(runtime(true)) },
+    global: { stubs: { teleport: true } } })
+  const trigger = () => w.get('[data-testid="gateway-used-history-trigger"]')
+  const panel = () => w.get('[data-testid="gateway-used-history-panel"]').html()
+  try {
+    await trigger().trigger('click')
+    const frame = panel()
+    await w.get('[data-testid="gateway-used-history-close"]').trigger('click')
+    await w.setProps({ progressPaused: true })
+    await w.setProps({ progress: idleProgress(runtime(false)) })
+    await vi.advanceTimersByTimeAsync(5 * 60_000)
+    await trigger().trigger('click')
+    expect(panel()).toBe(frame)
+    await w.setProps({ progressPaused: false })
+    expect(panel()).not.toBe(frame)
+  } finally {
+    w.unmount()
+    vi.useRealTimers()
+  }
+})
+
+it('全部历史的状态、颜色与提示只在浮层打开时生成，关上时只给网关与大区', async () => {
+  const seen = { 'unified-1': { at: isoAgo(60), region: 'europe', verdict: 'degraded', full_use_ms: 43_000 } }
+  const w = mount(AccountGatewayCell, { props: { account: account({ seen }) }, global: { stubs: { teleport: true } } })
+  const items = () => w.findComponent(GatewayUsedHistory).props('items')
+  const closed = [{ name: 'unified-1', region: 'europe', title: '', duration: '', status: '', tone: 'idle' }]
+  try {
+    expect(items()).toEqual(closed)
+    await w.get('[data-testid="gateway-used-history-trigger"]').trigger('click')
+    expect(items()).toEqual([expect.objectContaining({ name: 'unified-1', region: 'europe', duration: '43s', tone: 'degraded' })])
+    expect(items()[0].status).toContain('gatewayUsed.cooling')
+    expect(items()[0].title).toContain('gatewayHistory.verdicts.degraded')
+    await w.get('[data-testid="gateway-used-history-close"]').trigger('click')
+    expect(items()).toEqual(closed)
+  } finally { w.unmount() }
+})
+
+it('全部历史浮层关着时，网关与大区不变的轮询不重发列表', async () => {
+  const w = mount(AccountGatewayCell, { props: { account: account({ seen: { 'unified-1': { at: isoAgo(60), region: 'us-east' } } }) } })
+  const items = () => w.findComponent(GatewayUsedHistory).props('items')
+  try {
+    const closed = items()
+    await w.setProps({ account: account({ seen: { 'unified-1': { at: isoAgo(30), region: 'us-east' } } }) })
+    expect(items()).toBe(closed)
+    await w.setProps({ account: account({ seen: { 'unified-1': { at: isoAgo(30), region: 'europe' } } }) })
+    expect(items()).toEqual([expect.objectContaining({ name: 'unified-1', region: 'europe' })])
+  } finally { w.unmount() }
+})
+
+it('同一行换账号时关闭全部历史浮层', async () => {
+  const history = { current: 'unified-1', seen: { 'unified-1': { at: isoAgo(5), region: 'east-asia' } } }
+  const w = mount(AccountGatewayCell, { props: { account: account(history) }, global: { stubs: { teleport: true } } })
+  try {
+    await w.get('[data-testid="gateway-used-history-trigger"]').trigger('click')
+    expect(w.find('[data-testid="gateway-used-history-panel"]').exists()).toBe(true)
+    await w.setProps({ account: { ...account(history), id: 2 } })
+    expect(w.find('[data-testid="gateway-used-history-panel"]').exists()).toBe(false)
+  } finally { w.unmount() }
+})
+
+it('没开网关池的号不拿运行态快照覆盖落点读数', () => {
+  const at = new Date().toISOString()
+  const w = mount(AccountGatewayCell, { props: {
+    account: account({ current: 'unified-old', seen: { 'unified-old': { at, region: 'east-asia' } } }, { openai_gwpool: false }),
+    progress: idleProgress({ history: { current: 'unified-new', seen: { 'unified-new': { at, region: 'europe' } } } })
+  } })
+  try {
+    const current = w.get('[data-testid="account-gateway-current"]').text()
+    expect(current).toContain('unified-old')
+    expect(current).not.toContain('unified-new')
+  } finally { w.unmount() }
+})
+
+it('接触账本与账本标签优先取运行态快照，快照缺省才回退到页面里存的', async () => {
+  const ledger = (tag: string, gateways: string[]) => ({ ledger_tag: tag, tracking_since: isoAgo(3600), rounds: gateways.map((gateway, index) => ({
+    report: { id: `${tag}-${index}`, gateway, model: 'gpt-6-luna', source: 'foreground', at: isoAgo(60 + index), outcome: 'refreshed' }
+  })) })
+  const stored = account({}, { openai_gwpool_ledger_tag: 'stored', openai_gwpool_contacts: ledger('stored', ['unified-1']) })
+  const w = mount(AccountGatewayCell, { props: {
+    account: stored, progress: idleProgress({ ledger_tag: 'fresh', contacts: ledger('fresh', ['unified-2', 'unified-3']) })
+  } })
+  const degraded = () => w.get('[data-testid="gateway-used-degraded"]').text()
+  try {
+    expect(degraded()).toContain('"count":2')
+    await w.setProps({ progress: idleProgress() })
+    expect(degraded()).toContain('"count":1')
+  } finally { w.unmount() }
+})
+
+it('冷却窗口优先取运行态快照，不用页面里存的账号窗口', () => {
+  const seen = { 'unified-1': { at: isoAgo(2 * 3600), region: 'east-asia' } }
+  const w = mount(AccountGatewayCell, { props: {
+    account: account({ seen }), progress: idleProgress({ history: { seen }, gateway_window_seconds: 3600 })
+  } })
+  try { expect(windowUsage(w)).toEqual({ used: 0, cooled: 1 }) } finally { w.unmount() }
+})
+
+it('验证中的候选显示进度更新时间，不借活票的验证时间', () => {
+  const updated = isoAgo(300)
+  const w = mount(AccountGatewayCell, { props: { account: account({}), progress: {
+    ...idleProgress({ tickets: [{ gateway: 'unified-13', region: 'europe', verified_at: isoAgo(7200), verified_models: [] }] }),
+    phase: 'verifying', gateway: 'unified-13', attempt: 1, active_requests: 1, updated_at: updated
+  } } })
+  try {
+    expect(w.get('[data-testid="account-gateway-current-time"]').text()).toBe(formatRelativeTime(updated, Date.now()))
+  } finally { w.unmount() }
+})
+
+it('候选队列直接取运行态快照里的 queues', () => {
+  const queues = { model: 'gpt-6-luna', valid_until: new Date().toISOString(),
+    quality: { count: 1, gateways: ['unified-1'] }, ordinary: { count: 0, gateways: [] } }
+  const w = mount(AccountGatewayCell, { props: { account: account({}), progress: idleProgress({ queues }) } })
+  try { expect(w.findComponent(GatewayQueueCards).props('snapshot')).toEqual(queues) } finally { w.unmount() }
+})
+
+it('每一项读数不暂停时改了就显示，失焦期间改了不透出', async () => {
+  vi.useFakeTimers()
+  const at = new Date().toISOString()
+  const seen = { 'unified-1': { at: isoAgo(2 * 3600), region: 'east-asia' } }
+  const ledger = (tag: string, gateways: string[]) => ({ ledger_tag: tag, tracking_since: isoAgo(3600), rounds: gateways.map((gateway, index) => ({
+    report: { id: `${tag}-${index}`, gateway, model: 'gpt-6-luna', source: 'foreground', at: isoAgo(60 + index), outcome: 'refreshed' }
+  })) })
+  const round = (ms: number) => ({ id: 'r', model: 'all', started_at: isoAgo(100), full: 1, attempted: 1, full_usage_mode: 'business_active_v1', full_duration_ms: ms })
+  const queues = (gateways: string[]) => ({ model: 'gpt-6-luna', valid_until: at, quality: { count: gateways.length, gateways }, ordinary: { count: 0, gateways: [] } })
+  const working = (fields: Partial<GatewayPoolProgress> = {}) =>
+    ({ ...idleProgress(), phase: 'ready', sequence: 1, attempt: 1, elapsed_ms: 1000, active_requests: 1, ...fields }) as GatewayPoolProgress
+  const verifying = (fields: Partial<GatewayPoolProgress> = {}) => working({ phase: 'verifying', gateway: 'unified-13', updated_at: isoAgo(300), ...fields })
+  type Props = Record<string, unknown>
+  const stored = (base: Props, next: Props): [Props, Props] => [{ account: account({ seen }, base) }, { account: account({ seen }, next) }]
+  const snapshot = (base: Props, next: Props): [Props, Props] => [{ progress: idleProgress(base) }, { progress: idleProgress(next) }]
+  const progress = (base: GatewayPoolProgress, next: GatewayPoolProgress): [Props, Props] => [{ progress: base }, { progress: next }]
+  const cases: Array<[string, Props, Props]> = [
+    ['platform', {}, { account: { ...account({ seen }), platform: 'anthropic' } }],
+    ['type', {}, { account: { ...account({ seen }), type: 'apikey' } }],
+    ['openai_gwpool', ...stored({}, { openai_gwpool: false })],
+    ['stored gateways', {}, { account: account({ current: 'unified-1', seen }) }],
+    ['stored window', ...stored({}, { openai_gwpool_gateway_window_s: 3600 })],
+    ['stored contacts', ...stored({ openai_gwpool_ledger_tag: 'stored', openai_gwpool_contacts: ledger('stored', ['unified-2']) },
+      { openai_gwpool_ledger_tag: 'stored', openai_gwpool_contacts: ledger('stored', ['unified-2', 'unified-3']) })],
+    ['stored ledger tag', ...stored({ openai_gwpool_ledger_tag: 'stored', openai_gwpool_contacts: ledger('stored', ['unified-2']) },
+      { openai_gwpool_ledger_tag: 'other', openai_gwpool_contacts: ledger('stored', ['unified-2']) })],
+    ['snapshot history', ...snapshot({ history: { seen } }, { history: { current: 'unified-1', seen } })],
+    ['snapshot window', ...snapshot({ gateway_window_seconds: 14400 }, { gateway_window_seconds: 3600 })],
+    ['snapshot contacts', ...snapshot({ ledger_tag: 'fresh', contacts: ledger('fresh', ['unified-2']) },
+      { ledger_tag: 'fresh', contacts: ledger('fresh', ['unified-2', 'unified-3']) })],
+    ['snapshot ledger tag', ...snapshot({ ledger_tag: 'fresh', contacts: ledger('fresh', ['unified-2']) },
+      { ledger_tag: 'other', contacts: ledger('fresh', ['unified-2']) })],
+    ['tickets', ...snapshot({}, { tickets: [{ gateway: 'unified-1', region: 'east-asia', verified_at: at, verified_models: ['gpt-6-luna'] }] })],
+    ['rounds', ...snapshot({ rounds: [round(1000)] }, { rounds: [round(61_000)] })],
+    ['archived', ...snapshot({}, { archived: { all: { rounds: 4, active_duration_ms: 5000 } } })],
+    ['queues', ...snapshot({ queues: queues(['unified-1']) }, { queues: queues(['unified-1', 'unified-2']) })],
+    ['phase', ...progress(working(), working({ phase: 'waiting' }))],
+    ['sequence', ...progress(working(), working({ sequence: 2 }))],
+    ['attempt', ...progress(working(), working({ attempt: 2 }))],
+    ['rejected', ...progress(working(), working({ rejected: 2 }))],
+    ['elapsed_ms', ...progress(working(), working({ elapsed_ms: 5000 }))],
+    ['active_requests', ...progress(working(), working({ active_requests: 3 }))],
+    ['gateway', ...progress(verifying(), verifying({ gateway: 'unified-15' }))],
+    ['updated_at', ...progress(verifying(), verifying({ updated_at: isoAgo(7200) }))],
+    ['retryPending', {}, { retryPending: true }]
+  ]
+  try {
+    for (const [label, base, next] of cases) {
+      const w = mount(AccountGatewayCell, { props: { account: account({ seen }), ...base } as any })
+      try {
+        const live = w.html()
+        await w.setProps({ progressPaused: true })
+        const frame = w.html()
+        await w.setProps(next)
+        expect(w.html(), `${label} leaked into the paused frame`).toBe(frame)
+        await w.setProps({ progressPaused: false })
+        expect(w.html(), `${label} is not rendered`).not.toBe(live)
+      } finally { w.unmount() }
+    }
+  } finally { vi.useRealTimers() }
+})
+
+it('时钟走动不重建运行态，轮次统计只随新快照重算', async () => {
+  vi.useFakeTimers()
+  const progress = idleProgress({ rounds: [{ id: 'r', model: 'all', started_at: isoAgo(100), full: 1, attempted: 1 }] })
+  const filter = vi.fn(Array.prototype.filter)
+  Object.defineProperty(progress.runtime!.rounds, 'filter', { value: filter, configurable: true, writable: true })
+  const w = mount(AccountGatewayCell, { props: { account: account({}), progress } })
+  try {
+    expect(vi.getTimerCount()).toBeGreaterThan(0)
+    const calls = filter.mock.calls.length
+    await vi.advanceTimersByTimeAsync(10_000)
+    expect(filter.mock.calls.length).toBe(calls)
+    await w.setProps({ progress: { ...progress, runtime: { ...progress.runtime! } } })
+    expect(filter.mock.calls.length).toBe(calls + 1)
+  } finally {
+    w.unmount()
+    vi.useRealTimers()
+  }
+})
+
 // Deliberately not 183s or 100%: 3/5 full × 120s = 72 expected seconds per gateway.
 function accountWithSamples(history: { current: string; seen: Record<string, { at: string; region?: string }> }): Account {
   const rounds = [5 * 3600, 7 * 3600].flatMap((gap, bucket) => Array.from({ length: 5 }, (_, index) => ({
     report: {
       id: `sample-${bucket}-${index}`, gateway: 'unified-sample', model: 'gpt-6-astra',
       criterion: 'state-echo-v1', source: 'foreground', first: 'repeat', at: isoAgo(8 * 3600 + index),
-      gap_known: true, elapsed_seconds: gap, outcome: index < 3 ? 'full' : 'refreshed',
-      window_final: index < 3, full_window_ms: index < 3 ? 120000 : 0
-    }
+      gap_known: true, elapsed_seconds: gap, outcome: index < 3 ? 'full' : 'refreshed'
+    },
+    full_use_ms: index < 3 ? 120000 : 0
   })))
   return account(history, {
     openai_gwpool_ledger_tag: 'same-ledger',
@@ -365,8 +717,7 @@ describe('AccountGatewayCell', () => {
       pool_live: 98,
       pool_free: 1
     }))
-    const summary = w.get('[data-testid="account-gateway-window-usage"]').text()
-    expect(JSON.parse(summary.slice(summary.indexOf('{')))).toEqual({ used: 1, cooled: 2 })
+    expect(windowUsage(w)).toEqual({ used: 1, cooled: 2 })
     expect(w.find('[data-testid="account-gateway-pool-snapshot"]').exists()).toBe(false)
   })
   it('验证统计与反馈保留在数据中但常规界面不展示', () => {
@@ -399,8 +750,7 @@ describe('AccountGatewayCell', () => {
       }
     }))
     expect(w.find('[data-testid="account-gateway-regions"]').exists()).toBe(false)
-    const summary = w.get('[data-testid="account-gateway-window-usage"]').text()
-    expect(JSON.parse(summary.slice(summary.indexOf('{')))).toEqual({ used: 1, cooled: 3 })
+    expect(windowUsage(w)).toEqual({ used: 1, cooled: 3 })
   })
   it('当前落点保留北美归类和具体出口，不把历史网关混入候选', () => {
     const w = render(account({
@@ -421,13 +771,13 @@ describe('AccountGatewayCell', () => {
       seen: {
         'unified-73': { at: isoAgo(61 * 60), region: 'east-asia' },
         'unified-142': {
-          at: isoAgo(60), region: 'us-east', full_held_ms: 75000,
+          at: isoAgo(60), region: 'us-east', full_use_ms: 75000,
           cooldown: { until: isoAgo(-119 * 60), window_seconds: 7200, fixed_seconds: 7200 }
         }
       }
     }, { openai_gwpool_gateway_window_s: undefined }))
     expect(tone(w, 'us-east')).toBe('idle')
-    expect(w.get('[data-testid="account-gateway-window-usage"]').text()).toContain('"used":1,"cooled":1')
+    expect(windowUsage(w)).toEqual({ used: 1, cooled: 1 })
     const title = cell(w, 'us-east').attributes('title') ?? ''
     expect(title).toContain('-75s-')
     expect(title).toContain('regionHot:{"minutes":119}')
@@ -478,7 +828,7 @@ describe('AccountGatewayCell', () => {
         updated_at: isoAgo(600)
       })
     )
-    expect(w.get('[data-testid="account-gateway-window-usage"]').text()).toContain('"used":1,"cooled":1')
+    expect(windowUsage(w)).toEqual({ used: 1, cooled: 1 })
   })
 
   // 窗口是账号自己配的那个旋钮（后端拿同一个数判「这个网关最近烧过没有」）。
@@ -490,9 +840,9 @@ describe('AccountGatewayCell', () => {
       updated_at: isoAgo(3 * 3600)
     }
     // 默认 4 小时：3 小时前打的还算烧着。
-    expect(render(account(seen)).get('[data-testid="account-gateway-window-usage"]').text()).toContain('"used":1,"cooled":0')
+    expect(windowUsage(render(account(seen)))).toEqual({ used: 1, cooled: 0 })
     // 旋钮调到 1 小时：同一条读数就该冷了。
-    expect(render(account(seen, { openai_gwpool_gateway_window_s: 3600 })).get('[data-testid="account-gateway-window-usage"]').text()).toContain('"used":0,"cooled":1')
+    expect(windowUsage(render(account(seen, { openai_gwpool_gateway_window_s: 3600 })))).toEqual({ used: 0, cooled: 1 })
   })
 
   // 大区读不出来的落点（老记录、或这一发被上游改派走了）要能看见，不能悄悄消失。
@@ -522,7 +872,7 @@ describe('AccountGatewayCell', () => {
     expect(cell(w, 'east-asia').text()).toContain('unified-73')
     expect(cell(w, 'east-asia').text()).not.toContain('+1')
     expect(cell(w, 'east-asia').attributes('title') ?? '').not.toContain('-99-')
-    expect(w.get('[data-testid="account-gateway-window-usage"]').text()).toContain('"used":2,"cooled":0')
+    expect(windowUsage(w)).toEqual({ used: 2, cooled: 0 })
   })
 
   it('没有读数时给占位，不是整块消失', () => {
@@ -564,7 +914,7 @@ describe('AccountGatewayCell', () => {
     ]) {
       const w = render(account({ current, seen, updated_at: isoAgo(60) }))
       expect(tone(w, region)).toBe(expected)
-      expect(cell(w, region).text().startsWith('! ')).toBe(expected === 'degraded')
+      expect(w.get('[data-testid="account-gateway-current-mark"]').text()).toBe(expected === 'degraded' ? '!' : '')
       expect(cell(w, region).text()).not.toContain('✓')
       expect(cell(w, region).attributes('title')).toContain(`gatewayHistory.verdicts.${verdict}`)
       w.unmount()
@@ -594,7 +944,7 @@ describe('AccountGatewayCell', () => {
         observed_at: new Date().toISOString(),
         tickets: [{ gateway: 'unified-73', region: 'east-asia', expires_at: new Date(Date.now() + 240_000).toISOString(), verified_models: ['gpt-6-luna'] }],
         rounds: [{ id: 'round', model: 'all', started_at: isoAgo(240), attempted: 8, full: 3, full_duration_ms: 65000 }],
-        archived: { 'gpt-6-luna': { rounds: 2, attempted: 20, full: 5, duration_ms: 200_000 } }
+        archived: { 'gpt-6-luna': { rounds: 2, attempted: 20, full: 5 } }
       }
     }
     const w = mount(AccountGatewayCell, { props: {
@@ -628,33 +978,32 @@ describe('AccountGatewayCell', () => {
     } })
     expect(w.get('[data-testid="account-gateway-current-time"]').text()).toBe('—')
     const usage = w.get('[data-testid="account-gateway-usage-round"]').text()
-    expect(usage).toContain('\\"minutes\\":20,\\"seconds\\":2')
+    expect(w.get('[data-testid="gateway-cycle-duration"]').text()).toBe('00:20:02')
     expect(usage).not.toContain('3418')
     expect(w.text()).not.toContain('gatewayRuntime.hint')
     w.unmount()
   })
 
-  it('周期结束后当前计数时长归零，新周期不累计上一周期', async () => {
+  it('周期结束后本轮格保留刚结束那一轮，新周期从零起算不累计上一周期', async () => {
     const runtime = { observed_at: new Date().toISOString(), tickets: [],
       rounds: [{ id: 'old', model: 'all', started_at: isoAgo(3600), ended_at: isoAgo(1800),
-        attempted: 8, full: 3, full_duration_ms: 65000, full_usage_mode: 'business_active_v1' }], archived: null }
+        attempted: 8, full: 3, full_duration_ms: 65000, full_usage_mode: 'business_active_v1' },
+      { id: 'older', model: 'all', started_at: isoAgo(9000), ended_at: isoAgo(7200),
+        attempted: 4, full: 2, full_duration_ms: 1000, full_usage_mode: 'business_active_v1' }], archived: null }
     const progress = { phase: 'idle' as const, attempt: 0, limit: 5, rejected: 0, elapsed_ms: 0,
       started_at: '', updated_at: '', active_requests: 0, runtime }
     const w = mount(AccountGatewayCell, { props: { account: account({}), progress } })
-    expect(w.find('[data-testid="account-gateway-usage-round"]').exists()).toBe(false)
-    const empty = w.get('[data-testid="account-gateway-usage-idle"]').text()
-    expect(empty).toContain('"full":0,"attempted":0')
-    expect(empty).toContain('\\"minutes\\":0,\\"seconds\\":0')
+    // Between cycles the tile keeps the latest ended round instead of zeros.
+    expect(w.get('[data-testid="gateway-cycle-tickets"]').text()).toContain('"full":3,"attempted":8')
+    expect(w.get('[data-testid="gateway-cycle-duration"]').text()).toBe('00:01:05')
     const history = w.get('[data-testid="account-gateway-usage-history"]').text()
-    expect(history).toContain('"count":1')
-    expect(history).toContain('\\"minutes\\":1,\\"seconds\\":5')
+    expect(history).toContain('"count":2')
+    expect(w.get('[data-testid="gateway-total-duration"]').text()).toBe('00:01:06')
     await w.setProps({ progress: { ...progress, runtime: { ...runtime,
       rounds: [...runtime.rounds, { id: 'new', model: 'all', started_at: isoAgo(30), ended_at: '',
         attempted: 1, full: 1, full_duration_ms: 5000, full_usage_mode: 'business_active_v1' }] } } })
-    expect(w.find('[data-testid="account-gateway-usage-idle"]').exists()).toBe(false)
-    const next = w.get('[data-testid="account-gateway-usage-round"]').text()
-    expect(next).toContain('"full":1,"attempted":1')
-    expect(next).toContain('\\"minutes\\":0,\\"seconds\\":5')
+    expect(w.get('[data-testid="gateway-cycle-tickets"]').text()).toContain('"full":1,"attempted":1')
+    expect(w.get('[data-testid="gateway-cycle-duration"]').text()).toBe('00:00:05')
     expect(w.get('[data-testid="account-gateway-usage-history"]').text()).toBe(history)
     w.unmount()
   })
@@ -666,19 +1015,18 @@ describe('AccountGatewayCell', () => {
       attempted: 8, full: 3, full_duration_ms: 65000, full_usage_mode: 'business_active_v1' }
     const runtime = { observed_at: new Date().toISOString(), tickets: [],
       rounds: [active, ended],
-      archived: { all: { rounds: 2, attempted: 10, full: 4, duration_ms: 900000, duration_incomplete: true, active_duration_ms: 95000 } } }
+      archived: { all: { rounds: 2, attempted: 10, full: 4, active_duration_ms: 95000 } } }
     const progress = { phase: 'idle' as const, attempt: 0, limit: 5, rejected: 0, elapsed_ms: 0,
       started_at: '', updated_at: '', active_requests: 0, runtime }
     const w = mount(AccountGatewayCell, { props: { account: account({}), progress } })
     const history = () => w.get('[data-testid="account-gateway-usage-history"]').text()
     expect(history()).toContain('"count":3')
-    expect(history()).toContain('\\"minutes\\":2,\\"seconds\\":40')
-    expect(history()).not.toContain('durationIncomplete')
+    expect(w.get('[data-testid="gateway-total-duration"]').text()).toBe('00:02:40')
     const before = history()
     await w.setProps({ progress: { ...progress, runtime: { ...runtime, rounds: [active],
-      archived: { all: { rounds: 3, attempted: 18, full: 7, duration_ms: 990000, active_duration_ms: 160000 } } } } })
+      archived: { all: { rounds: 3, attempted: 18, full: 7, active_duration_ms: 160000 } } } } })
     expect(history()).toBe(before)
-    expect(w.get('[data-testid="account-gateway-usage-round"]').text()).toContain('\\"seconds\\":5')
+    expect(w.get('[data-testid="gateway-cycle-duration"]').text()).toBe('00:00:05')
     w.unmount()
   })
 
@@ -693,15 +1041,14 @@ describe('AccountGatewayCell', () => {
           { id: 'legacy-ended', model: 'all', started_at: isoAgo(10000), ended_at: isoAgo(6000),
             attempted: 9, full: 4, full_duration_ms: 3000000 }
         ],
-        archived: { all: { rounds: 3, attempted: 30, full: 12, duration_ms: 9000000 } }
+        archived: { all: { rounds: 3, attempted: 30, full: 12 } }
       }
     } } })
     const current = w.get('[data-testid="account-gateway-usage-round"]').text()
     expect(current).toContain('"full":20,"attempted":20')
-    expect(current).not.toContain('gatewayRuntime.active')
-    const history = w.get('[data-testid="account-gateway-usage-history"]').text()
-    expect(history).toContain('gatewayRuntime.archivedCounts:{"count":4}')
-    expect(history).not.toContain('duration')
+    expect(w.get('[data-testid="gateway-cycle-duration"]').text()).toBe('—')
+    expect(w.get('[data-testid="gateway-total-rounds"]').text()).toContain('gatewayRuntime.totalRounds:{"count":4}')
+    expect(w.get('[data-testid="gateway-total-duration"]').text()).toBe('—')
     w.unmount()
   })
 
@@ -736,7 +1083,7 @@ describe('AccountGatewayCell', () => {
             region: 'east-asia',
             verdict: 'degraded',
             full_at: isoAgo(240),
-            full_held_ms: 180_000
+            full_use_ms: 180_000
           },
           'unified-95': { at: isoAgo(180), region: 'us-east' }
         },
@@ -817,9 +1164,7 @@ describe('AccountGatewayCell', () => {
         updated_at: isoAgo(60)
       })
     )
-    const text = w.get('[data-testid="account-gateway-window-usage"]').text()
-    expect(text).toContain('gatewayHistory.windowUsage:')
-    expect(JSON.parse(text.slice(text.indexOf('{')))).toEqual({ used: 2, cooled: 1 })
+    expect(windowUsage(w)).toEqual({ used: 2, cooled: 1 })
     expect(w.find('[data-testid="account-gateway-pool-snapshot"]').exists()).toBe(false)
   })
 
@@ -832,8 +1177,7 @@ describe('AccountGatewayCell', () => {
     const w = render(
       account({ current: 'unified-0', seen, pool_live: 62, pool_free: 7, updated_at: isoAgo(60) })
     )
-    const text = w.get('[data-testid="account-gateway-window-usage"]').text()
-    expect(JSON.parse(text.slice(text.indexOf('{')))).toEqual({ used: 67, cooled: 0 })
+    expect(windowUsage(w)).toEqual({ used: 67, cooled: 0 })
     expect(w.find('[data-testid="account-gateway-pool-snapshot"]').exists()).toBe(false)
   })
 
@@ -846,9 +1190,7 @@ describe('AccountGatewayCell', () => {
         updated_at: isoAgo(60)
       })
     )
-    const text = w.get('[data-testid="account-gateway-window-usage"]').text()
-    expect(text).toContain('gatewayHistory.windowUsage:')
-    expect(JSON.parse(text.slice(text.indexOf('{')))).toEqual({ used: 1, cooled: 0 })
+    expect(windowUsage(w)).toEqual({ used: 1, cooled: 0 })
     expect(w.find('[data-testid="account-gateway-pool-snapshot"]').exists()).toBe(false)
   })
 
@@ -864,8 +1206,7 @@ describe('AccountGatewayCell', () => {
         updated_at: isoAgo(60)
       })
     )
-    const text = w.get('[data-testid="account-gateway-window-usage"]').text()
-    expect(text).toContain('gatewayHistory.windowUsage:')
+    expect(windowUsage(w)).toEqual({ used: 1, cooled: 0 })
     expect(w.find('[data-testid="account-gateway-pool-snapshot"]').exists()).toBe(false)
   })
 
@@ -880,8 +1221,7 @@ describe('AccountGatewayCell', () => {
         updated_at: isoAgo(60)
       })
     )
-    const text = w.get('[data-testid="account-gateway-window-usage"]').text()
-    expect(text).toContain('gatewayHistory.windowUsage:')
+    expect(windowUsage(w)).toEqual({ used: 1, cooled: 0 })
     expect(w.find('[data-testid="account-gateway-pool-snapshot"]').exists()).toBe(false)
   })
 
@@ -899,7 +1239,7 @@ describe('AccountGatewayCell', () => {
     expect(w.find('[data-testid="account-gateway-forecast"]').exists()).toBe(false)
   })
 
-  // 没有 full_held_ms 就写「未计时」，**绝不拿 at − full_at 顶上**。
+  // 没有 full_use_ms 就写「未计时」，**绝不拿 at − full_at 顶上**。
   //
   // 第一版就是那个减法：full_at 是粘滞的，而 degraded 判定要等下一次真的打到这个网关才会
   // 写，中间空几个小时就白算几个小时 —— 现网渲染出了 22655s / 21738s（满血窗口才 183 秒）。
@@ -931,6 +1271,11 @@ describe('AccountGatewayCell', () => {
     const stale = cell(w, 'us-east').attributes('title') ?? ''
     expect(stale).toContain(`-${base}.fullUntimed-`)
     expect(stale).not.toMatch(/-\d{4,}s-/)
+    // 量到了但不足 1 秒（新周期第一发就判降）：写 <1s，不写成像「没用过」的 0s。
+    await w.setProps({ account: account({ current: 'unified-95', seen: {
+      'unified-95': { at: isoAgo(30), region: 'us-east', verdict: 'degraded', full_use_ms: 300 }
+    } }) })
+    expect(cell(w, 'us-east').attributes('title')).toContain('-<1s-')
   })
 
   // 满血分钟预测：每个网关各算一个单位，使用同层实测率和时长，不是保底。
@@ -951,7 +1296,7 @@ describe('AccountGatewayCell', () => {
         }
       })
     )
-    expect(oneRegion.get('[data-testid="account-gateway-window-usage"]').text()).toContain('"used":0,"cooled":3')
+    expect(windowUsage(oneRegion)).toEqual({ used: 0, cooled: 3 })
     expect(oneRegion.find('[data-testid="account-gateway-forecast"]').exists()).toBe(false)
 
     // 同一大区里新旧混着时**各算各的**：旧的那个已恢复、新的那个还在烧 ⇒ 1 个单位。
@@ -965,13 +1310,13 @@ describe('AccountGatewayCell', () => {
         }
       })
     )
-    expect(staleAndFresh.get('[data-testid="account-gateway-window-usage"]').text()).toContain('"used":1,"cooled":1')
+    expect(windowUsage(staleAndFresh)).toEqual({ used: 1, cooled: 1 })
 
     // 全部刚烧过 ⇒ 一小时内一个都出不来 ⇒ 0 分钟。
     const allBurned = Object.fromEntries(
       Array.from({ length: 9 }, (_, i) => [`unified-${i}`, { at: isoAgo(60), region: 'us-west' }])
     )
-    expect(render(account({ current: 'unified-0', seen: allBurned })).get('[data-testid="account-gateway-window-usage"]').text()).toContain('"used":9,"cooled":0')
+    expect(windowUsage(render(account({ current: 'unified-0', seen: allBurned })))).toEqual({ used: 9, cooled: 0 })
 
     // 足够多的可重试网关仍封顶一小时。
     const many = Object.fromEntries(
@@ -980,7 +1325,7 @@ describe('AccountGatewayCell', () => {
         { at: isoAgo(5 * 3600), region: 'us-west' }
       ])
     )
-    expect(render(accountWithSamples({ current: 'unified-0', seen: many })).get('[data-testid="account-gateway-window-usage"]').text()).toContain('"used":0,"cooled":100')
+    expect(windowUsage(render(accountWithSamples({ current: 'unified-0', seen: many })))).toEqual({ used: 0, cooled: 100 })
 
     // 冷却剩余 ≤ 1 小时就算可用：4 小时窗口下，3.5 小时前烧的那个算回来。
     const recovering = render(
@@ -989,7 +1334,7 @@ describe('AccountGatewayCell', () => {
         seen: { 'unified-1': { at: isoAgo(3.5 * 3600), region: 'us-west' } }
       })
     )
-    expect(recovering.get('[data-testid="account-gateway-window-usage"]').text()).toContain('"used":1,"cooled":0')
+    expect(windowUsage(recovering)).toEqual({ used: 1, cooled: 0 })
   })
 
   // region 完全不参与计数：没带 region 的落点一样是一个有名有姓的网关，照数。
@@ -1008,7 +1353,7 @@ describe('AccountGatewayCell', () => {
         }
       })
     )
-    expect(w.get('[data-testid="account-gateway-window-usage"]').text()).toContain('"used":0,"cooled":3')
+    expect(windowUsage(w)).toEqual({ used: 0, cooled: 3 })
 
     // 它还在窗口里的时候只是「这一个单位不可用」，不该再去扣别人。
     const hotBlind = render(
@@ -1021,7 +1366,7 @@ describe('AccountGatewayCell', () => {
         }
       })
     )
-    expect(hotBlind.get('[data-testid="account-gateway-window-usage"]').text()).toContain('"used":1,"cooled":2')
+    expect(windowUsage(hotBlind)).toEqual({ used: 1, cooled: 2 })
 
     // 那两条按大区的提示文案已经没了，页面上不该再出现它们。
     const text = w.text()

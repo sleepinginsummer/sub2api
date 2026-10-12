@@ -43,6 +43,9 @@ func (s *OpenAIGatewayService) maintainGatewayPoolRests(ctx context.Context) tim
 	next := time.Now().Add(gatewayPoolOutboxPoll)
 	scanCtx, cancel := context.WithTimeout(ctx, gatewayPoolWarmNoteTimeout)
 	accounts, err := s.accountRepo.FindByExtraField(scanCtx, openAIGatewayPoolExtraKey, true)
+	if err == nil {
+		err = s.hydrateGatewayPoolLedgers(scanCtx, gatewayPoolRowPointers(accounts), openAIGatewayHistoryExtraKey)
+	}
 	cancel()
 	if err != nil {
 		slog.Warn("gwpool_local_rest_scan_failed")
@@ -76,8 +79,7 @@ func (s *OpenAIGatewayService) maintainGatewayPoolRests(ctx context.Context) tim
 		if identityErr != nil {
 			continue
 		}
-		// 休息缓存按配置隔离，不能用跨配置共享的消耗账本标签查找截止时间。
-		if raw, ok := s.codexCookies.poolRestState.Load(gatewayPoolRestTag(identity)); ok {
+		if raw, ok := s.codexCookies.poolRestState.Load(gatewayPoolLedgerTag(identity)); ok {
 			if state, valid := raw.(gatewayPoolRestState); valid && state.Active && !state.ResumeAt.IsZero() {
 				if state.ResumeAt.Before(next) {
 					next = state.ResumeAt

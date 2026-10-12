@@ -330,7 +330,6 @@ func TestGatewayPoolSingleTicketRotationFetchesOnlyWhenNeeded(t *testing.T) {
 	fake.cookieForHit = func(hit int64) string { return gwpoolTestPairCookie(t, fmt.Sprintf("unified-%d", hit)) }
 	store := &openAICodexCookieStore{}
 	account := fake.account(1)
-	gwpoolTestIdentity := openAIGatewayPoolAccountKey(account)
 	for i := int64(1); i <= 3; i++ {
 		headers := http.Header{}
 		require.NoError(t, attachRoute(context.Background(), store, account, gwpoolTestURL, headers))
@@ -439,8 +438,7 @@ func TestAttachRouteMatchesAttachGuards(t *testing.T) {
 func TestRoutePairInUseFallsBackToJarWhenDisabled(t *testing.T) {
 	svc := &OpenAIGatewayService{}
 	acct := gwpoolTestAccount(1)
-	acct.Extra[openAIGatewayPoolExtraKey] = false
-	svc.codexCookies.Store(acct, openAITurnStatePairCookieURL, codexCookieUpstreamResponse())
+	svc.codexCookies.Store(acct, chatgptCodexURL, codexCookieUpstreamResponse())
 	pair, fromPool, poolGateway, _ := svc.routePairInUse(acct, http.Header{}, OpenAIGatewayPoolApplied{})
 	require.Equal(t, "__cflb=lb-1; __oailb=jwt-1", pair)
 	require.False(t, fromPool, "没接管就不是覆写")
@@ -797,7 +795,7 @@ func TestGatewayPoolIdentityFollowsParentForShadowRow(t *testing.T) {
 
 	identity, err := svc.codexCookies.gatewayPoolIdentity(context.Background(), shadow)
 	require.NoError(t, err)
-	require.Equal(t, openAIGatewayPoolCacheKey(shadow, gwpoolTestIdentity), identity)
+	require.Equal(t, gwpoolTestIdentity, identity)
 
 	parentIdentity, err := svc.codexCookies.gatewayPoolIdentity(context.Background(), parent)
 	require.NoError(t, err)
@@ -871,15 +869,14 @@ func TestGatewayPoolFetchSurvivesCallerCancel(t *testing.T) {
 	require.Eventually(t, func() bool {
 		store.poolFetch.mu.Lock()
 		defer store.poolFetch.mu.Unlock()
-		call := store.poolFetch.calls[openAIGatewayPoolCacheKey(acct, gwpoolTestIdentity)]
-		return call != nil && call.waiters == 2
+		return store.poolFetch.calls[gwpoolTestIdentity].waiters == 2
 	}, time.Second, time.Millisecond)
 	cancel() // 客户端断开
 	close(release)
 	require.ErrorIs(t, <-done, context.Canceled, "另有等待者时共享取票不被取消")
 	require.NoError(t, <-follower)
 	require.Eventually(t, func() bool {
-		_, state := store.cachedPoolPair(openAIGatewayPoolCacheKey(acct, gwpoolTestIdentity))
+		_, state := store.cachedPoolPair(gwpoolTestIdentity)
 		return state == openAIGatewayPoolPairLive
 	}, time.Second, time.Millisecond)
 	require.EqualValues(t, 1, hits.Load())
@@ -915,7 +912,6 @@ func TestGatewayPoolForcesRotationAfterRouteExpiry(t *testing.T) {
 	fake.forceCookie = "__cflb=pool-lb2; __oailb=" + routeCookieTestOailb(t, "chat.gateway.unified-84.api.openai.com")
 	store := &openAICodexCookieStore{}
 	acct := fake.account(1)
-	gwpoolTestIdentity := openAIGatewayPoolAccountKey(acct)
 
 	headers := http.Header{}
 	require.NoError(t, attachRoute(context.Background(), store, acct, gwpoolTestURL, headers))
@@ -947,7 +943,7 @@ func TestGatewayPoolForceNoSlotFailsClosed(t *testing.T) {
 	acct := fake.account(1)
 	// 罐里有一张能回放的：也不许用。
 	store.Store(acct, gwpoolTestURL, codexCookieUpstreamResponse())
-	store.poolPairs.Store(openAIGatewayPoolCacheKey(acct, gwpoolTestIdentity), openAIGatewayPoolPair{
+	store.poolPairs.Store(gwpoolTestIdentity, openAIGatewayPoolPair{
 		cookie: stale, gateway: "unified-142", version: "tkt-stale", invalidated: true})
 
 	for range 2 {
@@ -1168,7 +1164,7 @@ func TestGatewayPoolLedgerIsKeyedByCredentialIdentityNotRowID(t *testing.T) {
 	require.True(t, store.gatewayPoolUsedRecently(gwpoolTestIdentity, "unified-167", time.Hour))
 
 	// 把缓存那张拨到过期，逼下一发重新取票（否则同身份直接复用窗口内那张）。
-	store.poolPairs.Store(openAIGatewayPoolCacheKey(fake.account(1), gwpoolTestIdentity), openAIGatewayPoolPair{
+	store.poolPairs.Store(gwpoolTestIdentity, openAIGatewayPoolPair{
 		cookie: first, gateway: "unified-167", invalidated: true})
 
 	// 行 35 是同一份凭据的另一个本地行：账本必须共用 ⇒ 167 已经烧过，只能挑 183。
@@ -1249,14 +1245,15 @@ func TestDoOpenAIUpstreamGatewayPoolNoSlotWaitsWithoutFallbackUntilCanceled(t *t
 	require.Empty(t, req.Header.Get("Cookie"), "失败时不许留下降级的回放 cookie")
 }
 
-// 池子接管时取本次请求的快照，而非罐；上游新下发时仍以改派后的路由为准。
+// 池子接管时路由对读数取池子那张（罐已不参与出站，回读罐会记成别的网关）；
+// 上游新下发时仍以新下发的为准——那是改派后的真实落点。
 func TestRoutePairInUsePrefersGatewayPoolPair(t *testing.T) {
 	poolCookie := gwpoolTestPairCookie(t, "unified-142")
 	fake := newGwpoolFakePool(t, poolCookie, 150)
 	svc := &OpenAIGatewayService{}
 	acct := fake.account(1)
 	// 罐里存着另一个网关的 pair，它不该再被当成这一发的读数。
-	svc.codexCookies.Store(acct, openAITurnStatePairCookieURL, codexCookieUpstreamResponse())
+	svc.codexCookies.Store(acct, chatgptCodexURL, codexCookieUpstreamResponse())
 
 	headers := http.Header{}
 	applied := attachRouteApplied(t, &svc.codexCookies, acct, gwpoolTestURL, headers)
@@ -1628,17 +1625,14 @@ func TestGatewayPoolClientMessageSplitsHopelessCodes(t *testing.T) {
 func TestGatewayPoolBackoffErrorCarriesCode(t *testing.T) {
 	store := &openAICodexCookieStore{}
 	const identity = "acct-1"
-	fake := newGwpoolFakePool(t, gwpoolTestPairCookie(t, "unified-142"), 150)
-	account := fake.account(1)
-	cacheKey := openAIGatewayPoolCacheKey(account, identity)
-	store.poolBackoff.Store(gatewayPoolLedgerIdentity(cacheKey),
+	store.poolBackoff.Store(identity,
 		gatewayPoolBackoffEntry{Until: time.Now().Add(5 * time.Minute), Code: gwpool.CodeConsumerRejected})
 
-	remaining, code := store.gatewayPoolBackoffFor(cacheKey)
+	remaining, code := store.gatewayPoolBackoffFor(identity)
 	require.Greater(t, remaining, 4*time.Minute)
 	require.Equal(t, gwpool.CodeConsumerRejected, code)
 
-	_, _, err := store.gatewayPoolPair(context.Background(), account, identity)
+	_, _, err := store.gatewayPoolPair(context.Background(), &Account{ID: 1}, identity)
 	require.ErrorIs(t, err, gwpool.ErrNoSlot, "退避仍然是「这一发没拿到票」")
 	require.Contains(t, gatewayPoolClientMessage(gatewayPoolClientError(err)), "网关池不可用或配置有误",
 		"退避期里也要指向 consumer key，不能继续说槽位不够")
@@ -1701,4 +1695,66 @@ func TestPoolClientCacheKeyFollowsCallTimeout(t *testing.T) {
 	swapped, err := store.poolClient(acct)
 	require.NoError(t, err)
 	require.Same(t, tuned, swapped)
+}
+
+// Test-only probes over production state (no production caller).
+
+func (s *openAICodexCookieStore) gatewayPoolUsedRecently(identity, gateway string, window time.Duration) bool {
+	_, used := s.gatewayPoolUsedAt(identity, gateway, window)
+	return used
+}
+
+func (s *openAICodexCookieStore) beginGatewayPoolAttempt(identity, gateway string, window time.Duration) bool {
+	return s.beginGatewayPoolAttemptAt(identity, gateway, window, nil)
+}
+
+func (s *openAICodexCookieStore) gatewayPoolInventorySnapshot(identity string) (generation uint64, pending bool) {
+	generation, active, candidates := s.gatewayPoolInventoryCandidates(identity)
+	return generation, active || len(candidates) > 0
+}
+
+func (s *openAICodexCookieStore) gatewayPoolRestDuration(identity string, account *Account, now time.Time) time.Duration {
+	if until := s.gatewayPoolLocalResumeAt(identity, account, now); until.After(now) {
+		return until.Sub(now)
+	}
+	return 0
+}
+
+// The edit modal submits the extra snapshot taken when the list loaded. Saving it
+// must neither roll back nor drop gateway-maintained pool runtime state.
+func TestUpdateAccountKeepsGatewayPoolRuntimeState(t *testing.T) {
+	accountID := int64(203)
+	fresh := map[string]any{
+		openAIGatewayPoolContactsExtraKey: map[string]any{"ledger_tag": "fresh"},
+		openAIGatewayLedgerTagExtraKey:    "fresh",
+		openAIGatewayHistoryExtraKey:      map[string]any{"ledger_tag": "fresh"},
+		openAIGatewayPoolOutboxExtraKey:   map[string]any{"pending": []any{"fresh"}},
+		gatewayPoolRestStateKey:           map[string]any{"tag": "fresh", "active": true},
+		gatewayPoolRestTagKey:             "fresh",
+		GatewayPoolUsageBlockedAtKey:      "2026-10-10T10:00:00Z",
+		gatewayPoolUsageExtraKey:          map[string]any{"tag": "fresh"},
+		gatewayPoolUsageTagKey:            "fresh",
+	}
+	stored := map[string]any{openAIGatewayPoolExtraKey: true, openAIGatewayPoolBaseURLExtraKey: "http://127.0.0.1:8099",
+		OpenAIGatewayPoolConsumerKeyExtraKey: "stored-ck"}
+	submitted := map[string]any{openAIGatewayPoolExtraKey: true, openAIGatewayPoolBaseURLExtraKey: "http://127.0.0.1:8099",
+		OpenAIGatewayPoolConsumerKeyExtraKey: true}
+	stale := true
+	for key, value := range fresh {
+		stored[key] = value
+		if stale { // half the keys arrive stale, the rest are missing from the snapshot
+			submitted[key] = "stale"
+		}
+		stale = !stale
+	}
+	repo := &upstreamBillingProbeAccountRepo{accounts: map[int64]*Account{
+		accountID: {ID: accountID, Platform: PlatformOpenAI, Type: AccountTypeOAuth,
+			Credentials: map[string]any{"chatgpt_account_id": "acc-a"}, Extra: stored},
+	}}
+	svc := &adminServiceImpl{accountRepo: repo}
+	_, err := svc.UpdateAccount(context.Background(), accountID, &UpdateAccountInput{Extra: submitted})
+	require.NoError(t, err)
+	for key, value := range fresh {
+		require.Equal(t, value, repo.accounts[accountID].Extra[key], key)
+	}
 }

@@ -172,8 +172,6 @@ func (s *OpenAIGatewayService) bufferChatCompletionsAsResponses(
 	return &OpenAIForwardResult{
 		RequestID:                   requestID,
 		UpstreamHeaders:             resp.Header,
-		GatewayPoolRoutePair:        openAIGatewayPoolRoutePairFromResponse(resp),
-		GatewayPoolApplied:          openAIGatewayPoolAppliedFromResponse(resp),
 		Usage:                       usage,
 		Model:                       originalModel,
 		BillingModel:                billingModel,
@@ -246,8 +244,6 @@ func (s *OpenAIGatewayService) streamChatCompletionsAsResponses(
 		return &OpenAIForwardResult{
 			RequestID:                   requestID,
 			UpstreamHeaders:             resp.Header,
-			GatewayPoolRoutePair:        openAIGatewayPoolRoutePairFromResponse(resp),
-			GatewayPoolApplied:          openAIGatewayPoolAppliedFromResponse(resp),
 			Usage:                       scan.Usage,
 			Model:                       originalModel,
 			BillingModel:                billingModel,
@@ -264,8 +260,6 @@ func (s *OpenAIGatewayService) streamChatCompletionsAsResponses(
 		return &OpenAIForwardResult{
 			RequestID:                   requestID,
 			UpstreamHeaders:             resp.Header,
-			GatewayPoolRoutePair:        openAIGatewayPoolRoutePairFromResponse(resp),
-			GatewayPoolApplied:          openAIGatewayPoolAppliedFromResponse(resp),
 			Usage:                       scan.Usage,
 			Model:                       originalModel,
 			BillingModel:                billingModel,
@@ -298,8 +292,6 @@ func (s *OpenAIGatewayService) streamChatCompletionsAsResponses(
 	return &OpenAIForwardResult{
 		RequestID:                   requestID,
 		UpstreamHeaders:             resp.Header,
-		GatewayPoolRoutePair:        openAIGatewayPoolRoutePairFromResponse(resp),
-		GatewayPoolApplied:          openAIGatewayPoolAppliedFromResponse(resp),
 		Usage:                       scan.Usage,
 		Model:                       originalModel,
 		BillingModel:                billingModel,

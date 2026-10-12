@@ -2,8 +2,6 @@ package service
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"log/slog"
 	"net/http"
@@ -17,7 +15,7 @@ import (
 
 const (
 	openAIGatewayPoolContactsExtraKey = "openai_gwpool_contacts"
-	gatewayPoolContactRoundLimit      = 64
+	gatewayPoolContactRoundLimit      = 300
 	gatewayPoolContactGatewayLimit    = 512
 	gatewayPoolContactAliasLimit      = 8
 )
@@ -50,11 +48,13 @@ type gatewayPoolContactRound struct {
 	LastProbeModel   string                 `json:"last_probe_model,omitempty"`
 	LastProbeSource  string                 `json:"last_probe_source,omitempty"`
 	Steps            []gatewayPoolProbeStep `json:"steps,omitempty"`
+	// FullUseMs is the card's reading for this ticket, written when it degrades.
+	// It stays local: the pool and local ranking keep Report.FullWindowMS.
+	FullUseMs int64 `json:"full_use_ms,omitempty"`
 }
 
 type gatewayPoolContacts struct {
 	LedgerTag        string                            `json:"ledger_tag"`
-	Previous         *gatewayPoolContacts              `json:"previous,omitempty"`
 	TrackingSince    time.Time                         `json:"tracking_since"`
 	HistoryTruncated bool                              `json:"history_truncated,omitempty"`
 	LastUSAt         time.Time                         `json:"last_us_at,omitempty"`
@@ -69,13 +69,8 @@ type gatewayPoolContactEvent struct {
 	Steps                            []gatewayPoolProbeStep
 }
 
-func gatewayPoolContactHash(value string) string {
-	sum := sha256.Sum256([]byte(value))
-	return hex.EncodeToString(sum[:])
-}
-
 func gatewayPoolContactRoundID(identity, version string, at time.Time) string {
-	return gatewayPoolContactHash("contact-round-v1\x00" + gatewayPoolConsumptionIdentity(identity) + "\x00" + version + "\x00" + at.UTC().Format(time.RFC3339Nano))
+	return gatewayPoolDigest("contact-round-v1\x00" + identity + "\x00" + version + "\x00" + at.UTC().Format(time.RFC3339Nano))
 }
 
 func readGatewayPoolContacts(account *Account, tag string) gatewayPoolContacts {
@@ -85,22 +80,47 @@ func readGatewayPoolContacts(account *Account, tag string) gatewayPoolContacts {
 		_ = json.Unmarshal(raw, &state)
 	}
 	if state.LedgerTag != tag {
-		previous := state
-		previous.Previous = nil
-		next := gatewayPoolContacts{LedgerTag: tag}
-		if state.Previous != nil && state.Previous.LedgerTag == tag {
-			next = *state.Previous
-		}
-		if previous.LedgerTag != "" || len(previous.Rounds) > 0 || len(previous.Seen) > 0 {
-			next.Previous = &previous
-		}
-		state = next
+		state = gatewayPoolContacts{LedgerTag: tag}
 	}
 	if state.Seen == nil {
 		state.Seen = map[string]gatewayPoolContactSeen{}
 	}
 	pruneGatewayPoolContacts(&state, time.Now())
 	return state
+}
+
+// gatewayPoolContactsSummary is a row's contacts ledger without its rounds,
+// most of its size, which gatewayPoolContactsLastAt never reads.
+func (s *OpenAIGatewayService) gatewayPoolContactsSummary(ctx context.Context, account *Account) (any, error) {
+	repo, ok := s.accountRepo.(gatewayPoolLedgerRepository)
+	if !ok {
+		return account.Extra[openAIGatewayPoolContactsExtraKey], nil
+	}
+	summary, err := repo.LoadGatewayPoolLedgerWithout(ctx, account.ID, openAIGatewayPoolContactsExtraKey, "rounds")
+	return summary, err
+}
+
+// gatewayPoolContactsLastAt is the newest contact in tag's ledger. Selection
+// needs nothing else, and prune only drops the oldest entries, so this equals
+// the maximum over readGatewayPoolContacts without decoding every round.
+func gatewayPoolContactsLastAt(contacts any, tag string) time.Time {
+	var state struct {
+		LedgerTag string `json:"ledger_tag"`
+		Seen      map[string]struct {
+			LastAt time.Time `json:"last_at"`
+		} `json:"seen"`
+	}
+	raw, _ := json.Marshal(contacts)
+	_ = json.Unmarshal(raw, &state)
+	var last time.Time
+	if state.LedgerTag == tag {
+		for _, seen := range state.Seen {
+			if seen.LastAt.After(last) {
+				last = seen.LastAt
+			}
+		}
+	}
+	return last
 }
 
 func pruneGatewayPoolContacts(state *gatewayPoolContacts, now time.Time) {
@@ -169,6 +189,9 @@ func mergeGatewayPoolContacts(state *gatewayPoolContacts, other gatewayPoolConta
 			if r.Report.WindowFinal && !prev.Report.WindowFinal {
 				target.Report = r.Report
 			}
+			if target.FullUseMs == 0 {
+				target.FullUseMs = r.FullUseMs
+			}
 			if r.LastAt.After(prev.LastAt) {
 				target.LastAt = r.LastAt
 			}
@@ -205,18 +228,14 @@ func (s *OpenAIGatewayService) changeGatewayPoolContacts(ctx context.Context, ac
 		return
 	}
 	tag := gatewayPoolLedgerTag(identity)
-	value, _ := s.codexCookies.poolContactLocks.LoadOrStore(tag, &sync.Mutex{})
-	lock, ok := value.(*sync.Mutex)
-	if !ok {
-		panic("gwpool contact lock has an invalid type")
-	}
+	lock := gatewayPoolLoadOrNew[sync.Mutex](&s.codexCookies.poolContactLocks, tag)
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), gatewayPoolWarmNoteTimeout)
 	defer cancel()
 	lock.Lock()
 	defer lock.Unlock()
 	unlock := s.codexCookies.gatewayPoolHistoryLock(account.ID)
 	defer unlock()
-	fresh, err := s.accountRepo.GetByID(ctx, account.ID)
+	fresh, err := s.gatewayPoolLedgerRow(ctx, account.ID, openAIGatewayPoolContactsExtraKey, openAIGatewayPoolOutboxExtraKey, openAIGatewayHistoryExtraKey)
 	if err != nil || fresh == nil {
 		slog.Warn("gwpool_contact_read_failed", "account_id", account.ID)
 		return
@@ -226,7 +245,7 @@ func (s *OpenAIGatewayService) changeGatewayPoolContacts(ctx context.Context, ac
 		return
 	}
 	state := readGatewayPoolContacts(fresh, tag)
-	peers, err := s.accountRepo.FindByExtraField(ctx, openAIGatewayLedgerTagExtraKey, tag)
+	peers, err := s.gatewayPoolStatePeers(ctx, tag, "contacts", fresh.ID)
 	if err != nil {
 		slog.Warn("gwpool_contact_history_incomplete", "account_id", account.ID)
 		state.HistoryTruncated = true
@@ -250,7 +269,7 @@ func (s *OpenAIGatewayService) changeGatewayPoolContacts(ctx context.Context, ac
 		patch[openAIGatewayPoolOutboxExtraKey] = box
 	}
 	// Contact classification and its outbox item commit in the same extra patch.
-	if err := s.accountRepo.UpdateExtra(ctx, fresh.ID, patch); err != nil {
+	if err := s.updateGatewayPoolRuntimeExtra(ctx, fresh.ID, patch); err != nil {
 		slog.Warn("gwpool_contact_persist_failed", "account_id", account.ID)
 		return
 	}
@@ -288,8 +307,7 @@ func (s *OpenAIGatewayService) noteGatewayPoolContact(ctx context.Context, accou
 			}
 			actualCountry := country
 			if step.ActualGateway != "" && step.ActualGateway != event.Applied.Gateway {
-				value, _ := s.codexCookies.poolDatacenterCountries.Load(account.gatewayPoolBaseURL() + "\x00" + step.ActualGateway)
-				actualCountry, _ = value.(string)
+				actualCountry = s.codexCookies.gatewayPoolDatacenterCountry(account, step.ActualGateway)
 			}
 			touchedUS = touchedUS || actualCountry == "US"
 		}
@@ -301,7 +319,7 @@ func (s *OpenAIGatewayService) noteGatewayPoolContact(ctx context.Context, accou
 		if state.TrackingSince.IsZero() {
 			state.TrackingSince = at
 		}
-		version := gatewayPoolContactHash(event.Applied.Version)
+		version := gatewayPoolDigest(event.Applied.Version)
 		index := -1
 		for i, r := range state.Rounds {
 			if r.Report.Gateway != gateway {
@@ -335,7 +353,7 @@ func (s *OpenAIGatewayService) noteGatewayPoolContact(ctx context.Context, accou
 			tag := gatewayPoolAccountTag(fresh, event.Identity)
 			r := gatewayPoolContactRound{RoundID: event.Applied.RoundID, VersionHash: version, LastAt: last,
 				LastProbeOutcome: event.Outcome, Steps: event.Steps,
-				Report: gwpool.ContactReport{ID: gatewayPoolContactHash("contact-report-v1\x00" + tag + "\x00" + event.Applied.RoundID),
+				Report: gwpool.ContactReport{ID: gatewayPoolDigest("contact-report-v1\x00" + tag + "\x00" + event.Applied.RoundID),
 					AccountTag: tag, Gateway: gateway, Model: event.Model, Criterion: gwpool.ContactCriterion, Source: event.Source,
 					First: first, At: at, GapKnown: gapKnown, ElapsedSeconds: gap, Outcome: event.Outcome}}
 			state.Rounds = append(state.Rounds, r)
@@ -371,8 +389,9 @@ func (r *gatewayPoolContactRound) noteProbe(event gatewayPoolContactEvent) {
 }
 
 func (s *OpenAIGatewayService) finishGatewayPoolContact(ctx context.Context, account *Account, identity string,
-	applied OpenAIGatewayPoolApplied, held time.Duration) {
-	if applied.RoundID == "" || held <= 0 || held > 10*time.Hour {
+	applied OpenAIGatewayPoolApplied, held, used time.Duration) {
+	window := held > 0 && held <= 10*time.Hour
+	if applied.RoundID == "" || (!window && used <= 0) {
 		return
 	}
 	s.changeGatewayPoolContacts(ctx, account, identity, func(_ *Account, state *gatewayPoolContacts) *gwpool.ContactReport {
@@ -380,6 +399,12 @@ func (s *OpenAIGatewayService) finishGatewayPoolContact(ctx context.Context, acc
 			r := &state.Rounds[i]
 			if !r.matchesRound(applied.RoundID) || r.Report.Gateway != applied.Gateway || r.Report.Outcome != "full" || r.Report.WindowFinal {
 				continue
+			}
+			if used > 0 {
+				r.FullUseMs = used.Milliseconds()
+			}
+			if !window {
+				return nil // the use reading stays even when the pool sample is unusable
 			}
 			r.Report.FullWindowMS = held.Milliseconds()
 			r.Report.WindowFinal = true
@@ -391,7 +416,6 @@ func (s *OpenAIGatewayService) finishGatewayPoolContact(ctx context.Context, acc
 }
 
 func (s *OpenAIGatewayService) noteGatewayPoolProbeAndContact(ctx context.Context, account *Account, observation gatewayPoolProbeObservation) {
-	s.noteGatewayPoolProbe(ctx, account, observation)
 	if observation.Shots == 0 {
 		return
 	}
@@ -408,7 +432,7 @@ func (s *OpenAIGatewayService) noteGatewayPoolProbeAndContact(ctx context.Contex
 			s.noteGatewayPoolCooldownVerdict(ctx, account, observation.Applied, verdict)
 		}
 		s.noteOpenAIGatewayUse(context.WithValue(ctx, gatewayPoolObservationEpochKey{}, observation.Applied.cooldownResetAt), account, observation.Applied.Gateway, observation.Applied.Region, verdict, false,
-			observation.Applied.PoolLive, observation.Applied.PoolFree, observation.Applied.FullHeldMs, observation.Applied.LedgerTag)
+			observation.Applied.PoolLive, observation.Applied.PoolFree, observation.Applied.FullUseMs, observation.Applied.LedgerTag)
 	}
 	outcome := "unknown"
 	if observation.Conclusive {
@@ -424,6 +448,11 @@ func (s *OpenAIGatewayService) noteGatewayPoolProbeAndContact(ctx context.Contex
 
 func (s *OpenAIGatewayService) noteGatewayPoolBusinessContact(request *http.Request, account *Account, identity string,
 	applied OpenAIGatewayPoolApplied, started time.Time, responses ...*http.Response) {
+	// Every write below (contact, verified mark via identity, usage) needs this
+	// account's applied route; ordinary responses must not re-decode the body.
+	if account == nil || applied.AccountID != account.ID {
+		return
+	}
 	if len(responses) > 0 && responses[0] != nil {
 		for _, cookie := range responses[0].Cookies() {
 			if cookie.Name != "__oailb" {
@@ -431,8 +460,7 @@ func (s *OpenAIGatewayService) noteGatewayPoolBusinessContact(request *http.Requ
 			}
 			actual := openAICodexRouteGateway("__oailb=" + cookie.Value)
 			if actual != "" && actual != applied.Gateway {
-				value, _ := s.codexCookies.poolDatacenterCountries.Load(account.gatewayPoolBaseURL() + "\x00" + actual)
-				applied.DatacenterCountry, _ = value.(string)
+				applied.DatacenterCountry = s.codexCookies.gatewayPoolDatacenterCountry(account, actual)
 			}
 		}
 	}
