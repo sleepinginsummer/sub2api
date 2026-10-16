@@ -1,7 +1,7 @@
 <template>
   <AppLayout>
-    <div class="custom-page-layout">
-      <div class="card flex-1 min-h-0 overflow-hidden">
+    <div class="custom-page-layout" :class="{ 'custom-page-layout--embedded': isValidUrl && !isMarkdownMode }">
+      <div :class="isValidUrl && !isMarkdownMode ? 'custom-embed-container' : 'card flex-1 min-h-0 overflow-hidden'">
         <div v-if="loading" class="flex h-full items-center justify-center py-12">
           <div
             class="h-8 w-8 animate-spin rounded-full border-2 border-primary-500 border-t-transparent"
@@ -458,6 +458,27 @@ onUnmounted(() => {
   height: calc(100vh - 64px - 4rem);
 }
 
+.custom-page-layout--embedded {
+  height: calc(100vh - 64px);
+  margin: -1rem;
+}
+
+.custom-embed-container {
+  @apply flex-1 min-h-0 overflow-hidden;
+}
+
+@media (min-width: 768px) {
+  .custom-page-layout--embedded {
+    margin: -1.5rem;
+  }
+}
+
+@media (min-width: 1024px) {
+  .custom-page-layout--embedded {
+    margin: -2rem;
+  }
+}
+
 .toc-sidebar {
   @apply flex flex-col h-full border-r border-gray-200 dark:border-dark-600 bg-gray-50 dark:bg-dark-800;
   width: min(240px, 30%);
@@ -517,10 +538,7 @@ onUnmounted(() => {
 }
 
 .custom-embed-shell {
-  @apply relative;
-  @apply h-full w-full overflow-hidden rounded-2xl;
-  @apply bg-gradient-to-b from-gray-50 to-white dark:from-dark-900 dark:to-dark-950;
-  @apply p-0;
+  @apply relative h-full w-full overflow-hidden bg-transparent p-0;
 }
 
 .custom-open-fab {
