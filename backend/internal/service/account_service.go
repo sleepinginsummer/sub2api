@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -115,8 +116,9 @@ type AccountRepository interface {
 	BulkUpdate(ctx context.Context, ids []int64, updates AccountBulkUpdate) (int64, error)
 	// IncrementQuotaUsed 原子递增 API Key 账号的配额用量（总/日/周）
 	IncrementQuotaUsed(ctx context.Context, id int64, amount float64) error
-	// ResetQuotaUsed 重置 API Key 账号所有维度的配额用量为 0
-	ResetQuotaUsed(ctx context.Context, id int64) error
+	// ResetQuotaUsedAndClearRateLimitCooldown atomically resets API Key quota usage
+	// and clears only the account-level rate-limit cooldown.
+	ResetQuotaUsedAndClearRateLimitCooldown(ctx context.Context, id int64) error
 	// RevertProxyFallback 将账号的 proxy_id 切回 proxy_fallback_origin_id，并清空 origin 字段。
 	// 仅当 proxy_fallback_origin_id IS NOT NULL 时更新，否则视为账号不存在（返回 ErrAccountNotFound）。
 	RevertProxyFallback(ctx context.Context, accountID int64) error
@@ -222,6 +224,9 @@ func NewAccountService(accountRepo AccountRepository, groupRepo GroupRepository)
 
 // Create 创建账号
 func (s *AccountService) Create(ctx context.Context, req CreateAccountRequest) (*Account, error) {
+	if req.Platform == PlatformTypeSafe && req.Type != AccountTypeAPIKey {
+		return nil, errors.New("typesafe accounts only support apikey credentials")
+	}
 	// 验证分组是否存在（如果指定了分组）
 	if len(req.GroupIDs) > 0 {
 		if err := s.validateGroupIDsExist(ctx, req.GroupIDs); err != nil {
@@ -514,10 +519,15 @@ func (s *AccountService) TestCredentials(ctx context.Context, id int64) error {
 	case PlatformGrok:
 		// Grok OAuth credentials are validated via token exchange/refresh and request-path probes.
 		return nil
-	case PlatformKimi, PlatformZhipu, PlatformDeepseek:
-		// 国产 OpenAI 兼容供应商：凭证为 API Key，实际可用性经余额/额度探测与转发路径验证。
+	case PlatformTypeSafe:
+		// TypeSafe credentials are API keys; inference failures drive health and cooldown state.
 		return nil
 	default:
+		if IsMultiProtocolAPIKeyProvider(account.Platform) {
+			// 多协议 API Key 供应商（国产厂商与聚合平台）：凭证为 API Key，实际可用性
+			// 经余额/额度探测与转发路径验证。
+			return nil
+		}
 		return fmt.Errorf("unsupported platform: %s", account.Platform)
 	}
 }
