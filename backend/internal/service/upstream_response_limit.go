@@ -58,6 +58,8 @@ func ReadUpstreamResponseBody(reader io.Reader, cfg *config.Config, c *gin.Conte
 		}
 		return nil, err
 	}
+	// 接力票只能由完整且未超限的成功 JSON 确认；SSE 仍由流读取包装器判断完成事件。
+	completeOpenAITurnStateRelayJSON(reader, body)
 	return body, nil
 }
 

@@ -31,8 +31,8 @@ import (
 // Luna 确认不记票（模型不同，openai_quality_guard_probe.go）：
 //   - 200 没给新票（或回显所发那张）：上游认了所发的票，没有有效条目时记下它（客户端自带的也算）；
 //     已有条目不动，免得一张更早发出的票冲掉并发请求刚接上的新票。
-//   - 200 给了新票：所发的票已被换掉，立即丢；新票等这条流以 response.completed 收尾（没有任何 SSE
-//     行的正文读到 EOF）才接，且不顶掉铸得更晚的有效票。上游先回 200 发票、随后 response.failed
+//   - 200 给了新票：所发的票已被换掉，立即丢；新票等 SSE 以 response.completed 收尾，或完整 JSON
+//     确认成功后才接，且不顶掉铸得更晚的有效票。上游先回 200 发票、随后 response.failed
 //     的那张，之后从不被认（2026-10-20 pro1 实测）；被降智防护拦下关掉的响应同理不接。
 //   - 400：这一发带的正是接力票时丢掉（票解不开时上游回 400 invalid_encrypted_content），下一条
 //     不再盖票，等上游重新给。其它状态码不动：429 / 5xx 带回的票是限流、故障的副产物。
@@ -196,8 +196,8 @@ func (s *OpenAIGatewayService) sweepOpenAITurnStateRelay(now time.Time) {
 }
 
 // openAITurnStateRelayBody 等响应真正成功收尾才接上游给的新票：读到 response.completed（事件行或
-// data 的 type）；一行 SSE 都没有的正文（JSON）读到 EOF。失败、截断、提前关闭都不接。不看
-// Content-Type（OAuth 上游可能不带它却照发 SSE）；只看每行开头，不缓存正文。
+// data 的 type）；JSON 则由完整正文读取器确认 status=completed 且无业务错误后接票。
+// 失败、截断、提前关闭都不接；不依赖 Content-Type，OAuth 上游可能不带它却照发 SSE。
 type openAITurnStateRelayBody struct {
 	io.ReadCloser
 	commit func()
@@ -215,11 +215,35 @@ func (b *openAITurnStateRelayBody) Read(p []byte) (int, error) {
 	}
 	if err == io.EOF && b.commit != nil {
 		b.check() // 最后一行可能没有换行
-		if b.commit != nil && !b.sse {
-			b.done()
-		}
 	}
 	return n, err
+}
+
+// completeOpenAITurnStateRelayJSON 穿过请求生命周期包装器，兼容普通 OAuth 与 CPR 的读取路径。
+func completeOpenAITurnStateRelayJSON(reader io.Reader, body []byte) {
+	for {
+		switch wrapped := reader.(type) {
+		case *openAIRequestContextReadCloser:
+			reader = wrapped.ReadCloser
+		case *openAITurnStateRelayBody:
+			wrapped.completeJSON(body)
+			return
+		default:
+			return
+		}
+	}
+}
+
+// completeJSON 复用业务读取器已完整读取并通过大小限制的正文，避免接力包装器重复缓存 JSON。
+// EOF 只表示传输结束；业务状态失败、未完成或正文损坏时都不能接票。
+func (b *openAITurnStateRelayBody) completeJSON(body []byte) {
+	if b.commit == nil || b.sse || !gjson.ValidBytes(body) {
+		return
+	}
+	response := gjson.ParseBytes(body)
+	if response.Get("status").String() == "completed" && response.Get("error").Type == gjson.Null {
+		b.done()
+	}
 }
 
 func (b *openAITurnStateRelayBody) scan(chunk []byte) {

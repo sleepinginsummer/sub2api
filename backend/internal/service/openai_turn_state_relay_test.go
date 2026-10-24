@@ -170,6 +170,15 @@ func TestTurnStateRelayRecordsMintedStateOnlyAfterCompletion(t *testing.T) {
 		name, contentType, body, want string
 	}{
 		{"json_read_to_end", "application/json", `{"status":"completed"}`, "B"},
+		{"json_failed", "application/json", `{"status":"failed","error":{"code":"server_error"}}`, ""},
+		{"json_incomplete", "application/json", `{"status":"incomplete"}`, ""},
+		{"json_missing_status", "application/json", `{"output":[]}`, ""},
+		{"json_completed_with_error", "application/json", `{"status":"completed","error":{"code":"server_error"}}`, ""},
+		{"json_completed_null_error", "application/json", `{"status":"completed","error":null}`, "B"},
+		{"json_truncated", "application/json", `{"status":"completed"`, ""},
+		{"json_trailing_garbage", "application/json", `{"status":"completed"}broken`, ""},
+		{"json_status_after_long_output", "application/json", `{"output":"` + strings.Repeat("x", 1024) + `","status":"completed"}`, "B"},
+		{"json_pretty_printed", "application/json", "{\n  \"status\": \"completed\"\n}", "B"},
 		{"sse_without_content_type_failed", "", failed, ""},
 		{"sse_without_content_type_completed", "", qualityGuardCompleted, "B"},
 	} {
@@ -187,7 +196,9 @@ func TestTurnStateRelayRecordsMintedStateOnlyAfterCompletion(t *testing.T) {
 			resp.Header.Set(openAICodexTurnStateHeader, "B")
 			svc.settleOpenAITurnStateRelay(req, resp)
 			require.Empty(t, turnStateRelayNext(t, svc, c, account, "gpt-5.5"))
-			turnStateRelayDrain(resp)
+			_, err = ReadUpstreamResponseBody(resp.Body, nil, c, nil)
+			require.NoError(t, err)
+			require.NoError(t, resp.Body.Close())
 			require.Equal(t, tc.want, turnStateRelayNext(t, svc, c, account, "gpt-5.5"))
 		})
 	}
@@ -543,4 +554,62 @@ func TestTurnStateRelayConfigValidation(t *testing.T) {
 	account.Type = AccountTypeAPIKey
 	require.Error(t, validateOpenAIQualityGuardExtra(account, map[string]any{openAITurnStateRelayEnabledKey: true}))
 	require.NoError(t, validateOpenAIQualityGuardExtra(account, map[string]any{openAITurnStateRelayEnabledKey: false}))
+}
+
+// 连续两次 CPR 转发：只有成功完成的非流式响应才能向下一请求接力新票。
+func TestTurnStateRelayCPRJSONRequiresCompletion(t *testing.T) {
+	for _, status := range []string{"completed", "failed", "incomplete"} {
+		t.Run(status, func(t *testing.T) {
+			var sent []string
+			svc, account := rawRelayTestSetup(t, func(w http.ResponseWriter, r *http.Request) {
+				sent = append(sent, r.Header.Get(openAICodexTurnStateHeader))
+				w.Header().Set("Content-Type", "application/json")
+				w.Header().Set(openAICodexTurnStateHeader, fmt.Sprintf("minted-%d", len(sent)))
+				_, _ = fmt.Fprintf(w, `{"id":"resp_relay","status":%q,"model":"gpt-5.5","output":[],"usage":{"input_tokens":1,"output_tokens":0}}`, status)
+			})
+			account.Extra[openAITurnStateRelayEnabledKey] = true
+			body := []byte(`{"model":"gpt-5.5","stream":false,"input":"hi","prompt_cache_key":"relay-session"}`)
+			for range 2 {
+				c, _, decoded := rawRelayTestContext(t, context.Background(), "/v1/responses", body, "", nil)
+				_, err := svc.Forward(context.Background(), c, account, decoded)
+				require.NoError(t, err)
+			}
+			require.Len(t, sent, 2)
+			if status == "completed" {
+				require.Equal(t, "minted-1", sent[1])
+			} else {
+				require.Equal(t, "ts-inbound", sent[1], "失败或未完成响应不得把新票接力给下一发")
+			}
+		})
+	}
+}
+
+// 普通 OAuth 会在接力正文外包装请求生命周期管理器，仍应在完整读取后按业务状态接票。
+func TestTurnStateRelayJSONThroughRequestContextReader(t *testing.T) {
+	for _, status := range []string{"completed", "failed"} {
+		t.Run(status, func(t *testing.T) {
+			committed := false
+			closed := false
+			relay := &openAITurnStateRelayBody{
+				ReadCloser: io.NopCloser(strings.NewReader(fmt.Sprintf(`{"status":%q}`, status))),
+				commit:     func() { committed = true },
+			}
+			reader := &openAIRequestContextReadCloser{ReadCloser: relay, cleanup: func() { closed = true }}
+			_, err := ReadUpstreamResponseBody(reader, nil, newConvTestContext(t, nil), nil)
+			require.NoError(t, err)
+			require.Equal(t, status == "completed", committed)
+			require.NoError(t, reader.Close())
+			require.True(t, closed, "接票判定不能影响请求生命周期清理")
+		})
+	}
+}
+
+func TestTurnStateRelayJSONReadFailureDoesNotCommit(t *testing.T) {
+	committed := false
+	source := io.MultiReader(strings.NewReader(`{"status":"completed"}`), iotest.ErrReader(io.ErrUnexpectedEOF))
+	relay := &openAITurnStateRelayBody{ReadCloser: io.NopCloser(source), commit: func() { committed = true }}
+	_, err := ReadUpstreamResponseBody(relay, nil, newConvTestContext(t, nil), nil)
+	require.ErrorIs(t, err, io.ErrUnexpectedEOF)
+	require.False(t, committed, "完整 JSON 后仍有读取错误时不能接票")
+	require.NoError(t, relay.Close())
 }
