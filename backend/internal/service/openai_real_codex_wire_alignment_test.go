@@ -118,9 +118,11 @@ func TestForwardRealCodexLiteOmitsInstructions(t *testing.T) {
 	}
 }
 
-// 原生 v2 压缩回合首发不带 instructions；切换可用兜底模型时必须补回首发提示。
-// 使用尚未退役的 gpt-5.4；它保留 Lite 兼容头，不适用 GPT-5.5 专属剥头规则。
-// HTTP 4xx、非流式与流式 SSE 失败终态均验证重试体和兼容头。
+// 原生 v2 压缩回合（普通 /responses + compaction_trigger）与普通 Lite 轮次同形：首发照真客户端不带
+// instructions（整个会话形态不切换、前缀缓存不断）。上游报上下文超限时换兜底模型重试，兜底落到
+// 非退役模型 gpt-5.4 时重试体必须保留 instructions。GPT-5.5 已被上游订阅模型规则排除，
+// 不再作为成功兜底的夹具；旧模型摘 Lite 头的纯转换仍由 openai_lite_mapped_gpt55_test 覆盖。三条兜底分支（HTTP 4xx、非流式与流式
+// 的 SSE 失败终态）各走一遍。
 func TestForwardRealCodexLiteCompactionFallbackKeepsInstructions(t *testing.T) {
 	sseFailed := "event: response.failed\n" +
 		`data: {"type":"response.failed","response":{"status":"failed","error":{"code":"context_length_exceeded","message":"context window exceeded"}}}` + "\n\n"
@@ -156,7 +158,7 @@ func TestForwardRealCodexLiteCompactionFallbackKeepsInstructions(t *testing.T) {
 			require.False(t, gjson.GetBytes(up.bodies[0], "instructions").Exists(), string(up.bodies[0]))
 			require.Equal(t, "true", up.requests[0].Header.Get(responsesLiteHeader))
 			require.Equal(t, "gpt-5.4", gjson.GetBytes(up.bodies[1], "model").String())
-			require.Equal(t, "true", up.requests[1].Header.Get(responsesLiteHeader), "未退役模型保留 Lite 兼容头")
+			require.Equal(t, "true", up.requests[1].Header.Get(responsesLiteHeader))
 			retryInstructions := gjson.GetBytes(up.bodies[1], "instructions")
 			require.Equal(t, defaultCodexSynthInstructions("gpt-6-astra"), retryInstructions.String(),
 				"补回的是首发模型那份，不是兜底模型的")

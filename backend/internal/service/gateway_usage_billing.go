@@ -137,7 +137,7 @@ func (p *postUsageBillingParams) shouldUpdateRateLimits() bool {
 }
 
 func (p *postUsageBillingParams) shouldUpdateAccountQuota() bool {
-	return p.Cost.TotalCost > 0 && p.Account.IsAPIKeyOrBedrock() && p.Account.HasAnyQuotaLimit()
+	return p.Cost.TotalCost > 0 && p.Account.SupportsAccountQuota() && p.Account.HasAnyQuotaLimit()
 }
 
 // postUsageBilling is the legacy fallback billing path used when the unified
@@ -241,10 +241,15 @@ func isForcedUsageBillingRequestID(requestID string) bool {
 	return strings.HasPrefix(id, "web_search:") ||
 		strings.HasPrefix(id, "grok-video:") ||
 		strings.HasPrefix(id, "grok_audio:") ||
-		// 降智丢弃行必须独立于同次请求的成功行，避免抢占成功行的计费幂等键。
-		strings.HasPrefix(id, "gwpool_degraded:") ||
 		strings.HasPrefix(id, "grok_realtime:") ||
-		strings.HasPrefix(id, GeminiCachedContentUsageRequestIDPrefix)
+		strings.HasPrefix(id, GeminiCachedContentUsageRequestIDPrefix) ||
+		// 网关池 state-echo 判降智后被整发丢弃的那几次尝试。**必须压过 ctx 的 id**：
+		// 丢弃行和随后重试成功那一行属于同一次客户端请求，不 forced 的话两者算出同一个
+		// (request_id, api_key_id) ⇒ 丢弃行先落库抢占 usage_billing_dedup ⇒ 成功那一发
+		// 的 claim 命中已存在行、Applied=false ⇒ 余额/配额/限流/account_stats 全不走，
+		// 而 usage_logs 的插入又被 ON CONFLICT 吃掉 ⇒ 真实那一行连日志都没有，零报错。
+		// 2026-10-02 审计用探针坐实过这条。
+		strings.HasPrefix(id, "gwpool_degraded:")
 }
 
 // StableGrokAudioBillingRequestID is the durable usage_logs / dedup key for one
@@ -347,6 +352,8 @@ func buildUsageBillingCommand(requestID string, usageLog *UsageLog, p *postUsage
 	}
 	if p.shouldUpdateAccountQuota() {
 		cmd.AccountQuotaCost = p.Cost.TotalCost * p.AccountRateMultiplier
+		cmd.AccountQuotaHasDailyLimit = p.Account.GetQuotaDailyLimit() > 0
+		cmd.AccountQuotaHasWeeklyLimit = p.Account.GetQuotaWeeklyLimit() > 0
 	}
 
 	cmd.Normalize()
@@ -543,11 +550,12 @@ func notifyAccountQuota(p *postUsageBillingParams, deps *billingDeps, result *Us
 			slog.Error("panic in notifyAccountQuota", "recover", r)
 		}
 	}()
-	if p.Cost.TotalCost <= 0 || p.Account == nil || !p.Account.IsAPIKeyOrBedrock() || deps.balanceNotifyService == nil {
+	if p.Cost.TotalCost <= 0 || p.Account == nil || !p.Account.SupportsAccountQuota() || !p.Account.HasAnyQuotaLimit() || deps.balanceNotifyService == nil {
 		slog.Debug("notifyAccountQuota: skipped",
 			"total_cost", p.Cost.TotalCost,
 			"account_nil", p.Account == nil,
-			"is_apikey_or_bedrock", p.Account != nil && p.Account.IsAPIKeyOrBedrock(),
+			"supports_account_quota", p.Account != nil && p.Account.SupportsAccountQuota(),
+			"has_quota_limit", p.Account != nil && p.Account.HasAnyQuotaLimit(),
 			"service_nil", deps.balanceNotifyService == nil,
 		)
 		return
@@ -556,6 +564,10 @@ func notifyAccountQuota(p *postUsageBillingParams, deps *billingDeps, result *Us
 	var quotaState *AccountQuotaState
 	if result != nil {
 		quotaState = result.QuotaState
+		// 本应累加却无递增后状态（账号已删除，计数被跳过）：没有新用量，不做阈值判定。
+		if quotaState == nil && p.shouldUpdateAccountQuota() {
+			return
+		}
 	}
 	slog.Debug("notifyAccountQuota: calling CheckAccountQuotaAfterIncrement",
 		"account_id", p.Account.ID,

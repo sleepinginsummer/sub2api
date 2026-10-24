@@ -1,6 +1,9 @@
 <template>
   <section class="space-y-3 border-t border-gray-200 pt-4 dark:border-dark-600" data-testid="bulk-gwpool">
-    <h3 class="font-medium">{{ t('admin.accounts.openai.gwpool') }}</h3>
+    <h3 class="font-medium">
+      {{ t('admin.accounts.openai.gwpool') }}
+      <span class="ml-2 text-xs font-normal text-amber-600 dark:text-amber-400" data-testid="bulk-gwpool-shutdown-note">{{ t('admin.accounts.openai.gwpoolShutdownNote') }}</span>
+    </h3>
     <p class="input-hint">{{ t('admin.accounts.openai.gwpoolBulkHint') }}</p>
     <div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
     <div v-for="field in fields" :key="field.key" class="grid grid-cols-[auto_1fr] items-start gap-3" :class="{ 'sm:col-span-2': field.wide }">
@@ -59,6 +62,7 @@ const fields: Field[] = [
   { key: 'openai_gwpool_consumer_key', label: 'gwpoolConsumerKey', type: 'password', default: '', wide: true },
   { key: 'openai_gwpool_continuous_wait', label: 'gwpoolContinuousWait', hint: 'gwpoolContinuousWaitDesc', type: 'boolean', default: false, wide: true },
   { key: 'openai_gwpool_probe_timeout_s', label: 'gwpoolProbeTimeout', hint: 'gwpoolProbeTimeoutDesc', type: 'number', default: 10, max: 120 },
+  { key: 'openai_gwpool_stop_gateways', label: 'gwpoolStopGateways', hint: 'gwpoolStopGatewaysDesc', type: 'number', default: 5, max: 512 },
   { key: 'openai_gwpool_resume_gateways', label: 'gwpoolResumeGateways', hint: 'gwpoolResumeGatewaysDesc', type: 'number', default: 50, max: 512 },
   { key: 'openai_gwpool_gateway_window_s', label: 'gwpoolGatewayWindow', type: 'number', default: 3600, max: 86400 },
   { key: 'openai_gwpool_cooldown_reset_hours', label: 'gwpoolCooldownResetHours', hint: 'gwpoolCooldownResetDesc', type: 'number', default: 24, min: 0, max: cooldownResetMaxHours },

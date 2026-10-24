@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { defineComponent } from 'vue'
+import CPRConnectionForm from '../CPRConnectionForm.vue'
 import { flushPromises, mount } from '@vue/test-utils'
 import {
   BUILTIN_PLATFORM_CATALOG,
@@ -46,6 +47,12 @@ vi.mock('@/api/admin', () => ({
   }
 }))
 
+// Codex 客户端身份卡片自带请求：本 spec 不涉及，挂起以免 jsdom 真的发 XHR。
+vi.mock('@/api/admin/codexClientProfile', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/api/admin/codexClientProfile')>()),
+  getCodexClientProfile: vi.fn(() => new Promise(() => {})),
+  previewCodexClientProfile: vi.fn(() => new Promise(() => {})),
+}))
 vi.mock('@/api/admin/accounts', () => ({
   getAntigravityDefaultModelMapping: vi.fn()
 }))
@@ -61,6 +68,7 @@ vi.mock('vue-i18n', async () => {
 })
 
 import EditAccountModal from '../EditAccountModal.vue'
+import { getCodexClientProfile } from '@/api/admin/codexClientProfile'
 
 const BaseDialogStub = defineComponent({
   name: 'BaseDialog',
@@ -331,6 +339,255 @@ function mountModal(account = buildAccount(), renderGroupSelector = false) {
 }
 
 describe('EditAccountModal', () => {
+  it('saves unchanged CPR credentials without requiring a new remote connection', async () => {
+    const account = { ...buildAccount(), type: 'cpr', credentials: { base_url: 'http://127.0.0.1:18081', cpr_account_id: 'acct_1' } }
+    updateAccountMock.mockReset().mockResolvedValue(account)
+    checkMixedChannelRiskMock.mockReset().mockResolvedValue({ has_risk: false })
+    const wrapper = mountModal(account)
+    expect(wrapper.getComponent(CPRConnectionForm).props('existingAccountId')).toBe(account.id)
+    await wrapper.get('form#edit-account-form').trigger('submit.prevent')
+    await flushPromises()
+    expect(updateAccountMock).toHaveBeenCalledOnce()
+    expect(updateAccountMock.mock.calls[0]?.[1]?.cpr_auto_configure).toBe(false)
+    wrapper.unmount()
+  })
+
+  it('keeps the redacted Vertex API key when saving without entering a new one', async () => {
+    const account = buildVertexAccount()
+    account.credentials = {
+      auth_mode: 'apikey',
+      project_id: 'demo-project',
+      location: 'us-central1',
+      tier_id: 'vertex'
+    }
+    account.credentials_status = { has_api_key: true }
+    updateAccountMock.mockReset()
+    checkMixedChannelRiskMock.mockReset()
+    checkMixedChannelRiskMock.mockResolvedValue({ has_risk: false })
+    updateAccountMock.mockResolvedValue(account)
+
+    const wrapper = mountModal(account)
+    expect(wrapper.find('[data-testid="edit-vertex-api-key-input"]').exists()).toBe(true)
+    await wrapper.get('[data-testid="edit-vertex-api-key-project-id-input"]').setValue('')
+    await wrapper.get('form#edit-account-form').trigger('submit.prevent')
+
+    expect(updateAccountMock).toHaveBeenCalledTimes(1)
+    const credentials = updateAccountMock.mock.calls[0]?.[1]?.credentials
+    expect(credentials).toMatchObject({ auth_mode: 'apikey', location: 'us-central1', tier_id: 'vertex' })
+    expect(credentials).not.toHaveProperty('api_key')
+    expect(credentials).not.toHaveProperty('project_id')
+  })
+
+  it('submits a rotated Vertex API key', async () => {
+    const account = buildVertexAccount()
+    account.credentials = { auth_mode: 'apikey', location: 'global', tier_id: 'vertex' }
+    account.credentials_status = { has_api_key: true }
+    updateAccountMock.mockReset()
+    checkMixedChannelRiskMock.mockReset()
+    checkMixedChannelRiskMock.mockResolvedValue({ has_risk: false })
+    updateAccountMock.mockResolvedValue(account)
+
+    const wrapper = mountModal(account)
+    await wrapper.get('[data-testid="edit-vertex-api-key-input"]').setValue(' rotated-key ')
+    await wrapper.get('form#edit-account-form').trigger('submit.prevent')
+
+    expect(updateAccountMock).toHaveBeenCalledTimes(1)
+    expect(updateAccountMock.mock.calls[0]?.[1]?.credentials?.api_key).toBe('rotated-key')
+  })
+
+  it('blocks Vertex API key save when no key exists and none is entered', async () => {
+    const account = buildVertexAccount()
+    account.credentials = { auth_mode: 'apikey', location: 'global', tier_id: 'vertex' }
+    updateAccountMock.mockReset()
+    checkMixedChannelRiskMock.mockReset()
+    checkMixedChannelRiskMock.mockResolvedValue({ has_risk: false })
+    const wrapper = mountModal(account)
+    await wrapper.get('form#edit-account-form').trigger('submit.prevent')
+    expect(updateAccountMock).not.toHaveBeenCalled()
+  })
+
+  it('requires an explicit quality guard action and saves wait defaults independently of the pool', async () => {
+    const account = buildAccount()
+    account.type = 'oauth'
+    account.extra = {}
+    updateAccountMock.mockReset().mockResolvedValue(account)
+    checkMixedChannelRiskMock.mockReset().mockResolvedValue({ has_risk: false })
+    const wrapper = mountModal(account)
+    expect(wrapper.get<HTMLInputElement>('[data-testid="edit-quality-guard-enabled"]').element.checked).toBe(false)
+    expect(wrapper.get('[data-testid="edit-gwpool-shutdown-note"]').text()).toBe('admin.accounts.openai.gwpoolShutdownNote')
+    await wrapper.get('[data-testid="edit-quality-guard-enabled"]').setValue(true)
+    expect(wrapper.get<HTMLSelectElement>('[data-testid="edit-quality-guard-mode"]').element.value).toBe('')
+    await wrapper.get('form#edit-account-form').trigger('submit.prevent')
+    expect(updateAccountMock).not.toHaveBeenCalled()
+    await wrapper.get('[data-testid="edit-quality-guard-mode"]').setValue('wait')
+    expect(wrapper.get<HTMLInputElement>('[data-testid="edit-quality-guard-attempts"]').element.value).toBe('20')
+    expect(wrapper.get<HTMLInputElement>('[data-testid="edit-quality-guard-interval"]').element.value).toBe('5')
+    await wrapper.get('form#edit-account-form').trigger('submit.prevent')
+    expect(updateAccountMock.mock.calls[0]?.[1]?.extra).toMatchObject({
+      openai_quality_guard_enabled: true, openai_quality_guard_mode: 'wait',
+      openai_quality_guard_max_attempts: 20, openai_quality_guard_interval_s: 5
+    })
+    expect(updateAccountMock.mock.calls[0]?.[1]?.extra.openai_gwpool).not.toBe(true)
+  })
+
+  it('loads quality guard block mode, resets on account change and removes disabled settings', async () => {
+    const account = buildAccount()
+    account.type = 'setup-token'
+    account.extra = { openai_quality_guard_enabled: true, openai_quality_guard_mode: 'block', openai_quality_guard_max_attempts: 9 }
+    updateAccountMock.mockReset().mockResolvedValue(account)
+    checkMixedChannelRiskMock.mockReset().mockResolvedValue({ has_risk: false })
+    const wrapper = mountModal(account)
+    expect(wrapper.get<HTMLSelectElement>('[data-testid="edit-quality-guard-mode"]').element.value).toBe('block')
+    expect(wrapper.find('[data-testid="edit-quality-guard-attempts"]').exists()).toBe(false)
+    await wrapper.get('[data-testid="edit-quality-guard-enabled"]').setValue(false)
+    await wrapper.get('form#edit-account-form').trigger('submit.prevent')
+    expect(updateAccountMock.mock.calls[0]?.[1]?.extra).not.toHaveProperty('openai_quality_guard_enabled')
+    expect(updateAccountMock.mock.calls[0]?.[1]?.extra).not.toHaveProperty('openai_quality_guard_mode')
+    await wrapper.setProps({ account: { ...account, id: account.id + 1, extra: {} } })
+    await wrapper.get('[data-testid="edit-quality-guard-enabled"]').setValue(true)
+    expect(wrapper.get<HTMLSelectElement>('[data-testid="edit-quality-guard-mode"]').element.value).toBe('')
+    await wrapper.setProps({ account: { ...account, type: 'apikey' } })
+    expect(wrapper.find('[data-testid="edit-quality-guard-section"]').exists()).toBe(false)
+  })
+
+  it('saves turn-state relay independently of the quality guard', async () => {
+    const account = buildAccount()
+    account.type = 'oauth'
+    account.extra = {}
+    updateAccountMock.mockReset().mockResolvedValue(account)
+    checkMixedChannelRiskMock.mockReset().mockResolvedValue({ has_risk: false })
+    const wrapper = mountModal(account)
+    expect(wrapper.get<HTMLInputElement>('[data-testid="edit-turn-state-relay-enabled"]').element.checked).toBe(false)
+    await wrapper.get('[data-testid="edit-turn-state-relay-enabled"]').setValue(true)
+    await wrapper.get('form#edit-account-form').trigger('submit.prevent')
+    const saved = updateAccountMock.mock.calls[0]?.[1]?.extra
+    expect(saved).toMatchObject({ openai_turn_state_relay_enabled: true })
+    expect(saved).not.toHaveProperty('openai_quality_guard_enabled')
+    expect(saved).not.toHaveProperty('openai_quality_guard_mode')
+  })
+
+  it('saves the account Codex client profile and clears it back to inherit', async () => {
+    const profile = { client: 'cli', platform: 'linux', versionMode: 'latest' }
+    vi.mocked(getCodexClientProfile).mockResolvedValueOnce({
+      global: null,
+      effective: { user_agent: 'Codex Desktop/0.163.0', originator: 'Codex Desktop', version: '0.163.0' },
+      fallback: { user_agent: 'Codex Desktop/0.163.0', originator: 'Codex Desktop', version: '0.163.0' },
+      presets: [
+        { profile: { client: 'desktop', platform: 'macos', versionMode: 'latest' }, originator: 'Codex Desktop', os_type: 'Mac OS', os_version: '26.7.1', arch: 'arm64', terminal: 'unknown' },
+        { profile, originator: 'codex_cli_rs', os_type: 'Ubuntu', os_version: '26.4.0', arch: 'x86_64', terminal: 'unknown' },
+      ],
+      max_version_lag: 10,
+      refreshing: false,
+      desktop: {} as never,
+      cli: [],
+    } as never)
+    const account = buildAccount()
+    account.type = 'oauth'
+    account.extra = { codex_client_profile: profile }
+    updateAccountMock.mockReset().mockResolvedValue(account)
+    checkMixedChannelRiskMock.mockReset().mockResolvedValue({ has_risk: false })
+    const wrapper = mountModal(account)
+    await flushPromises()
+    expect(wrapper.find('[data-testid="edit-codex-client-profile"]').exists()).toBe(true)
+
+    await wrapper.get('form#edit-account-form').trigger('submit.prevent')
+    expect(updateAccountMock.mock.calls[0]?.[1]?.extra?.codex_client_profile).toEqual(profile)
+
+    await wrapper.get('[data-testid="codex-profile-preset"]').setValue('')
+    await wrapper.get('form#edit-account-form').trigger('submit.prevent')
+    expect(updateAccountMock.mock.calls[1]?.[1]?.extra).not.toHaveProperty('codex_client_profile')
+  })
+
+  it('keeps the custom UA and the preset as one choice of the identity select', async () => {
+    const profile = { client: 'cli', platform: 'linux', versionMode: 'latest' }
+    const customUA = 'codex_cli_rs/0.160.0 (Windows 10.0.26100; x86_64) unknown'
+    vi.mocked(getCodexClientProfile).mockResolvedValueOnce({
+      global: null,
+      effective: { user_agent: 'Codex Desktop/0.163.0', originator: 'Codex Desktop', version: '0.163.0' },
+      fallback: { user_agent: 'Codex Desktop/0.163.0', originator: 'Codex Desktop', version: '0.163.0' },
+      presets: [{ profile, originator: 'codex_cli_rs', os_type: 'Ubuntu', os_version: '26.4.0', arch: 'x86_64', terminal: 'unknown' }],
+      max_version_lag: 10,
+      refreshing: false,
+      desktop: {} as never,
+      cli: [],
+    } as never)
+    const account = buildAccount()
+    account.type = 'oauth'
+    account.extra = { codex_user_agent: customUA }
+    updateAccountMock.mockReset().mockResolvedValue(account)
+    checkMixedChannelRiskMock.mockReset().mockResolvedValue({ has_risk: false })
+    const wrapper = mountModal(account)
+    await flushPromises()
+    const select = () => wrapper.get<HTMLSelectElement>('[data-testid="codex-profile-preset"]')
+    const uaInput = () => wrapper.find<HTMLInputElement>('[data-testid="edit-codex-user-agent-input"]')
+    const submit = async () => {
+      await wrapper.get('form#edit-account-form').trigger('submit.prevent')
+      return updateAccountMock.mock.calls.at(-1)?.[1]?.extra
+    }
+
+    expect(select().element.value).toBe('custom')
+    expect(uaInput().element.value).toBe(customUA)
+    let saved = await submit()
+    expect(saved).toMatchObject({ codex_user_agent: customUA })
+    expect(saved).not.toHaveProperty('codex_client_profile')
+
+    await select().setValue('cli:linux')
+    expect(uaInput().exists()).toBe(false)
+    saved = await submit()
+    expect(saved?.codex_client_profile).toEqual(profile)
+    expect(saved).not.toHaveProperty('codex_user_agent')
+
+    await select().setValue('')
+    saved = await submit()
+    expect(saved).not.toHaveProperty('codex_client_profile')
+    expect(saved).not.toHaveProperty('codex_user_agent')
+  })
+
+  it('hides the Codex client profile on spark shadows', async () => {
+    vi.mocked(getCodexClientProfile).mockResolvedValueOnce({ presets: [], max_version_lag: 10, effective: { user_agent: '' } } as never)
+    const shadow = { ...buildOpenAIOAuthParentAccount(), id: 8, parent_account_id: 7 }
+    const wrapper = mountModal(shadow)
+    await flushPromises()
+    expect(wrapper.find('[data-testid="edit-codex-client-profile"]').exists()).toBe(false)
+    // 影子行没有预设面板，自己的自定义 UA 照旧直接可编辑。
+    expect(wrapper.find('[data-testid="edit-codex-user-agent-input"]').exists()).toBe(true)
+  })
+
+  it('loads and clears turn-state relay', async () => {
+    const account = buildAccount()
+    account.type = 'setup-token'
+    account.extra = { openai_turn_state_relay_enabled: true }
+    updateAccountMock.mockReset().mockResolvedValue(account)
+    checkMixedChannelRiskMock.mockReset().mockResolvedValue({ has_risk: false })
+    const wrapper = mountModal(account)
+    expect(wrapper.get<HTMLInputElement>('[data-testid="edit-turn-state-relay-enabled"]').element.checked).toBe(true)
+    await wrapper.get('[data-testid="edit-turn-state-relay-enabled"]').setValue(false)
+    await wrapper.get('form#edit-account-form').trigger('submit.prevent')
+    expect(updateAccountMock.mock.calls[0]?.[1]?.extra).not.toHaveProperty('openai_turn_state_relay_enabled')
+  })
+
+  it('offers turn-state relay on CPR accounts without the quality guard', async () => {
+    const account = { ...buildAccount(), type: 'cpr', extra: {}, credentials: { base_url: 'http://127.0.0.1:18081', cpr_account_id: 'acct_1' } }
+    updateAccountMock.mockReset().mockResolvedValue(account)
+    checkMixedChannelRiskMock.mockReset().mockResolvedValue({ has_risk: false })
+    const wrapper = mountModal(account)
+    expect(wrapper.find('[data-testid="edit-quality-guard-enabled"]').exists()).toBe(false)
+    await wrapper.get('[data-testid="edit-turn-state-relay-enabled"]').setValue(true)
+    await wrapper.get('form#edit-account-form').trigger('submit.prevent')
+    await flushPromises()
+    expect(updateAccountMock.mock.calls[0]?.[1]?.extra).toMatchObject({ openai_turn_state_relay_enabled: true })
+  })
+
+  it('notes that gateway-pool accounts do not relay turn-state', () => {
+    const account = buildAccount()
+    account.type = 'oauth'
+    account.extra = { openai_gwpool: true }
+    const wrapper = mountModal(account)
+    expect(wrapper.text()).toContain('admin.accounts.openai.turnStateRelayPool')
+    const plain = mountModal({ ...account, id: account.id + 1, extra: {} })
+    expect(plain.text()).not.toContain('admin.accounts.openai.turnStateRelayPool')
+  })
+
   beforeEach(() => {
     authIsSimpleMode.value = true
   })
@@ -1326,6 +1583,35 @@ describe('EditAccountModal', () => {
     expect(updateAccountMock.mock.calls[0]?.[1]?.extra).not.toHaveProperty('openai_gwpool_rotation_min_gateways')
   })
 
+  it('saves the default5 stop threshold independently from recovery and retired settings', async () => {
+    const account = buildAccount()
+    account.type = 'oauth'
+    account.extra = { openai_gwpool: true, openai_gwpool_base_url: 'https://pool.example.test',
+      openai_gwpool_rotation_min_gateways: 99, openai_gwpool_resume_gateways: 50 }
+    updateAccountMock.mockReset().mockResolvedValue(account)
+    checkMixedChannelRiskMock.mockReset().mockResolvedValue({ has_risk: false })
+    const wrapper = mountModal(account)
+    const stop = wrapper.get<HTMLInputElement>('[data-testid="edit-openai-gwpool-stop-gateways"]')
+    expect(stop.element.value).toBe('')
+    expect(stop.attributes('placeholder')).toBe('5')
+    await stop.setValue('8')
+    await wrapper.get('form#edit-account-form').trigger('submit.prevent')
+    let extra = updateAccountMock.mock.calls[0]?.[1]?.extra
+    expect(extra?.openai_gwpool_stop_gateways).toBe(8)
+    expect(extra?.openai_gwpool_resume_gateways).toBe(50)
+    expect(extra).not.toHaveProperty('openai_gwpool_rotation_min_gateways')
+    updateAccountMock.mockReset().mockResolvedValue(account)
+    await stop.setValue('')
+    await wrapper.get('form#edit-account-form').trigger('submit.prevent')
+    extra = updateAccountMock.mock.calls[0]?.[1]?.extra
+    expect(extra).not.toHaveProperty('openai_gwpool_stop_gateways')
+    expect(extra?.openai_gwpool_resume_gateways).toBe(50)
+    const loaded = mountModal({ ...account, extra: { ...account.extra, openai_gwpool_stop_gateways: 7, openai_gwpool_continuous_wait: true } })
+    expect(loaded.get<HTMLInputElement>('[data-testid="edit-openai-gwpool-stop-gateways"]').element.value).toBe('7')
+    expect(loaded.get('[data-testid="edit-openai-gwpool-thresholds"]').attributes('disabled')).toBeDefined()
+    loaded.unmount()
+    wrapper.unmount()
+  })
   it('keeps default50 recovery independent from retired stop settings and saves overrides', async () => {
     const account = buildAccount()
     account.type = 'oauth'
@@ -2347,6 +2633,26 @@ describe('EditAccountModal', () => {
     expect(updateAccountMock).toHaveBeenCalledTimes(1)
   })
 
+  it('shows quota limit card for Vertex SA account and keeps quota limits on save', async () => {
+    const account = buildVertexAccount()
+    account.extra = { quota_limit: 200, quota_daily_limit: 20, quota_used: 35.5 }
+    updateAccountMock.mockReset()
+    checkMixedChannelRiskMock.mockReset()
+    checkMixedChannelRiskMock.mockResolvedValue({ has_risk: false })
+    updateAccountMock.mockResolvedValue(account)
+
+    const wrapper = mountModal(account)
+    expect(wrapper.findComponent({ name: 'QuotaLimitCard' }).exists()).toBe(true)
+
+    await wrapper.get('form#edit-account-form').trigger('submit.prevent')
+
+    expect(updateAccountMock).toHaveBeenCalledTimes(1)
+    const extra = updateAccountMock.mock.calls[0]?.[1]?.extra
+    expect(extra?.quota_limit).toBe(200)
+    expect(extra?.quota_daily_limit).toBe(20)
+    expect(extra?.quota_weekly_limit).toBeUndefined()
+  })
+
   it('blocks Vertex SA save when neither credentials_status nor legacy json indicates existence', async () => {
     const account = buildVertexAccount()
     account.credentials = {
@@ -2362,62 +2668,6 @@ describe('EditAccountModal', () => {
 
     const wrapper = mountModal(account)
 
-    await wrapper.get('form#edit-account-form').trigger('submit.prevent')
-
-    expect(updateAccountMock).not.toHaveBeenCalled()
-  })
-
-  it('keeps the redacted Vertex API key when saving without entering a new one', async () => {
-    const account = buildVertexAccount()
-    account.credentials = {
-      auth_mode: 'apikey',
-      project_id: 'demo-project',
-      location: 'us-central1',
-      tier_id: 'vertex'
-    }
-    account.credentials_status = { has_api_key: true }
-    updateAccountMock.mockReset()
-    checkMixedChannelRiskMock.mockReset()
-    checkMixedChannelRiskMock.mockResolvedValue({ has_risk: false })
-    updateAccountMock.mockResolvedValue(account)
-
-    const wrapper = mountModal(account)
-    expect(wrapper.find('[data-testid="edit-vertex-api-key-input"]').exists()).toBe(true)
-    await wrapper.get('[data-testid="edit-vertex-api-key-project-id-input"]').setValue('')
-    await wrapper.get('form#edit-account-form').trigger('submit.prevent')
-
-    expect(updateAccountMock).toHaveBeenCalledTimes(1)
-    const credentials = updateAccountMock.mock.calls[0]?.[1]?.credentials
-    expect(credentials).toMatchObject({ auth_mode: 'apikey', location: 'us-central1', tier_id: 'vertex' })
-    expect(credentials).not.toHaveProperty('api_key')
-    expect(credentials).not.toHaveProperty('project_id')
-  })
-
-  it('submits a rotated Vertex API key', async () => {
-    const account = buildVertexAccount()
-    account.credentials = { auth_mode: 'apikey', location: 'global', tier_id: 'vertex' }
-    account.credentials_status = { has_api_key: true }
-    updateAccountMock.mockReset()
-    checkMixedChannelRiskMock.mockReset()
-    checkMixedChannelRiskMock.mockResolvedValue({ has_risk: false })
-    updateAccountMock.mockResolvedValue(account)
-
-    const wrapper = mountModal(account)
-    await wrapper.get('[data-testid="edit-vertex-api-key-input"]').setValue(' rotated-key ')
-    await wrapper.get('form#edit-account-form').trigger('submit.prevent')
-
-    expect(updateAccountMock).toHaveBeenCalledTimes(1)
-    expect(updateAccountMock.mock.calls[0]?.[1]?.credentials?.api_key).toBe('rotated-key')
-  })
-
-  it('blocks Vertex API key save when no key exists and none is entered', async () => {
-    const account = buildVertexAccount()
-    account.credentials = { auth_mode: 'apikey', location: 'global', tier_id: 'vertex' }
-    updateAccountMock.mockReset()
-    checkMixedChannelRiskMock.mockReset()
-    checkMixedChannelRiskMock.mockResolvedValue({ has_risk: false })
-
-    const wrapper = mountModal(account)
     await wrapper.get('form#edit-account-form').trigger('submit.prevent')
 
     expect(updateAccountMock).not.toHaveBeenCalled()

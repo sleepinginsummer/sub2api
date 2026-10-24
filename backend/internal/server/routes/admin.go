@@ -373,6 +373,9 @@ func registerAccountRoutes(admin *gin.RouterGroup, h *handler.Handlers, stepUpAu
 		// Same protection as the Codex reset-quota route (admin auth, audit, compliance guard).
 		accounts.POST("/:id/claude/reset-credits/redeem", h.Admin.Account.RedeemClaudeResetCredit)
 		accounts.POST("", h.Admin.Account.Create)
+		accounts.POST("/cpr/discover", h.Admin.Account.DiscoverCPR)
+		accounts.POST("/:id/cpr/quota/refresh", h.Admin.Account.RefreshCPRQuota)
+		accounts.POST("/:id/cpr/reset-quota", h.Admin.Account.ResetCPRQuota)
 		accounts.POST("/:id/duplicate", h.Admin.Account.Duplicate)
 		accounts.POST("/check-mixed-channel", h.Admin.Account.CheckMixedChannel)
 		accounts.POST("/import/codex-session", h.Admin.Account.ImportCodexSession)
@@ -582,6 +585,11 @@ func registerSettingsRoutes(admin *gin.RouterGroup, h *handler.Handlers) {
 		adminSettings.GET("/admin-api-key", h.Admin.Setting.GetAdminAPIKey)
 		adminSettings.POST("/admin-api-key/regenerate", h.Admin.Setting.RegenerateAdminAPIKey)
 		adminSettings.DELETE("/admin-api-key", h.Admin.Setting.DeleteAdminAPIKey)
+		// Codex 客户端身份预设与官方 Desktop 发布
+		adminSettings.GET("/codex-client-profile", h.Admin.Setting.GetCodexClientProfile)
+		adminSettings.PUT("/codex-client-profile", h.Admin.Setting.UpdateCodexClientProfile)
+		adminSettings.POST("/codex-client-profile/preview", h.Admin.Setting.PreviewCodexClientProfile)
+		adminSettings.POST("/codex-client-profile/refresh", h.Admin.Setting.RefreshCodexReleases)
 		// 529过载冷却配置
 		adminSettings.GET("/overload-cooldown", h.Admin.Setting.GetOverloadCooldownSettings)
 		adminSettings.PUT("/overload-cooldown", h.Admin.Setting.UpdateOverloadCooldownSettings)

@@ -39,6 +39,7 @@
 import { computed } from 'vue'
 import { useI18n } from 'vue-i18n'
 import type { Account } from '@/types'
+import { supportsAccountQuota } from '@/utils/accountQuota'
 import type { GatewayPoolProgress } from '@/api/admin/accounts'
 import CapacityBadge from '@/components/account/CapacityBadge.vue'
 import QuotaBadge from '@/components/account/QuotaBadge.vue'
@@ -209,7 +210,7 @@ const formatCost = (value: number | null | undefined) => {
 }
 
 // ====== 配额 ======
-const isQuotaEligible = computed(() => display.value.account.type === 'apikey' || display.value.account.type === 'bedrock')
+const isQuotaEligible = computed(() => supportsAccountQuota(display.value.account.type))
 
 const showDailyQuota = computed(() =>
   isQuotaEligible.value && display.value.account.quota_daily_limit != null && display.value.account.quota_daily_limit > 0

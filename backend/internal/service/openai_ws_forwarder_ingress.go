@@ -276,7 +276,11 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 			normalized = next
 		}
 		responsesLite := isOpenAIResponsesLiteWebSocketPayload(normalized)
-		// 先投影时区，再归一化；后者会删除定位消息所需的元数据。
+		// 时区投影必须抢在归一化之前：它会删掉 internal_chat_message_metadata_passthrough
+		// （上游 #7066，ChatGPT 拒收该字段），而本改写正是靠该字段的 create_time 定位消息
+		// 时刻、靠 content_item_kinds 判定哪段是 environment_context。删掉之后再改写只会
+		// 静默退化成 no-op。这是 ctx_pool 帧与 WS→HTTP 桥的唯一一遍，发送边界不再重复；
+		// 帧收口 applyCodexWSFrameWireProfile 只负责 user_location 那一半。
 		normalized = rewriteCodexEnvironmentTimezone(c, account, normalized)
 		if compatibilityBody, compatibilityChanged, compatibilityErr := normalizeOpenAIResponsesWebSocketCompatibilityBodyWithConfig(s.cfg, normalized, account, responsesLite); compatibilityErr != nil {
 			return openAIWSClientPayload{}, NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, "invalid websocket request payload", compatibilityErr)
@@ -614,7 +618,8 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 			}
 			if hooks != nil && hooks.BeforeTurn != nil {
 				if err := hooks.BeforeTurn(turn); err != nil {
-					return err
+					return gatewayPoolWSTurnRestFailure(err, turn, currentBridgePayload.payloadRaw, currentBridgePayload.previousResponseID,
+						currentBridgePayload.accountIdentitySourceRaw, currentBridgePayload.originalModel, bridgeAccountFailoverInput, bridgeAccountFailoverInputExists)
 				}
 			}
 			if turnState != "" && c != nil && c.Request != nil {

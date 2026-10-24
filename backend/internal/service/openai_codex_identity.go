@@ -32,19 +32,18 @@ func NormalizeCodexClientVersion(version string) string {
 	return version
 }
 
-// buildCodexCLIUserAgent 按版本号拼出规范 Codex TUI User-Agent。
+// buildCodexCLIUserAgent 按版本号拼出规范 Codex CLI User-Agent。
 // UA 形态只在 codexCLIUserAgentSuffix 一处定义，避免多处拼装漂移。
 func buildCodexCLIUserAgent(version string) string {
 	if version = NormalizeCodexClientVersion(version); version == "" {
 		return codexCLIUserAgent
 	}
-	return openai.CodexDefaultOriginator + "/" + version + codexCLIUserAgentSuffix +
-		" (" + openai.CodexDefaultOriginator + "; " + version + ")"
+	return openai.CodexDefaultOriginator + "/" + version + codexCLIUserAgentSuffix
 }
 
 // codexIdentityEnforcement 控制 enforceCodexIdentityHeaders 是否强制统一出站身份，
 // 由 gateway.disable_codex_identity_enforcement 在服务构造时取反发布。
-// 默认开启：上游在容量紧张时按客户端身份分优先级降载，被降载的请求会拿到
+// 默认开启：上游会按客户端身份进行风控分层，命中风险身份的请求会拿到
 // HTTP 200 + 流内 server_is_overloaded，本次请求即失败；强制统一出口可确保没有
 // 请求带着第三方或陈旧身份出站。关闭后退回「仅按最终 UA 配对 originator」的收口语义。
 var codexIdentityEnforcement = func() *atomic.Bool {
@@ -132,13 +131,24 @@ type codexOutboundIdentity struct {
 }
 
 // resolveCodexOutboundIdentity 由候选 User-Agent 推导自洽的出站身份。
-// candidateUA 为空时使用规范 User-Agent；推导不出官方身份时整体回退为规范 TUI 身份。
+// candidateUA 为空时使用规范 User-Agent；推导不出官方身份时整体回退为规范 CLI 身份。
 //
 // 候选 UA（面板 / 账号级的管理员显式配置）只贡献客户端名与 OS / 架构 / 终端指纹，
 // 其自带的版本段一律用当前生效版本重建：一条填写于某个历史版本的 UA 否则会把出站身份
-// 永久钉死在陈旧版本上，绕过版本自动同步，落回上游优先降载的那一侧。
+// 永久钉死在陈旧版本上，绕过版本自动同步，落回上游身份风控更严格的一侧。
 // 需要固定版本请填「Codex 客户端版本号」并关闭自动同步。
 func resolveCodexOutboundIdentity(candidateUA string) codexOutboundIdentity {
+	if strings.TrimSpace(candidateUA) == "" {
+		if profile, releases := codexGlobalClientProfile(); profile != nil {
+			return profile.identity(releases)
+		}
+	}
+	return resolveCodexUserAgentIdentity(candidateUA)
+}
+
+// resolveCodexUserAgentIdentity 是预设之前的解析链（候选 UA → 全局自定义 UA → 规范 CLI）。
+// 非 ChatGPT 上游（API key、CPR、Command Code）固定走它：预设只描述 ChatGPT 账号的客户端。
+func resolveCodexUserAgentIdentity(candidateUA string) codexOutboundIdentity {
 	canonical := codexCanonicalUserAgent()
 	if _, _, ok := openai.PairCodexClientIdentity(canonical); !ok {
 		canonical = codexCLIUserAgent
@@ -150,9 +160,12 @@ func resolveCodexOutboundIdentity(candidateUA string) codexOutboundIdentity {
 	originator, pairedUA, ok := openai.PairCodexClientIdentity(ua)
 	if !ok {
 		if originator, pairedUA, ok = openai.PairCodexClientIdentity(canonical); !ok {
-			originator, pairedUA = openai.CodexDefaultOriginator, codexCLIUserAgent
+			originator, pairedUA = openai.CodexCLIOriginator, codexCLIUserAgent
 		}
 	}
+	// 旧配置或账号级 UA 可能仍保存 codex-tui。该身份是 sub2api 默认出口曾经
+	// 使用的风险指纹，必须与 UA 首段一起归一为 CLI，不能只替换 originator。
+	originator, pairedUA, _ = openai.NormalizeCodexClientIdentityToCLI(originator, pairedUA)
 	// 生效版本只有一个来源：规范身份（面板版本号 → 自动同步值 → 内置常量，见
 	// SettingService.GetOpenAICodexClientVersion）。UA 与 version 头由此同源派生。
 	version := codexClientVersionFromUA(canonical)
@@ -160,6 +173,15 @@ func resolveCodexOutboundIdentity(candidateUA string) codexOutboundIdentity {
 		pairedUA = rebuilt
 	}
 	return codexOutboundIdentity{userAgent: pairedUA, originator: originator, version: version}
+}
+
+// codexWholeVersion 去掉预发布/构建后缀（1.2.3-alpha.4 → 1.2.3），同 codex-rs
+// client_version_to_whole：/models 的 client_version 查询参数只带整版本。
+func codexWholeVersion(version string) string {
+	if i := strings.IndexAny(version, "-+"); i >= 0 {
+		return version[:i]
+	}
+	return version
 }
 
 // codexClientVersionFromUA 取 UA 的版本段作为生效版本；
@@ -207,8 +229,8 @@ func enforceCodexIdentityHeaders(h http.Header) {
 }
 
 // enforceCodexIdentityHeadersWithUA 强制统一 OAuth 出站身份：User-Agent / originator / version
-// 一律改写为网关的规范身份，客户端自报身份不参与构造。上游在容量紧张时按客户端身份分优先级
-// 降载，被降载的请求会拿到 HTTP 200 + 流内 server_is_overloaded；统一出口可确保没有请求带着
+// 一律改写为网关的规范身份，客户端自报身份不参与构造。上游会按客户端身份进行风控分层，
+// 命中风险身份的请求会拿到 HTTP 200 + 流内 server_is_overloaded；统一出口可确保没有请求带着
 // 第三方或陈旧身份出站，也天然满足 originator 与 UA 首段配套的上游校验（issue #3901）。
 //
 // overrideUA 是账号级自定义 User-Agent：管理员的显式配置仍然生效，但只贡献客户端名与
@@ -224,6 +246,10 @@ func enforceCodexIdentityHeaders(h http.Header) {
 // （2026-09-20 排查）。需要连 originator 一起恢复的调用方先调 ensureCodexIdentityHeaders。
 // 必须在所有 User-Agent 改写之后调用。
 func enforceCodexIdentityHeadersWithUA(h http.Header, overrideUA string) {
+	enforceResolvedCodexIdentity(h, resolveCodexOutboundIdentity(overrideUA))
+}
+
+func enforceResolvedCodexIdentity(h http.Header, identity codexOutboundIdentity) {
 	if h == nil {
 		return
 	}
@@ -232,7 +258,6 @@ func enforceCodexIdentityHeadersWithUA(h http.Header, overrideUA string) {
 		pairCodexIdentityHeaders(h, keepOriginatorAbsent)
 		return
 	}
-	identity := resolveCodexOutboundIdentity(overrideUA)
 	h.Set("user-agent", identity.userAgent)
 	h.Set("version", identity.version)
 	if !keepOriginatorAbsent {

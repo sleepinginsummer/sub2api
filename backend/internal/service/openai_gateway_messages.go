@@ -37,6 +37,10 @@ func (s *OpenAIGatewayService) ForwardAsAnthropic(
 	// 新增一条能打到 chatgpt.com 的转发入口时要照抄这两行。
 	ctx, gwpoolSink := withOpenAIGatewayPoolSink(ctx, c)
 	defer func() { gwpoolSink.publish(forwarded) }()
+	if account.IsCPR() {
+		beginUpstreamResponseModelObservation(c)
+		return s.forwardOpenAIRawRelay(ctx, c, account, body)
+	}
 	// 工具 Schema 清洗必须先于所有分流：下游每条路径（原生 Anthropic 直通、
 	// Chat Completions 转换、Responses 转换）都会把 tools 原样带给上游，而
 	// xAI / Moonshot 等严格校验方会因 input_schema 里的 required:null 或
@@ -415,7 +419,7 @@ func (s *OpenAIGatewayService) ForwardAsAnthropic(
 		// 清除身份头。真正发送前恢复完整 Codex 身份，避免 ChatGPT Codex 上游因缺失
 		// originator/OpenAI-Beta 返回 404（issue #3901）。
 		ensureCodexIdentityHeaders(upstreamReq.Header)
-		enforceCodexIdentityHeaders(upstreamReq.Header)
+		s.enforceCodexClientIdentity(c, upstreamReq.Header, account)
 		// ensureCodexIdentityHeaders 末尾会无条件 Set 回 OpenAI-Beta:responses=experimental，
 		// 把 buildUpstreamRequest 里刚做完的线协议投影抵消掉。双开账号在 /responses 上不发
 		// 该头、在这里发，同一账号就是两种客户端形态。补回投影收口（其内部按双开门控，

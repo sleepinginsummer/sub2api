@@ -122,8 +122,9 @@
       </ClaudeResetCreditsCell>
     </template>
 
-    <!-- OpenAI OAuth accounts: single source from /usage API -->
+    <!-- OpenAI OAuth and CPR share the same quota layout; their APIs stay separate. -->
     <template v-else-if="isOpenAICodexUsageAccount">
+      <CPRAccountInfo v-if="account.type === 'cpr'" :snapshot="usageInfo?.cpr" />
       <div v-if="hasOpenAIUsageFallback" class="space-y-1">
         <UsageProgressBar
           v-if="usageInfo?.five_hour"
@@ -145,11 +146,8 @@
           color="emerald"
         />
         <!--
-          Upstream codex /wham/usage quota query + reset. The local active-sampling
-          refresh button is a sibling (not a #pre-actions slot child) because
-          OpenAIQuotaResetCell's root carries v-if="oauth only" — putting the
-          button inside would make it vanish for cpr accounts along with the
-          reset UI. The shared flex row keeps them on a single line for OAuth.
+          The shared action row keeps OAuth and CPR equally compact. The reset
+          component dispatches to the account type's own management API.
         -->
         <div class="flex flex-wrap items-start gap-1.5">
           <button
@@ -174,7 +172,7 @@
             </svg>
             {{ t('admin.accounts.usageWindow.activeQuery') }}
           </button>
-          <OpenAIQuotaResetCell :account="account" @account-updated="handleQuotaResetAccountUpdated" />
+          <OpenAIQuotaResetCell :account="account" :cpr-snapshot="usageInfo?.cpr" @account-updated="handleQuotaResetAccountUpdated" @usage-updated="handleQuotaUsageUpdated" />
         </div>
       </div>
       <div v-else-if="loading" class="space-y-1.5">
@@ -216,7 +214,7 @@
             </svg>
             {{ t('admin.accounts.usageWindow.activeQuery') }}
           </button>
-          <OpenAIQuotaResetCell :account="account" @account-updated="handleQuotaResetAccountUpdated" />
+          <OpenAIQuotaResetCell :account="account" :cpr-snapshot="usageInfo?.cpr" @account-updated="handleQuotaResetAccountUpdated" @usage-updated="handleQuotaUsageUpdated" />
         </div>
       </div>
     </template>
@@ -576,6 +574,29 @@
           <div class="h-3 w-8 animate-pulse rounded bg-gray-200 dark:bg-gray-700"></div>
           <div class="h-3 w-12 animate-pulse rounded bg-gray-200 dark:bg-gray-700"></div>
         </div>
+        <!-- Vertex 设置了配额上限：显示配额进度条 -->
+        <template v-if="isGeminiVertex">
+          <UsageProgressBar
+            v-if="quotaDailyBar"
+            label="1d"
+            :utilization="quotaDailyBar.utilization"
+            :resets-at="quotaDailyBar.resetsAt"
+            color="indigo"
+          />
+          <UsageProgressBar
+            v-if="quotaWeeklyBar"
+            label="7d"
+            :utilization="quotaWeeklyBar.utilization"
+            :resets-at="quotaWeeklyBar.resetsAt"
+            color="emerald"
+          />
+          <UsageProgressBar
+            v-if="quotaTotalBar"
+            label="total"
+            :utilization="quotaTotalBar.utilization"
+            color="purple"
+          />
+        </template>
         <div v-if="loading" class="space-y-1">
           <div class="flex items-center gap-1">
             <div class="h-3 w-[32px] animate-pulse rounded bg-gray-200 dark:bg-gray-700"></div>
@@ -706,8 +727,10 @@ import { buildOpenAIUsageRefreshKey, isOpenAICodexUsageAccount as isOpenAICodexU
 import { enqueueUsageRequest } from '@/utils/usageLoadQueue'
 import { formatCompactNumber } from '@/utils/format'
 import { isOfficialGeminiBaseUrl } from '@/utils/geminiExplicitCache'
+import { supportsAccountQuota } from '@/utils/accountQuota'
 import UsageProgressBar from './UsageProgressBar.vue'
 import AccountQuotaInfo from './AccountQuotaInfo.vue'
+import CPRAccountInfo from './CPRAccountInfo.vue'
 import ClaudeResetCreditsCell from './ClaudeResetCreditsCell.vue'
 import OpenAIQuotaResetCell from './OpenAIQuotaResetCell.vue'
 import GrokQuotaProbeCell from './GrokQuotaProbeCell.vue'
@@ -1600,7 +1623,7 @@ const makeQuotaBar = (
 }
 
 const hasApiKeyQuota = computed(() => {
-  if (props.account.type !== 'apikey' && props.account.type !== 'bedrock') return false
+  if (!supportsAccountQuota(props.account.type)) return false
   return (
     (props.account.quota_daily_limit ?? 0) > 0 ||
     (props.account.quota_weekly_limit ?? 0) > 0 ||
@@ -1628,6 +1651,10 @@ const quotaTotalBar = computed((): QuotaBarInfo | null => {
 
 const handleQuotaResetAccountUpdated = (account: Account) => {
   emit('account-updated', account)
+}
+
+const handleQuotaUsageUpdated = (usage: AccountUsageInfo) => {
+  usageInfo.value = usage
 }
 
 const handleOllamaCloudUsageUpdated = (state: NonNullable<Account['ollama_cloud_usage']>) => {

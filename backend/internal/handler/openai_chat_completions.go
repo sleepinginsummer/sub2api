@@ -82,9 +82,9 @@ func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
 		h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", "Model is not supported by this OpenAI-compatible endpoint for composite groups")
 		return
 	}
+	var reasoningPolicyErr error
 	if cappedBody, changed, err := applyOpenAIReasoningEffortPolicyForRequest(c, apiKey, body); err != nil {
-		respondOpenAIReasoningEffortPolicyError(c, err, h.errorResponse)
-		return
+		reasoningPolicyErr = err
 	} else if changed {
 		body = cappedBody
 	}
@@ -229,12 +229,23 @@ func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
 			return
 		}
 		account := selection.Account
+		if reasoningPolicyErr != nil && !account.IsCPR() {
+			if selection.ReleaseFunc != nil {
+				selection.ReleaseFunc()
+			}
+			respondOpenAIReasoningEffortPolicyError(c, reasoningPolicyErr, h.errorResponse)
+			return
+		}
 		sessionHash = ensureOpenAIPoolModeSessionHash(sessionHash, account)
 		reqLog.Debug("openai_chat_completions.account_selected", zap.Int64("account_id", account.ID), zap.String("account_name", account.Name))
 		_ = scheduleDecision
 		setOpsSelectedAccount(c, account.ID, account.Platform)
 
 		accountReleaseFunc, slotResult := h.acquireResponsesAccountSlot(c, apiKey.GroupID, sessionHash, selection, reqStream, &streamStarted, reqLog)
+		if slotResult == openAISlotAcquirePoolRested {
+			lastFailoverErr = h.gatewayPoolRestFailover(c, apiKey.GroupID, account, failedAccountIDs)
+			continue
+		}
 		if slotResult == openAISlotAcquireProfitVetoed {
 			// 利润终检否决：排除该账号重新选号；否决次数达上限则按无可用账号终止。
 			if !recordOpenAIProfitVeto(failedAccountIDs, account.ID, &profitVetoCount) {
@@ -378,6 +389,9 @@ func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
 							if !sameAccountRetryDeadlineAllows(failoverErr) {
 								h.handleFailoverExhausted(c, failoverErr, streamStarted)
 								return
+							}
+							if h.gatewayService.GatewayPoolRestHandoff(c.Request.Context(), account) != nil {
+								lastFailoverErr = h.gatewayPoolRestFailover(c, apiKey.GroupID, account, failedAccountIDs)
 							}
 							continue
 						}

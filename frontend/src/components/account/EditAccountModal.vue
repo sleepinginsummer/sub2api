@@ -959,33 +959,17 @@
       </div>
 
       <!-- CPR 中继（密钥留空表示不修改） -->
-      <div v-if="account.type === 'cpr'" class="space-y-4">
-        <div>
-          <label class="input-label">{{ t('admin.accounts.cpr.baseUrl') }}</label>
-          <input v-model="editCprBaseUrl" type="text" class="input" placeholder="http://127.0.0.1:18081" />
-          <p class="input-hint">{{ t('admin.accounts.cpr.baseUrlHint') }}</p>
-        </div>
-        <div>
-          <label class="input-label">{{ t('admin.accounts.cpr.accountId') }}</label>
-          <input v-model="editCprAccountId" type="text" class="input font-mono" placeholder="acct_..." />
-          <p class="input-hint">{{ t('admin.accounts.cpr.accountIdHint') }}</p>
-        </div>
-        <div>
-          <label class="input-label">{{ t('admin.accounts.cpr.clientKey') }}</label>
-          <input v-model="editCprClientKey" type="password" autocomplete="off" class="input font-mono" placeholder="sk_..." />
-          <p class="input-hint">{{ t('admin.accounts.leaveEmptyToKeep') }}</p>
-        </div>
-        <div>
-          <label class="input-label">{{ t('admin.accounts.cpr.adminApiKey') }}</label>
-          <input v-model="editCprAdminApiKey" type="password" autocomplete="off" class="input font-mono" placeholder="admin-..." />
-          <p class="input-hint">{{ t('admin.accounts.leaveEmptyToKeep') }}</p>
-        </div>
-        <div>
-          <label class="input-label">{{ t('admin.accounts.cpr.adminBaseUrl') }}</label>
-          <input v-model="editCprAdminBaseUrl" type="text" class="input" :placeholder="editCprBaseUrl || 'http://127.0.0.1:18081'" />
-          <p class="input-hint">{{ t('admin.accounts.cpr.adminBaseUrlHint') }}</p>
-        </div>
-      </div>
+      <CPRConnectionForm
+        v-if="account.type === 'cpr'"
+        :key="account.id"
+        v-model:base-url="editCprBaseUrl"
+        v-model:admin-key="editCprAdminApiKey"
+        v-model:admin-base-url="editCprAdminBaseUrl"
+        v-model:account-id="editCprAccountId"
+        :existing-account-id="account.id"
+        @selected="onCPRSelected"
+        @invalidated="editCprConnected = false"
+      />
 
       <!-- Vertex Service Account -->
       <div v-if="(account.platform === 'gemini' || account.platform === 'anthropic') && account.type === 'service_account'" class="space-y-4">
@@ -2392,9 +2376,9 @@
           @update:quotaNotifyTotalThresholdType="quotaNotifyState.total.thresholdType = $event"
         />
       </div>
-      <!-- 配额控制 (非 Anthropic apikey/bedrock) -->
+      <!-- 配额控制 (非 Anthropic apikey/bedrock，以及 Vertex service_account) -->
       <div
-        v-else-if="account?.type === 'apikey' || account?.type === 'bedrock'"
+        v-else-if="supportsAccountQuota(account?.type)"
         class="border-t border-gray-200 pt-4 dark:border-dark-600 space-y-4"
       >
         <div class="mb-3">
@@ -2550,9 +2534,28 @@
         </div>
       </div>
 
-      <!-- 账号级出站 User-Agent（仅 OpenAI OAuth）：留空回落到全局设置 -->
+      <!-- 账号级 Codex 客户端身份预设（OAuth / setup-token），见 backend/internal/service/openai_codex_client_profile.go -->
       <div
-        v-if="account?.platform === 'openai' && account?.type === 'oauth'"
+        v-if="accountSupportsCodexClientProfile && codexProfileView"
+        class="border-t border-gray-200 pt-4 dark:border-dark-600"
+        data-testid="edit-codex-client-profile"
+      >
+        <CodexClientProfileFields
+          v-model="codexClientProfile"
+          v-model:custom="codexCustomUA"
+          :presets="codexProfileView.presets"
+          :max-version-lag="codexProfileView.max_version_lag"
+          :title="t('admin.codexClientProfile.accountTitle')"
+          :description="t('admin.codexClientProfile.accountDescription')"
+          :inherit-label="t('admin.codexClientProfile.accountInherit')"
+          :custom-label="account?.type === 'oauth' ? t('admin.codexClientProfile.accountCustomUA') : undefined"
+          :inherit-preview="codexCustomUA ? t('admin.codexClientProfile.accountCustomPreview') : legacyCredentialCodexUA ? t('admin.codexClientProfile.accountInheritCustomUA') : codexProfileView.effective.user_agent"
+        />
+      </div>
+
+      <!-- 账号级出站 User-Agent（仅 OpenAI OAuth）：有预设面板时只在选「自定义 UA」后出现；影子行/面板未加载时照旧直接显示 -->
+      <div
+        v-if="account?.platform === 'openai' && account?.type === 'oauth' && (!codexProfileUIShown || codexCustomUA)"
         class="border-t border-gray-200 pt-4 dark:border-dark-600"
       >
         <label class="input-label">{{ t('admin.accounts.openai.codexUserAgent') }}</label>
@@ -2611,6 +2614,50 @@
         v-if="accountHasOpenAIExtraSettings"
         class="border-t border-gray-200 pt-4 dark:border-dark-600 space-y-4"
       >
+        <div
+          v-if="accountSupportsTurnStateRelay"
+          class="space-y-3 rounded-lg border border-gray-200 p-4 dark:border-dark-600"
+          data-testid="edit-quality-guard-section"
+        >
+          <!-- 降智防护只给本地 OAuth / setup-token；CPR 只有下面的 turn-state 接力。 -->
+          <template v-if="accountSupportsGatewayPool">
+            <label class="flex items-center justify-between gap-4">
+              <span class="input-label mb-0">{{ t('admin.accounts.openai.qualityGuard') }}</span>
+              <input v-model="qualityGuardEnabled" data-testid="edit-quality-guard-enabled" type="checkbox" class="h-4 w-4 rounded" />
+            </label>
+            <p class="text-xs text-gray-500 dark:text-gray-400">{{ t('admin.accounts.openai.qualityGuardScope') }}</p>
+            <p v-if="openAIGwpoolEnabled" class="text-xs text-amber-600">{{ t('admin.accounts.openai.qualityGuardPool') }}</p>
+            <div v-if="qualityGuardEnabled" class="space-y-3">
+              <label class="block text-xs">
+                {{ t('admin.accounts.openai.qualityGuardMode') }}
+                <select v-model="qualityGuardMode" required class="input mt-1" data-testid="edit-quality-guard-mode">
+                  <option value="" disabled>{{ t('admin.accounts.openai.qualityGuardChoose') }}</option>
+                  <option value="block">{{ t('admin.accounts.openai.qualityGuardBlock') }}</option>
+                  <option value="wait">{{ t('admin.accounts.openai.qualityGuardWait') }}</option>
+                </select>
+              </label>
+              <template v-if="qualityGuardMode === 'wait'">
+                <p class="input-hint">{{ t('admin.accounts.openai.qualityGuardWaitHint') }}</p>
+                <label class="block text-xs">
+                  {{ t('admin.accounts.openai.qualityGuardAttempts') }}
+                  <input v-model.number="qualityGuardAttempts" type="number" min="1" max="100" step="1" required class="input mt-1" data-testid="edit-quality-guard-attempts" />
+                </label>
+                <label class="block text-xs">
+                  {{ t('admin.accounts.openai.qualityGuardInterval') }}
+                  <input v-model.number="qualityGuardInterval" type="number" min="1" max="300" step="1" required class="input mt-1" data-testid="edit-quality-guard-interval" />
+                </label>
+              </template>
+            </div>
+          </template>
+          <div class="space-y-1" :class="{ 'border-t border-gray-200 pt-3 dark:border-dark-600': accountSupportsGatewayPool }">
+            <label class="flex items-center justify-between gap-4">
+              <span class="input-label mb-0">{{ t('admin.accounts.openai.turnStateRelay') }}</span>
+              <input v-model="turnStateRelayEnabled" data-testid="edit-turn-state-relay-enabled" type="checkbox" class="h-4 w-4 rounded" />
+            </label>
+            <p class="text-xs text-gray-500 dark:text-gray-400">{{ t('admin.accounts.openai.turnStateRelayHint') }}</p>
+            <p v-if="accountSupportsGatewayPool && openAIGwpoolEnabled" class="text-xs text-amber-600">{{ t('admin.accounts.openai.turnStateRelayPool') }}</p>
+          </div>
+        </div>
         <!-- 网关池：Codex 推理面的路由 cookie（__cflb / __oailb）改由池子下发，顶掉按账号罐回放。
              配置全在账号级：池子的 consumer key 是按账号发的。 -->
         <div
@@ -2620,7 +2667,10 @@
         >
           <div class="flex items-center justify-between gap-4">
             <div class="min-w-0">
-              <label class="input-label mb-0">{{ t('admin.accounts.openai.gwpool') }}</label>
+              <label class="input-label mb-0">
+                {{ t('admin.accounts.openai.gwpool') }}
+                <span class="ml-2 text-xs font-normal text-amber-600 dark:text-amber-400" data-testid="edit-gwpool-shutdown-note">{{ t('admin.accounts.openai.gwpoolShutdownNote') }}</span>
+              </label>
               <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">
                 {{ t('admin.accounts.openai.gwpoolDesc') }}
               </p>
@@ -2684,6 +2734,12 @@
               {{ t('admin.accounts.openai.gwpoolCredentialScope') }}
             </p>
             <fieldset :disabled="openAIGwpoolContinuousWait" class="grid grid-cols-1 gap-3 sm:grid-cols-2" data-testid="edit-openai-gwpool-thresholds">
+            <div>
+              <label class="input-label text-xs">{{ t('admin.accounts.openai.gwpoolStopGateways') }}</label>
+              <input v-model.number="openAIGwpoolStopGateways" type="number" min="1" max="512" step="1"
+                placeholder="5" class="input text-xs" data-testid="edit-openai-gwpool-stop-gateways" />
+              <p class="input-hint">{{ t('admin.accounts.openai.gwpoolStopGatewaysDesc') }}</p>
+            </div>
             <div>
               <label class="input-label text-xs">{{ t('admin.accounts.openai.gwpoolResumeGateways') }}</label>
               <input v-model.number="openAIGwpoolResumeGateways" type="number" min="1" max="512" step="1"
@@ -3543,6 +3599,13 @@ import BaseDialog from '@/components/common/BaseDialog.vue'
 import ConfirmDialog from '@/components/common/ConfirmDialog.vue'
 import Select from '@/components/common/Select.vue'
 import HelpTooltip from '@/components/common/HelpTooltip.vue'
+import CodexClientProfileFields from '@/components/account/CodexClientProfileFields.vue'
+import {
+  asCodexClientProfile,
+  getCodexClientProfile,
+  type CodexClientProfile,
+  type CodexClientProfileView,
+} from '@/api/admin/codexClientProfile'
 import {
   cprOutboundProxy as readCPROutboundProxy
 } from '@/utils/turnState'
@@ -3609,7 +3672,10 @@ import {
 } from '@/utils/format'
 import { extractApiErrorMessage, extractI18nErrorMessage } from '@/utils/apiError'
 import { createStableObjectKeyResolver } from '@/utils/stableObjectKey'
+import { supportsAccountQuota } from '@/utils/accountQuota'
 import { getAccountExpiryTimestamp } from '@/components/account/accountExpiry'
+import CPRConnectionForm from './CPRConnectionForm.vue'
+import type { CPRConnectAccount } from '@/types'
 import { allSelectedGroupsEnableLongContextPricing } from '@/components/account/longContextBilling'
 import { VERTEX_LOCATION_OPTIONS } from '@/constants/account'
 import {
@@ -3800,9 +3866,16 @@ const editApiKey = ref('')
 // CPR 中继：两把密钥留空表示保持不变，不回显明文。
 const editCprBaseUrl = ref('')
 const editCprAccountId = ref('')
-const editCprClientKey = ref('')
+const editCprConnected = ref(false)
 const editCprAdminApiKey = ref('')
 const editCprAdminBaseUrl = ref('')
+const onCPRSelected = (account: CPRConnectAccount) => {
+  editCprConnected.value = true
+  form.name = account.name || account.email || account.id
+  if (account.concurrency_limit != null && account.concurrency_limit > 0) {
+    form.concurrency = account.concurrency_limit
+  }
+}
 
 // ── 国产供应商（Kimi / Zhipu / DeepSeek）account_mode / api_protocol 编辑 ──
 // account_mode 决定额度/余额监控路径，api_protocol 决定转发端点与格式；
@@ -4111,11 +4184,32 @@ const cprOutboundProxy = computed(() => readCPROutboundProxy(props.account))
 const accountSupportsGatewayPool = computed(
   () => props.account?.platform === 'openai' && ['oauth', 'setup-token'].includes(props.account?.type || '')
 )
+const accountSupportsTurnStateRelay = computed(
+  () => accountSupportsGatewayPool.value || (props.account?.platform === 'openai' && props.account?.type === 'cpr')
+)
+// Codex 客户端身份预设（extra.codex_client_profile）：范围同网关池；Spark 影子行跟母账号，不单独设。
+const codexClientProfile = ref<CodexClientProfile | null>(null)
+const codexProfileView = ref<CodexClientProfileView | null>(null)
+const accountSupportsCodexClientProfile = computed(() => accountSupportsGatewayPool.value && !isSparkShadow.value)
+const codexProfileUIShown = computed(() => accountSupportsCodexClientProfile.value && codexProfileView.value !== null)
+// 预设下拉里的「自定义 UA」项：与预设二选一，保存时只留选中的那个。
+const codexCustomUA = ref(false)
+// 继承时推理面还会回落遗留的 credentials.user_agent（后端 GetOpenAIUserAgent）。
+const legacyCredentialCodexUA = computed(() => {
+  const legacy = (props.account?.credentials as Record<string, unknown> | undefined)?.user_agent
+  return typeof legacy === 'string' && legacy.trim() !== ''
+})
 const openAIGwpoolEnabled = ref(false)
+const qualityGuardEnabled = ref(false)
+const qualityGuardMode = ref<'' | 'block' | 'wait'>('')
+const qualityGuardAttempts = ref<number>(20)
+const qualityGuardInterval = ref<number>(5)
+const turnStateRelayEnabled = ref(false)
 const openAIGwpoolBaseURL = ref('')
 // 输入框恒为空：后端把已存的 key 脱敏成 true，页面从不回显原值。留空 = 不修改。
 const openAIGwpoolConsumerKey = ref('')
 const openAIGwpoolConsumerKeySaved = ref(false)
+const openAIGwpoolStopGateways = ref<number | ''>('')
 const openAIGwpoolResumeGateways = ref<number | ''>('')
 const openAIGwpoolContinuousWait = ref(false)
 const openAIGwpoolProbeTimeout = ref<number | ''>('')
@@ -4695,12 +4789,18 @@ const syncFormFromAccount = (newAccount: Account | null) => {
 	allowOverages.value = extra?.allow_overages === true
 	upstreamRequestIdHeader.value = readUpstreamRequestIdHeader(extra)
 	openAIGwpoolEnabled.value = extra?.openai_gwpool === true
+	qualityGuardEnabled.value = extra?.openai_quality_guard_enabled === true
+	qualityGuardMode.value = extra?.openai_quality_guard_mode === 'block' || extra?.openai_quality_guard_mode === 'wait' ? extra.openai_quality_guard_mode : ''
+	qualityGuardAttempts.value = typeof extra?.openai_quality_guard_max_attempts === 'number' ? extra.openai_quality_guard_max_attempts : 20
+	qualityGuardInterval.value = typeof extra?.openai_quality_guard_interval_s === 'number' ? extra.openai_quality_guard_interval_s : 5
+	turnStateRelayEnabled.value = extra?.openai_turn_state_relay_enabled === true
 	openAIUpstreamRecordingEnabled.value = newAccount.platform === 'openai' && extra?.openai_upstream_recording_enabled === true
 	openAIGwpoolBaseURL.value = typeof extra?.openai_gwpool_base_url === 'string' ? extra.openai_gwpool_base_url : ''
 	// 后端脱敏成 true = 配过；原值不会下发，所以输入框一律从空开始。
 	openAIGwpoolConsumerKeySaved.value = extra?.openai_gwpool_consumer_key === true
 	openAIGwpoolConsumerKey.value = ''
 	// 网关池强制组内轮转，阈值留空沿用后端默认。
+	openAIGwpoolStopGateways.value = typeof extra?.openai_gwpool_stop_gateways === 'number' ? extra.openai_gwpool_stop_gateways : ''
 	openAIGwpoolResumeGateways.value = typeof extra?.openai_gwpool_resume_gateways === 'number' ? extra.openai_gwpool_resume_gateways : ''
 	openAIGwpoolContinuousWait.value = extra?.openai_gwpool_continuous_wait === true
 	openAIGwpoolProbeTimeout.value = typeof extra?.openai_gwpool_probe_timeout_s === 'number' ? extra.openai_gwpool_probe_timeout_s : ''
@@ -4741,6 +4841,8 @@ const syncFormFromAccount = (newAccount: Account | null) => {
   codexFingerprintMode.value = 'off'
   codexFingerprintConvergence.value = false
   codexUserAgent.value = ''
+  codexClientProfile.value = null
+  codexCustomUA.value = false
   codexImageToolMode.value = 'inherit'
   anthropicPassthroughEnabled.value = false
   anthropicAPIKeyAuthScheme.value = 'x_api_key'
@@ -4789,6 +4891,9 @@ const syncFormFromAccount = (newAccount: Account | null) => {
       defaultMode: OPENAI_WS_MODE_OFF
     })
     if (newAccount.type === 'oauth' || newAccount.type === 'setup-token') {
+      codexClientProfile.value = asCodexClientProfile(extra?.codex_client_profile)
+      // 每次打开都重取：全局预设与官方版本可能刚在设置页改过。
+      getCodexClientProfile().then((view) => { codexProfileView.value = view }).catch(() => {})
       codexCLIOnlyEnabled.value = extra?.codex_cli_only === true
       codexCLIOnlyAppServerEnabled.value =
         extra?.codex_cli_only_allow_app_server === true
@@ -4801,6 +4906,7 @@ const syncFormFromAccount = (newAccount: Account | null) => {
         : 'off')
       codexFingerprintConvergence.value = extra?.codex_experimental_fingerprint_convergence === true
       codexUserAgent.value = typeof extra?.codex_user_agent === 'string' ? extra.codex_user_agent : ''
+      codexCustomUA.value = !codexClientProfile.value && codexUserAgent.value.trim() !== ''
     }
     const credentials = newAccount.credentials as Record<string, unknown> | undefined
     const compactMappings = credentials?.compact_model_mapping as Record<string, string> | undefined
@@ -4826,8 +4932,8 @@ const syncFormFromAccount = (newAccount: Account | null) => {
     }
   }
 
-  // Load quota limit for apikey/bedrock accounts (bedrock quota is also loaded in its own branch above)
-  if (newAccount.type === 'apikey' || newAccount.type === 'bedrock') {
+  // Load quota limit for apikey/bedrock/service_account accounts (bedrock quota is also loaded in its own branch above)
+  if (supportsAccountQuota(newAccount.type)) {
     const quotaVal = extra?.quota_limit as number | undefined
     editQuotaLimit.value = (quotaVal && quotaVal > 0) ? quotaVal : null
     const dailyVal = extra?.quota_daily_limit as number | undefined
@@ -5077,7 +5183,7 @@ const syncFormFromAccount = (newAccount: Account | null) => {
     editCprAccountId.value = (credentials.cpr_account_id as string) || ''
     editCprAdminBaseUrl.value = (credentials.admin_base_url as string) || ''
     // 两把密钥不回显。
-    editCprClientKey.value = ''
+    editCprConnected.value = false
     editCprAdminApiKey.value = ''
     // 模型白名单/映射与 oauth 同源：后端 GetModelMapping() / IsModelSupported()
     // 只读 credentials.model_mapping，与账号类型无关。
@@ -5895,6 +6001,16 @@ const handleSubmit = async () => {
     } else if (props.account.type === 'cpr') {
       const currentCredentials = (props.account.credentials as Record<string, unknown>) || {}
       const newCredentials: Record<string, unknown> = { ...currentCredentials }
+      const normalize = (value: unknown) => String(value || '').trim().replace(/\/+$/, '')
+      const changed = normalize(currentCredentials.base_url) !== normalize(editCprBaseUrl.value)
+        || normalize(currentCredentials.admin_base_url) !== normalize(editCprAdminBaseUrl.value)
+        || currentCredentials.cpr_account_id !== editCprAccountId.value.trim()
+        || !!editCprAdminApiKey.value.trim()
+      if (changed && (!editCprConnected.value || !editCprAccountId.value)) {
+        appStore.showError(t('admin.accounts.cpr.selectAccount'))
+        return
+      }
+      updatePayload.cpr_auto_configure = changed
 
       newCredentials.base_url = editCprBaseUrl.value.trim().replace(/\/+$/, '')
       newCredentials.cpr_account_id = editCprAccountId.value.trim()
@@ -5904,9 +6020,6 @@ const handleSubmit = async () => {
         delete newCredentials.admin_base_url
       }
       // 留空 = 保持原值，避免清空后无法恢复。
-      if (editCprClientKey.value.trim()) {
-        newCredentials.api_key = editCprClientKey.value.trim()
-      }
       if (editCprAdminApiKey.value.trim()) {
         newCredentials.admin_api_key = editCprAdminApiKey.value.trim()
       }
@@ -6353,7 +6466,36 @@ const handleSubmit = async () => {
       } else if (props.account.type !== 'cpr') {
         delete newExtra.openai_responses_flatten_namespaces
       }
+      if (accountSupportsTurnStateRelay.value) {
+        if (turnStateRelayEnabled.value) {
+          newExtra.openai_turn_state_relay_enabled = true
+        } else {
+          delete newExtra.openai_turn_state_relay_enabled
+        }
+      }
+      if (accountSupportsCodexClientProfile.value) {
+        if (codexClientProfile.value) {
+          newExtra.codex_client_profile = codexClientProfile.value
+        } else {
+          delete newExtra.codex_client_profile
+        }
+      }
       if (accountSupportsGatewayPool.value) {
+        if (qualityGuardEnabled.value) {
+          if (!qualityGuardMode.value) {
+            appStore.showError(t('admin.accounts.openai.qualityGuardChoose'))
+            return
+          }
+          newExtra.openai_quality_guard_enabled = true
+          newExtra.openai_quality_guard_mode = qualityGuardMode.value
+          newExtra.openai_quality_guard_max_attempts = qualityGuardAttempts.value
+          newExtra.openai_quality_guard_interval_s = qualityGuardInterval.value
+        } else {
+          delete newExtra.openai_quality_guard_enabled
+          delete newExtra.openai_quality_guard_mode
+          delete newExtra.openai_quality_guard_max_attempts
+          delete newExtra.openai_quality_guard_interval_s
+        }
         if (openAIGwpoolEnabled.value) {
           newExtra.openai_gwpool = true
         } else {
@@ -6381,6 +6523,11 @@ const handleSubmit = async () => {
           newExtra.openai_gwpool_probe_timeout_s = openAIGwpoolProbeTimeout.value
         } else {
           delete newExtra.openai_gwpool_probe_timeout_s
+        }
+        if (openAIGwpoolEnabled.value && openAIGwpoolStopGateways.value !== '') {
+          newExtra.openai_gwpool_stop_gateways = openAIGwpoolStopGateways.value
+        } else {
+          delete newExtra.openai_gwpool_stop_gateways
         }
         if (openAIGwpoolEnabled.value && openAIGwpoolResumeGateways.value !== '') {
           newExtra.openai_gwpool_resume_gateways = openAIGwpoolResumeGateways.value
@@ -6509,8 +6656,8 @@ const handleSubmit = async () => {
         } else {
           delete newExtra.codex_experimental_fingerprint_convergence
         }
-        // 账号级出站 UA：留空删键，回落到全局设置
-        const codexUA = codexUserAgent.value.trim()
+        // 账号级出站 UA：留空删键，回落到全局设置；有预设面板时只有选「自定义 UA」才保存（选预设或继承都清掉）
+        const codexUA = !codexProfileUIShown.value || codexCustomUA.value ? codexUserAgent.value.trim() : ''
         if (codexUA) {
           newExtra.codex_user_agent = codexUA
         } else {
@@ -6521,8 +6668,8 @@ const handleSubmit = async () => {
       updatePayload.extra = newExtra
     }
 
-    // For apikey/bedrock accounts, handle quota_limit in extra
-    if (props.account.type === 'apikey' || props.account.type === 'bedrock') {
+    // For apikey/bedrock/service_account accounts, handle quota_limit in extra
+    if (supportsAccountQuota(props.account.type)) {
       const currentExtra = (updatePayload.extra as Record<string, unknown>) ||
         (props.account.extra as Record<string, unknown>) || {}
       const newExtra: Record<string, unknown> = { ...currentExtra }

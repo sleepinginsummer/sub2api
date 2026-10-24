@@ -703,7 +703,7 @@ type UpstreamFailoverError struct {
 	SameAccountRetryMax       int           // 可选的错误级同账号重试上限，低于 handler 默认预算时优先采用
 	RequestScopedTransient    bool          // 故障因素与账号无关（如上游按客户端身份/模型容量降载）：可同账号重试，但不得据此对账号做临时封禁
 	SafeToFailoverAfterWrite  bool          // 仅写出 SSE 注释等非语义字节时，仍可在同一客户端流中切换账号
-	BoundUpstreamPassthrough  bool          // 显式缓存绑定的上游账号返回 429 / 5xx 时原样回写，不走错误映射
+	BoundUpstreamPassthrough  bool          // 绑定显式缓存的请求在上游网关账号上收到的 429 / 5xx：反映持有缓存的上游账号状态，原样回写不走错误映射
 	Stage                     GatewayFailureStage
 	Scope                     GatewayFailureScope
 	Reason                    GatewayFailureReason
@@ -743,7 +743,7 @@ func (e *UpstreamFailoverError) ShouldReportAccountScheduleFailure() bool {
 	// 网关池失败不进调度器的错误率：没票 / 池子挂了 / 判降智说的都是**路由**，这个账号的
 	// 凭据好好的，记进错误率会让池子一抖就把一批健康账号的健康度打下去
 	// （classifyUpstreamTransportError 对 gwpool.ErrPool 的豁免是同一个道理）。
-	if e.Reason == OpenAIGatewayPoolReason {
+	if e.Reason == OpenAIGatewayPoolReason || e.Reason == OpenAIQualityGuardReason {
 		return false
 	}
 	return !e.IsCredentialFailure() || e.Scope == GatewayFailureScopeAccount

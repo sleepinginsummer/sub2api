@@ -928,6 +928,55 @@ describe('AccountUsageCell', () => {
     expect(getUsage).toHaveBeenCalledTimes(2)
   })
 
+  it('CPR uses the OAuth quota bars, accounting estimate and live action updates without internal details', async () => {
+    const cpr = {
+      account_id: 'acct', enabled: true, status: 'normal',
+      checked_at: '2026-10-21T08:00:00Z', quota_updated_display: '1 小时前',
+      email: 'internal@example.invalid', access_token_expires_at: '2026-10-31T08:00:00Z',
+      outbound_proxy: 'socks5h://198.51.100.1:1080'
+    }
+    getUsage.mockResolvedValue({
+      cpr,
+      five_hour: { utilization: 0, resets_at: null },
+      seven_day: { utilization: 2, window_stats: { requests: 216, tokens: 18100000, cost: 12.5672, user_cost: 12.5672 } }
+    })
+    const wrapper = mount(AccountUsageCell, {
+      props: {
+        account: makeAccount({
+          id: 56, platform: 'openai', type: 'cpr',
+          credentials: { cpr_account_id: 'acct', base_url: 'http://127.0.0.1:18081' }
+        })
+      },
+      global: {
+        stubs: {
+          UsageProgressBar: {
+            name: 'UsageProgressBar',
+            props: ['label', 'utilization', 'resetsAt', 'windowStats', 'estimatedTotalCost', 'showNowWhenIdle', 'color'],
+            template: '<div class="usage-bar">{{ label }}|{{ utilization }}</div>'
+          },
+          OpenAIQuotaResetCell: {
+            props: ['account', 'cprSnapshot'],
+            emits: ['usage-updated'],
+            template: '<button data-test="cpr-query-result" @click="$emit(\'usage-updated\', { cpr: cprSnapshot, seven_day: { utilization: 4 } })" />'
+          }
+        }
+      }
+    })
+    await flushPromises()
+    const bars = wrapper.findAllComponents({ name: 'UsageProgressBar' })
+    expect(bars).toHaveLength(2)
+    expect(bars[0]!.props()).toMatchObject({ label: '5h', utilization: 0, showNowWhenIdle: true, color: 'indigo' })
+    expect(bars[1]!.props()).toMatchObject({ label: '7d', utilization: 2, color: 'emerald' })
+    expect(bars[1]!.props('estimatedTotalCost')).toBeCloseTo(628.36)
+    for (const internal of ['1 小时前', 'internal@example.invalid', 'socks5h://', 'CPR: ', 'accessExpires', 'cpr.details']) {
+      expect(wrapper.text()).not.toContain(internal)
+    }
+    await wrapper.get('[data-test="cpr-query-result"]').trigger('click')
+    expect(wrapper.text()).toContain('7d|4')
+    expect(wrapper.findAllComponents({ name: 'UsageProgressBar' })).toHaveLength(1)
+    wrapper.unmount()
+  })
+
   it('OpenAI OAuth 已限额时显示 /usage API 返回的限额数据', async () => {
 	getUsage.mockResolvedValue({
 	  five_hour: {
@@ -1713,6 +1762,71 @@ describe('AccountUsageCell', () => {
 		expect(wrapper.text()).not.toContain('admin.accounts.gemini.quotaPolicy.title')
 		expect(wrapper.text()).not.toContain('admin.accounts.gemini.rateLimit.unlimited')
 		expect(getUsage).not.toHaveBeenCalled()
+  })
+
+  it('Vertex 账号不设上限时不显示配额进度条', async () => {
+    const wrapper = mount(AccountUsageCell, {
+      props: {
+        account: makeAccount({
+          id: 4011,
+          platform: 'gemini',
+          type: 'service_account',
+          credentials: { tier_id: 'vertex', project_id: 'vertex-proj', location: 'global' },
+          extra: {}
+        }),
+        todayStats: {
+          requests: 3,
+          tokens: 1200,
+          cost: 0.42,
+          standard_cost: 0.42,
+          user_cost: 0.5
+        }
+      },
+      global: {
+        stubs: {
+          UsageProgressBar: true,
+          AccountQuotaInfo: true
+        }
+      }
+    })
+
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('A $0.42')
+    expect(wrapper.findAll('usage-progress-bar-stub')).toHaveLength(0)
+    expect(getUsage).not.toHaveBeenCalled()
+  })
+
+  it('Vertex 账号设置了配额上限时显示配额进度条', async () => {
+    const wrapper = mount(AccountUsageCell, {
+      props: {
+        account: makeAccount({
+          id: 4012,
+          platform: 'gemini',
+          type: 'service_account',
+          credentials: { tier_id: 'vertex', project_id: 'vertex-proj', location: 'global' },
+          extra: { quota_daily_start: new Date().toISOString() },
+          quota_used: 123.456,
+          quota_limit: 500,
+          quota_daily_limit: 50,
+          quota_daily_used: 12.5
+        }),
+        todayStats: null,
+        todayStatsLoading: false
+      },
+      global: {
+        stubs: {
+          UsageProgressBar: true,
+          AccountQuotaInfo: true
+        }
+      }
+    })
+
+    await flushPromises()
+
+    const bars = wrapper.findAll('usage-progress-bar-stub')
+    expect(bars.map((bar) => bar.attributes('label'))).toEqual(['1d', 'total'])
+    expect(getUsage).not.toHaveBeenCalled()
   })
 
   it('Gemini 第三方上游 API Key 按普通 Key 账号展示今日统计与额度，不显示 Gemini 徽章', async () => {

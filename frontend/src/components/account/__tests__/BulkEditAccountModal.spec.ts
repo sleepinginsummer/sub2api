@@ -104,6 +104,7 @@ describe('BulkEditAccountModal', () => {
   it('网关池只发送勾选字段，不回写旧策略，空Key保留且无后台预热', async () => {
     const wrapper = mountModal({ selectedPlatforms: ['openai'], selectedTypes: ['oauth', 'setup-token'] })
     expect(wrapper.find('[data-testid="bulk-gwpool"]').exists()).toBe(true)
+    expect(wrapper.get('[data-testid="bulk-gwpool-shutdown-note"]').text()).toBe('admin.accounts.openai.gwpoolShutdownNote')
     expect(wrapper.find('[data-testid*="prewarm"]').exists()).toBe(false)
     for (const key of ['guard_enabled', 'probe_model', 'rotation', 'rotation_min_gateways', 'max_wait_s', 'warm_tickets']) {
       expect(wrapper.find(`[data-testid="bulk-gwpool-apply-openai_gwpool_${key}"]`).exists()).toBe(false)
@@ -162,6 +163,20 @@ describe('BulkEditAccountModal', () => {
     wrapper.unmount()
   })
 
+  it('停止门槛独立勾选默认5，留空恢复默认且不改恢复门槛', async () => {
+    const wrapper = mountModal({ selectedPlatforms: ['openai'], selectedTypes: ['oauth'] })
+    const key = 'openai_gwpool_stop_gateways'
+    await wrapper.get(`[data-testid="bulk-gwpool-apply-${key}"]`).setValue(true)
+    expect(wrapper.get<HTMLInputElement>(`[data-testid="bulk-gwpool-value-${key}"]`).element.value).toBe('5')
+    await wrapper.get('#bulk-edit-account-form').trigger('submit.prevent')
+    await flushPromises()
+    expect(adminAPI.accounts.bulkUpdate).toHaveBeenLastCalledWith([1, 2], expect.objectContaining({ extra: { [key]: 5 } }))
+    await wrapper.get(`[data-testid="bulk-gwpool-value-${key}"]`).setValue('')
+    await wrapper.get('#bulk-edit-account-form').trigger('submit.prevent')
+    await flushPromises()
+    expect(adminAPI.accounts.bulkUpdate).toHaveBeenLastCalledWith([1, 2], expect.objectContaining({ extra: { [key]: null } }))
+    wrapper.unmount()
+  })
   it('恢复阈值独立勾选默认50，留空恢复默认且不改停调阈值', async () => {
     const wrapper = mountModal({ selectedPlatforms: ['openai'], selectedTypes: ['oauth'] })
     await wrapper.get('[data-testid="bulk-gwpool-apply-openai_gwpool_resume_gateways"]').setValue(true)
