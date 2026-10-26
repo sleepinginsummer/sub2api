@@ -8,9 +8,8 @@ import (
 	"github.com/tidwall/gjson"
 )
 
-// 使用记录的 TPS 只算答案：(output_tokens − reasoning_tokens) ÷ (duration_ms − first_answer_ms)
-// （frontend/src/utils/usageTps.ts）。首个答案之前上游可能已生成大量推理 token（推理正文通常不下发，
-// 下发的 reasoning_text.delta 与摘要也不算答案），所以计时从首个答案 delta 起，分子也只算答案部分。
+// 首答耗时与推理 Token 数保留用于诊断。使用记录的平均输出 TPS 只取
+// output_tokens ÷ duration_ms（frontend/src/utils/usageTps.ts），不使用这两个字段。
 
 // openAIFirstAnswer 记首个答案 delta 的到达时延。见到安全缓冲标记即作废且不再记：上游扣住输出、
 // 审完才放（Codex 提示 "Giving this request a little extra thought"），到达节奏不反映生成速度。

@@ -638,7 +638,7 @@ type UsageLog struct {
 	NativeCompactionV2 bool `json:"native_compaction_v2"`
 	DurationMs         *int `json:"duration_ms"`
 	FirstTokenMs       *int `json:"first_token_ms"`
-	// FirstAnswerMs / ReasoningTokens 供使用记录按可见输出算 TPS；未记录时省略。
+	// FirstAnswerMs / ReasoningTokens 保留用于首答与推理诊断；未记录时省略。
 	FirstAnswerMs   *int `json:"first_answer_ms,omitempty"`
 	ReasoningTokens *int `json:"reasoning_tokens,omitempty"`
 
