@@ -6,6 +6,8 @@ import (
 	"errors"
 	"sync"
 	"time"
+
+	"github.com/Wei-Shaw/sub2api/internal/pkg/adminaccess"
 )
 
 const (
@@ -128,6 +130,9 @@ func (s *AccountUsageService) getCPRUsageLocked(ctx context.Context, account *Ac
 		if err != nil {
 			return nil, err
 		}
+		if err := scopedAccountAccess(ctx, s.accountRepo, fresh, "accounts.usage.read", false); err != nil {
+			return nil, err
+		}
 		if fresh == nil || !fresh.IsCPR() {
 			return nil, ErrCPRNotConfigured
 		}
@@ -146,7 +151,7 @@ func (s *AccountUsageService) getCPRUsageLocked(ctx context.Context, account *Ac
 			err = ErrCPRNotConfigured
 		} else {
 			state, err = s.cprQuotaService.FetchAccountState(ctx, account)
-			if err == nil && state != nil && force && state.Capabilities.QuotaRefresh {
+			if err == nil && state != nil && force && state.Capabilities.QuotaRefresh && adminaccess.RestrictedFromContext(ctx) == nil {
 				err = s.cprQuotaService.RefreshQuota(ctx, account)
 				if err == nil {
 					state, err = s.cprQuotaService.FetchAccountState(ctx, account)

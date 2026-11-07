@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Wei-Shaw/sub2api/internal/pkg/adminaccess"
 	"github.com/imroc/req/v3"
 	gocache "github.com/patrickmn/go-cache"
 )
@@ -48,7 +49,7 @@ var codexWireTimezoneInFlight = gocache.New(5*time.Minute, time.Minute)
 // 整段在后台跑：闸门判定要读账号（还可能解析影子行），命中后还有一次最长 10 秒的外部查询，
 // 挂在额度查询的同步路径上会把管理端的账号详情和用量刷新一起拖住。额度结果不依赖它。
 func (s *OpenAIQuotaService) refreshCodexWireTimezone(ctx context.Context, accountID int64) {
-	if s == nil || s.accountRepo == nil || s.privacyClientFactory == nil {
+	if s == nil || s.accountRepo == nil || s.privacyClientFactory == nil || adminaccess.RestrictedFromContext(ctx) != nil {
 		return
 	}
 	if err := codexWireTimezoneInFlight.Add(

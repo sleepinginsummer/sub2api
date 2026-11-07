@@ -279,6 +279,9 @@ func (s *OpenAIQuotaService) CacheResetCreditsSnapshot(ctx context.Context, acco
 // of reset-credit expiration details. A successful read with absent credits
 // replaces the previous balance with unknown, never with a fabricated zero.
 func (s *OpenAIQuotaService) CacheCreditsSnapshot(ctx context.Context, accountID int64, usage *OpenAIQuotaUsage) error {
+	if err := scopedAccountIDAccess(ctx, s.accountRepo, accountID, scopedAccountOperation(ctx, "openai.quota.read"), true); err != nil {
+		return err
+	}
 	if usage == nil {
 		return infraerrors.New(http.StatusBadGateway, "OPENAI_QUOTA_EMPTY_USAGE", "openai quota query returned an empty result")
 	}
@@ -292,6 +295,9 @@ func (s *OpenAIQuotaService) CacheCreditsSnapshot(ctx context.Context, accountID
 
 // CachePostResetSnapshot persists the credits and usage windows observed after a reset.
 func (s *OpenAIQuotaService) CachePostResetSnapshot(ctx context.Context, accountID int64, usage *OpenAIQuotaUsage) error {
+	if err := scopedAccountIDAccess(ctx, s.accountRepo, accountID, scopedAccountOperation(ctx, "openai.quota.reset"), true); err != nil {
+		return err
+	}
 	if usage == nil {
 		return s.cacheResetCreditsSnapshot(ctx, accountID, nil, nil)
 	}
@@ -309,6 +315,9 @@ func (s *OpenAIQuotaService) CachePostResetSnapshot(ctx context.Context, account
 }
 
 func (s *OpenAIQuotaService) cacheResetCreditsSnapshot(ctx context.Context, accountID int64, credits *OpenAIRateLimitResetCredits, updates map[string]any) error {
+	if err := scopedAccountIDAccess(ctx, s.accountRepo, accountID, scopedAccountOperation(ctx, "openai.quota.read"), true); err != nil {
+		return err
+	}
 	if credits == nil || (credits.AvailableCount > 0 && len(credits.Credits) == 0) {
 		return infraerrors.New(
 			http.StatusBadGateway,
@@ -385,6 +394,7 @@ func (s *OpenAIQuotaService) ResetCreditTargeted(ctx context.Context, accountID 
 }
 
 func (s *OpenAIQuotaService) resetCredit(ctx context.Context, accountID int64, creditID, redeemRequestID string, targeted bool) (*OpenAIQuotaResetResult, error) {
+	ctx = WithScopedAdminAccountOperation(ctx, "openai.quota.reset")
 	call, err := s.prepareUpstreamCall(ctx, accountID, true)
 	if err != nil {
 		return nil, err
@@ -497,9 +507,16 @@ func (s *OpenAIQuotaService) loadQuotaCallSnapshot(ctx context.Context, accountI
 		return nil, infraerrors.New(http.StatusInternalServerError, "OPENAI_QUOTA_NOT_CONFIGURED", "openai quota service is not configured")
 	}
 
+	action := scopedAccountOperation(ctx, "openai.quota.read")
 	account, err := s.accountRepo.GetByID(ctx, accountID)
 	if err != nil {
+		if scopeErr := scopedAccountAccess(ctx, s.accountRepo, nil, action, false); scopeErr != nil {
+			return nil, scopeErr
+		}
 		return nil, infraerrors.Newf(http.StatusNotFound, "OPENAI_QUOTA_ACCOUNT_NOT_FOUND", "account not found: %v", err)
+	}
+	if err := scopedAccountAccess(ctx, s.accountRepo, account, action, !forReset); err != nil {
+		return nil, err
 	}
 	if account == nil {
 		return nil, infraerrors.New(http.StatusNotFound, "OPENAI_QUOTA_ACCOUNT_NOT_FOUND", "account not found")
@@ -508,9 +525,6 @@ func (s *OpenAIQuotaService) loadQuotaCallSnapshot(ctx context.Context, accountI
 	// transport construction. A later account read cannot bypass this guard.
 	if forReset && account.IsShadow() {
 		return nil, ErrSparkShadowResetNotSupported
-	}
-	if s.privacyClientFactory == nil {
-		return nil, infraerrors.New(http.StatusInternalServerError, "OPENAI_QUOTA_NOT_CONFIGURED", "openai quota service is not configured")
 	}
 	if account.Platform != PlatformOpenAI {
 		return nil, infraerrors.New(http.StatusBadRequest, "OPENAI_QUOTA_INVALID_PLATFORM", "account is not an OpenAI account")
@@ -522,9 +536,18 @@ func (s *OpenAIQuotaService) loadQuotaCallSnapshot(ctx context.Context, accountI
 	if account.IsShadow() {
 		resolved, rerr := resolveCredentialAccount(ctx, s.accountRepo, account)
 		if rerr != nil {
+			if scopeErr := scopedAccountAccess(ctx, s.accountRepo, nil, action, false); scopeErr != nil {
+				return nil, scopeErr
+			}
 			return nil, infraerrors.Newf(http.StatusBadGateway, "OPENAI_QUOTA_SHADOW_RESOLVE_FAILED", "failed to resolve shadow account: %v", rerr)
 		}
 		account = resolved
+		if err := scopedAccountAccess(ctx, s.accountRepo, account, action, false); err != nil {
+			return nil, err
+		}
+	}
+	if s.privacyClientFactory == nil {
+		return nil, infraerrors.New(http.StatusInternalServerError, "OPENAI_QUOTA_NOT_CONFIGURED", "openai quota service is not configured")
 	}
 	call.account = snapshotOpenAIOutboundAccount(account)
 	account = call.account

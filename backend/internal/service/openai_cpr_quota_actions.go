@@ -57,6 +57,9 @@ func (s *AccountUsageService) writeCPRQuotaExtra(ctx context.Context, account *A
 	if err != nil {
 		return err
 	}
+	if err := scopedAccountAccess(ctx, s.accountRepo, fresh, "accounts.usage.read", false); err != nil {
+		return err
+	}
 	if cprQuotaBinding(account) == "" || cprQuotaBinding(fresh) != cprQuotaBinding(account) {
 		return errors.New("CPR account binding changed")
 	}

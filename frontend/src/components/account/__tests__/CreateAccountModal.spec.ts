@@ -231,11 +231,14 @@ describe('CreateAccountModal OpenAI long-context billing', () => {
     connection.vm.$emit('update:accountId', 'acct_1')
     connection.vm.$emit('selected', { id: 'acct_1', name: 'CPR One', email: '', plan_type: 'pro', status: 'normal', enabled: true, concurrency_limit: 16 })
     await flushPromises()
+    await wrapper.get('[data-testid="openai-image-size-tier-1K"]').setValue(false)
+    await wrapper.get('[data-testid="openai-image-size-tier-2K"]').setValue(false)
     await wrapper.get('form#create-account-form').trigger('submit.prevent')
     await flushPromises()
     expect(createAccountMock).toHaveBeenCalledOnce()
     expect(createAccountMock.mock.calls[0]?.[0]).toMatchObject({ type: 'cpr', name: 'CPR One', concurrency: 16, cpr_auto_configure: true, credentials: { cpr_account_id: 'acct_1', admin_api_key: 'fake-admin' } })
     expect(createAccountMock.mock.calls[0]?.[0]?.credentials).not.toHaveProperty('api_key')
+    expect(createAccountMock.mock.calls[0]?.[0]?.extra?.openai_image_size_tiers).toEqual(['4K'])
     wrapper.unmount()
   })
 
@@ -356,6 +359,25 @@ describe('CreateAccountModal OpenAI long-context billing', () => {
 
     expect(createAccountMock).toHaveBeenCalledTimes(1)
     expect(createAccountMock.mock.calls[0]?.[0]?.extra?.images_url_to_b64_json).toBe(true)
+  })
+
+  it('omits image size tiers by default and sends restricted tiers when set', async () => {
+    await submitApiKeyAccount('openai')
+    expect(createAccountMock.mock.calls[0]?.[0]?.extra).not.toHaveProperty('openai_image_size_tiers')
+
+    createAccountMock.mockClear()
+    const wrapper = mountModal()
+    await selectButtonByText(wrapper, 'OpenAI')
+    await selectButtonByText(wrapper, 'API Key')
+    await wrapper.get('form#create-account-form input[type="text"]').setValue('openai account')
+    await wrapper.get('form#create-account-form input[type="password"]').setValue('test-api-key')
+    await wrapper.get('[data-testid="openai-image-size-tier-1K"]').setValue(false)
+    await wrapper.get('[data-testid="openai-image-size-tier-2K"]').setValue(false)
+    await wrapper.get('form#create-account-form').trigger('submit.prevent')
+    await flushPromises()
+
+    expect(createAccountMock).toHaveBeenCalledTimes(1)
+    expect(createAccountMock.mock.calls[0]?.[0]?.extra?.openai_image_size_tiers).toEqual(['4K'])
   })
 
   it('persists upstream model metadata after creating an account from preview', async () => {
