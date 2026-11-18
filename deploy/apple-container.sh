@@ -398,12 +398,21 @@ validate_ipv4_address() {
     done
 }
 
+# GNU coreutils 与 BSD/macOS 的 stat 参数不同：-c 是 GNU，-f 是 BSD。
+file_owner() {
+    stat -c '%u' "$1" 2>/dev/null || stat -f '%u' "$1"
+}
+
+file_mode() {
+    stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1"
+}
+
 validate_env_file_security() {
     local owner mode permissions
 
     [[ -f "${ENV_FILE}" ]] || die "Environment file not found: ${ENV_FILE}. Run '$0 init' first."
-    owner="$(stat -f '%u' "${ENV_FILE}")" || die "Unable to read owner for ${ENV_FILE}."
-    mode="$(stat -f '%Lp' "${ENV_FILE}")" || die "Unable to read permissions for ${ENV_FILE}."
+    owner="$(file_owner "${ENV_FILE}")" || die "Unable to read owner for ${ENV_FILE}."
+    mode="$(file_mode "${ENV_FILE}")" || die "Unable to read permissions for ${ENV_FILE}."
     [[ "${owner}" == "${EUID}" ]] || die "Environment file must be owned by the current user: ${ENV_FILE}"
     [[ "${mode}" =~ ^[0-7]+$ ]] || die "Unable to parse permissions for ${ENV_FILE}: ${mode}"
     permissions=$((8#${mode}))

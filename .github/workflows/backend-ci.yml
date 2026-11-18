@@ -22,13 +22,21 @@ permissions:
 
 jobs:
   shell:
-    runs-on: macos-15
+    # 自建 runner 跑部署脚本检查：GitHub 的 macOS runner 长期排不到队，导致该作业反复被取消。
+    # 仓库是公开的，PR 里可能带入未审代码，因此只在 push 和手动触发时使用自建 runner。
+    if: github.event_name != 'pull_request'
+    runs-on: [self-hosted, nas-linux]
     steps:
       - uses: actions/checkout@v6
       - name: Check deployment scripts
         run: |
           /bin/bash -n deploy/apple-container.sh
-          /bin/bash deploy/tests/apple-container-test.sh
+          # Apple 容器脚本依赖 macOS 的 container 与 plutil，Linux runner 上只做语法检查。
+          if [ "$(uname -s)" = "Darwin" ]; then
+              /bin/bash deploy/tests/apple-container-test.sh
+          else
+              echo "skip deploy/tests/apple-container-test.sh: 只支持 macOS"
+          fi
           /bin/sh deploy/tests/docker-compose-security-test.sh
           /bin/sh deploy/tests/docker-compose-gateway-env-test.sh
           /bin/sh deploy/tests/docker-runtime-resources-test.sh
