@@ -719,7 +719,8 @@ onMounted(() => {
   width: 8px;
   height: 16px;
   background: #22c55e;
-  animation: blink 1s step-end infinite;
+  /* 只闪有限次后常亮：无限闪烁会让合成器在 4K 高刷屏上持续出帧，页面静置也占满核 */
+  animation: blink 1s step-end 6;
 }
 
 @keyframes blink {
