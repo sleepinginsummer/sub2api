@@ -1,0 +1,39 @@
+#!/bin/bash
+# 测试用 plutil 替身：只实现 apple-container.sh 用到的 -extract 子集。
+# macOS 的 plutil 走 plist 语义；这里直接按 JSON 解析（container 的 -j 输出）。
+set -euo pipefail
+
+if [[ "${1:-}" != "-extract" ]]; then
+    echo "plutil stub: 只支持 -extract" >&2
+    exit 1
+fi
+
+key=$2
+format=$3   # json|raw
+[[ "${4:-}" == "-o" && "${5:-}" == "-" && "${6:-}" == "-" ]] || {
+    echo "plutil stub: 只支持 -o - -" >&2
+    exit 1
+}
+
+# 用 -c 传脚本，保证 stdin 仍然是管道进来的 JSON。
+exec python3 -c '
+import json, sys
+
+key, fmt = sys.argv[1], sys.argv[2]
+data = json.load(sys.stdin)
+
+node = data
+for part in key.split("."):
+    node = node[int(part)] if isinstance(node, list) else node[part]
+
+if fmt == "json":
+    print(json.dumps(node, separators=(",", ":")), end="")
+elif isinstance(node, bool):
+    print("true" if node else "false", end="")
+elif node is None:
+    print("", end="")
+elif isinstance(node, (dict, list)):
+    print(json.dumps(node, separators=(",", ":")), end="")
+else:
+    print(node, end="")
+' "$key" "$format"
