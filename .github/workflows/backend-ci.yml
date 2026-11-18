@@ -9,6 +9,8 @@ on:
       - '**.md'
       - 'LICENSE'
   pull_request:
+  # fork 的 push 事件偶尔不派发，保留手动触发入口以便补跑校验。
+  workflow_dispatch:
 
 # 同一分支连续推送时取消还在跑的上一轮，只留最新的那次。
 concurrency:
