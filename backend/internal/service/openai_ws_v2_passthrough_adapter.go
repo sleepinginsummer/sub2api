@@ -1050,7 +1050,7 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 				}
 				payload = identityPayload
 			} else if eventType == "session.update" {
-				accountScopedPayload, accountScoped, scopeErr := applyCodexAccountIdentityClientMetadataRaw(payload, codexAccountIdentitySource(c, account), getAPIKeyIDFromContext(c))
+				accountScopedPayload, accountScoped, scopeErr := applyCodexAccountIdentityClientMetadataRaw(payload, codexAccountIdentitySource(c, account), getAPIKeyIDFromContext(c), codexClientSessionID(c))
 				if scopeErr != nil {
 					return payload, nil, NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, "invalid websocket identity metadata", scopeErr)
 				}
@@ -1218,6 +1218,7 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 		Options: openaiwsv2.RelayOptions{
 			WriteTimeout:       s.openAIWSWriteTimeout(),
 			FirstTurnStartedAt: firstTurnStartedAt,
+			IsFirstTokenEvent:  openAIWSFirstTokenEventFunc(s.openAITTFTMode(ctx)),
 			TakeNextTurnStartedAt: func() time.Time {
 				startedAt := acceptedTurnStartedAt.Swap(nil)
 				if startedAt == nil {
@@ -1613,6 +1614,18 @@ func relayErrorText(err error) string {
 		return ""
 	}
 	return err.Error()
+}
+
+// openAIWSFirstTokenEventFunc applies the configured TTFT mode to WebSocket
+// events so they report first-token time on the same basis as SSE streams.
+// codex.* frames are WebSocket-only out-of-band events, not model output.
+func openAIWSFirstTokenEventFunc(mode string) func(eventType string, message []byte) bool {
+	return func(eventType string, message []byte) bool {
+		if strings.HasPrefix(strings.TrimSpace(eventType), "codex.") {
+			return false
+		}
+		return openAIStreamDataStartsTTFT(string(message), eventType, false, mode)
+	}
 }
 
 func openAIWSFirstTokenMsForLog(firstTokenMs *int) int {

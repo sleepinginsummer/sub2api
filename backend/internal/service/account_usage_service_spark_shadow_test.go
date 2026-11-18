@@ -131,8 +131,10 @@ func TestGetOpenAIUsage_SparkShadow_WritesExtraAndReturnsNonEmptyWindows(t *test
 		"QueryUsage must use parent's chatgpt-account-id for spark shadow accounts")
 
 	// Assertion A-2: shadow Extra was persisted with codex_5h_used_percent.
+	var persistedUpdates map[string]any
 	select {
 	case updates := <-updateExtraCh:
+		persistedUpdates = updates
 		require.Contains(t, updates, "codex_5h_used_percent",
 			"persisted extra must contain codex_5h_used_percent")
 		require.InDelta(t, 42.5, updates["codex_5h_used_percent"], 0.01,
@@ -148,4 +150,74 @@ func TestGetOpenAIUsage_SparkShadow_WritesExtraAndReturnsNonEmptyWindows(t *test
 		"returned UsageInfo.FiveHour must be non-nil (rebuild from merged Extra must happen)")
 	require.NotNil(t, usage.SevenDay,
 		"returned UsageInfo.SevenDay must be non-nil (rebuild from merged Extra must happen)")
+	require.Equal(t, "active", usage.Source)
+	require.Empty(t, usage.Error)
+	require.NotNil(t, usage.UpdatedAt)
+	// The fork reads an outbound snapshot instead of mutating the caller's
+	// account object; assert the observation timestamp on the persisted patch.
+	stamp, ok := persistedUpdates["codex_usage_updated_at"].(string)
+	require.True(t, ok, "snapshot observation time must be stored as a string")
+	observedAt, err := time.Parse(time.RFC3339, stamp)
+	require.NoError(t, err)
+	require.True(t, usage.UpdatedAt.Equal(observedAt))
+	require.NotContains(t, shadow.Extra, "codex_usage_updated_at", "usage reads must not mutate the caller's account")
+}
+
+func TestGetOpenAIUsage_SparkShadow_FailedOrEmptyQueryDoesNotRefreshSnapshot(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name   string
+		status int
+		body   string
+	}{
+		{"expired token", http.StatusUnauthorized, `{"error":{"code":"token_expired"}}`},
+		{"empty quota", http.StatusOK, `{}`},
+		{"empty windows", http.StatusOK, `{"additional_rate_limits":[{"metered_feature":"codex_bengalfox","rate_limit":{}}]}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			observedAt := time.Now().Add(-24 * time.Hour).UTC().Truncate(time.Second)
+			parentID := int64(100)
+			parent := &Account{ID: parentID, Platform: PlatformOpenAI, Type: AccountTypeOAuth, Status: StatusActive}
+			shadow := &Account{
+				ID: 200, ParentAccountID: &parentID,
+				Platform: PlatformOpenAI, Type: AccountTypeOAuth, Status: StatusActive,
+				QuotaDimension: QuotaDimensionSpark,
+				Extra: map[string]any{
+					"codex_7d_used_percent":  100.0,
+					"codex_usage_updated_at": observedAt.Format(time.RFC3339),
+				},
+			}
+			repo := &sparkShadowUsageTestRepo{
+				accounts:      map[int64]*Account{100: parent, 200: shadow},
+				updateExtraCh: make(chan map[string]any, 1),
+			}
+			tokens := &stubQuotaTokenCache{tokens: map[string]string{OpenAITokenCacheKey(parent): "fake-access-token"}}
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(tc.status)
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer srv.Close()
+			svc := &AccountUsageService{
+				accountRepo:        repo,
+				openAIQuotaService: NewOpenAIQuotaService(repo, nil, NewOpenAITokenProvider(repo, tokens, nil), newQuotaRedirectingFactory(srv), nil),
+			}
+			usage, err := svc.getOpenAIUsage(context.Background(), shadow, true)
+			require.NoError(t, err)
+			require.Equal(t, "quota_refresh_failed", usage.ErrorCode)
+			require.NotEmpty(t, usage.Error)
+			require.Equal(t, "passive", usage.Source)
+			require.NotNil(t, usage.UpdatedAt)
+			require.True(t, usage.UpdatedAt.Equal(observedAt))
+			require.NotNil(t, usage.SevenDay)
+			require.Equal(t, 100.0, usage.SevenDay.Utilization)
+			require.Equal(t, observedAt.Format(time.RFC3339), shadow.Extra["codex_usage_updated_at"])
+			select {
+			case <-repo.updateExtraCh:
+				t.Fatal("failed or empty queries must not persist a fresh snapshot")
+			case <-time.After(100 * time.Millisecond):
+			}
+		})
+	}
 }

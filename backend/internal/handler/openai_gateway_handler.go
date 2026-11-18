@@ -15,6 +15,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/Wei-Shaw/sub2api/internal/domain"
@@ -364,7 +365,7 @@ func NewOpenAIGatewayHandler(
 	opsService *service.OpsService,
 	cfg *config.Config,
 ) *OpenAIGatewayHandler {
-	pingInterval := time.Duration(0)
+	pingInterval := defaultPingInterval
 	maxAccountSwitches := 3
 	if cfg != nil {
 		pingInterval = time.Duration(cfg.Concurrency.PingInterval) * time.Second
@@ -439,6 +440,13 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 		return
 	}
 
+	// Reject invalid UTF-8 before JSON transformation so malformed bytes do not
+	// become retryable upstream errors.
+	if !utf8.Valid(body) {
+		h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", "Request body must be valid UTF-8 JSON. Send UTF-8 encoded bytes.")
+		return
+	}
+
 	setOpsRequestContext(c, "", false)
 	sessionHashBody := body
 	body, ok = h.normalizeOpenAIResponsesCompactRequest(c, reqLog, body)
@@ -484,6 +492,12 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 		reasoningPolicyErr = err
 	} else if changed {
 		body = cappedBody
+	}
+	if normalizedBody, changed := normalizeCodexUntrustedContext(body); changed {
+		body = normalizedBody
+		reqLog.Info("openai.codex_untrusted_context_normalized",
+			zap.String("normalization", "call_output_to_user_message"),
+		)
 	}
 	if normalizedBody, changed := normalizeCodexAutomationBootstrap(body); changed {
 		body = normalizedBody
@@ -1535,10 +1549,15 @@ func (h *OpenAIGatewayHandler) Messages(c *gin.Context) {
 						)
 						return
 					}
-					if service.OpenAICompactKeepaliveAdjustedWrittenSize(c) != writerSizeBeforeForward {
+					if !openAIForwardMayFailover(c, writerSizeBeforeForward, failoverErr) {
 						h.gatewayService.ObserveOpenAIAccountHealthFailure(c.Request.Context(), account, err)
 						h.handleAnthropicFailoverExhausted(c, failoverErr, true)
 						return
+					}
+					// Only keepalive bytes were written, so failover may continue, but
+					// every later error must be written as an SSE event.
+					if c.Writer.Written() {
+						streamStarted = true
 					}
 					if failoverErr.ShouldReportAccountScheduleFailure() {
 						h.gatewayService.ReportOpenAIAccountScheduleResult(account, openAIAccountScheduleModel(c, account, currentRoutingModel, false, nil), false, nil, err)
@@ -1714,6 +1733,12 @@ func (h *OpenAIGatewayHandler) handleAnthropicFailoverExhausted(c *gin.Context, 
 		h.anthropicStreamingAwareError(c, status, "api_error", failoverErr.ClientMessage, streamStarted)
 		return
 	}
+	// A failed or error frame that triggered the failover no longer reaches the
+	// client in-band, so its error passthrough rule is applied here instead.
+	if status, errType, msg, ok := service.ApplyOpenAIStreamFailedFrameRule(c, failoverErr); ok {
+		h.anthropicStreamingAwareError(c, status, errType, msg, streamStarted)
+		return
+	}
 	// 与 Responses 入口同口径：只有带说明的池失败才原样转给客户端。同账号重试截止耗尽后
 	// 冒出来的池失败可能不带说明（重试失败被改标成池原因），那时按上游状态码归一。
 	if failoverErr != nil && (failoverErr.Reason == service.OpenAIGatewayPoolReason || failoverErr.Reason == service.OpenAIQualityGuardReason) && strings.TrimSpace(failoverErr.ClientMessage) != "" {
@@ -1731,10 +1756,12 @@ func (h *OpenAIGatewayHandler) handleAnthropicFailoverExhausted(c *gin.Context, 
 
 // ensureAnthropicErrorResponse writes a fallback Anthropic error if no response was written.
 func (h *OpenAIGatewayHandler) ensureAnthropicErrorResponse(c *gin.Context, streamStarted bool) bool {
+	// Keepalive pings alone do not count as a written response, but they do
+	// commit the response as SSE, so the fallback must then be an SSE event.
 	if c == nil || c.Writer == nil || service.OpenAICompactKeepaliveAdjustedWrittenSize(c) >= 0 {
 		return false
 	}
-	h.anthropicStreamingAwareError(c, http.StatusBadGateway, "api_error", "Upstream request failed", streamStarted)
+	h.anthropicStreamingAwareError(c, http.StatusBadGateway, "api_error", "Upstream request failed", streamStarted || c.Writer.Written())
 	return true
 }
 
@@ -1791,11 +1818,23 @@ func normalizeCodexAutomationBootstrap(body []byte) ([]byte, bool) {
 // mayContainCodexCallOutputCandidate is a necessary condition for a bootstrap
 // candidate, checked before the full uniqueness scan and decode. Its type and
 // tool name are JSON strings, which appear literally unless a \u escape spells
-// their letters; without either, normalization cannot change the body.
+// their letters; without either, normalization cannot change the body. Escapes
+// that real clients emit (control characters, HTML-safe and non-ASCII runes)
+// cannot spell those letters and must not force the full decode.
+//
+// Tool declarations carry the same names, so a literal hit is confirmed by a
+// zero-copy scan for an input item of type function_call_output whose name
+// starts with one of toolNames. The full path rejects bodies with duplicate
+// members, and without duplicates the scan reads the same values as the
+// decoder.
 func mayContainCodexCallOutputCandidate(body []byte, toolNames ...string) bool {
-	if bytes.Contains(body, []byte(`\u`)) {
-		return true
+	if !service.JSONMayEscapePlainASCII(body) && !containsCodexCallOutputLiterals(body, toolNames) {
+		return false
 	}
+	return service.ResponsesInputHasFunctionCallOutputNamed(body, toolNames...)
+}
+
+func containsCodexCallOutputLiterals(body []byte, toolNames []string) bool {
 	if !bytes.Contains(body, []byte("function_call_output")) {
 		return false
 	}

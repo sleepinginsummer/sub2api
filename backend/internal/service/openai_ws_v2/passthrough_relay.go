@@ -79,19 +79,20 @@ type RelayOptions struct {
 	FirstMessageType                coderws.MessageType
 	FirstMessageSent                bool
 	StartClientAfterFirstDownstream bool
-	// BareErrorEndsTurn 让裸 error 事件立即结算本轮，不等可能跟来的 response.failed。
-	// 上游每轮失败只发一条 error、连接不断时用：客户端收到 error 就会发下一轮，
-	// 延后结算会让上一轮的回调落在下一轮开始之后。
-	BareErrorEndsTurn   bool
-	OnUsageParseFailure func(eventType string, usageRaw string)
-	OnTurnComplete      func(turn RelayTurnResult)
-	BeforeWriteClient   func(msgType coderws.MessageType, payload []byte, wroteDownstream bool) error
-	BeforeClientWrite   func(msgType coderws.MessageType, payload []byte)
-	AfterClientWrite    func(msgType coderws.MessageType, payload []byte, writeErr error)
-	BeforeRelayCancel   func(exit RelayExit)
-	ReadClientFrame     func(ctx context.Context, clientConn FrameConn) (coderws.MessageType, []byte, error)
-	OnTrace             func(event RelayTraceEvent)
-	Now                 func() time.Time
+	BareErrorEndsTurn               bool
+	OnUsageParseFailure             func(eventType string, usageRaw string)
+	OnTurnComplete                  func(turn RelayTurnResult)
+	BeforeWriteClient               func(msgType coderws.MessageType, payload []byte, wroteDownstream bool) error
+	BeforeClientWrite               func(msgType coderws.MessageType, payload []byte)
+	AfterClientWrite                func(msgType coderws.MessageType, payload []byte, writeErr error)
+	BeforeRelayCancel               func(exit RelayExit)
+	ReadClientFrame                 func(ctx context.Context, clientConn FrameConn) (coderws.MessageType, []byte, error)
+	OnTrace                         func(event RelayTraceEvent)
+	// IsFirstTokenEvent is retained for upstream source compatibility.
+	// Deprecated: this fork reports the first response frame via IsResponseFrameEvent,
+	// independently of semantic-token selection.
+	IsFirstTokenEvent func(eventType string, message []byte) bool
+	Now               func() time.Time
 }
 
 type RelayTraceEvent struct {

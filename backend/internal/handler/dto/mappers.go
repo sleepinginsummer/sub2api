@@ -149,8 +149,8 @@ func GroupFromServiceAdmin(g *service.Group) *AdminGroup {
 	out := &AdminGroup{
 		Group:                           groupFromServiceBase(g),
 		ForceOpenAIFast:                 g.ForceOpenAIFast,
+		ForceOpenAIUltrafast:            g.ForceOpenAIUltrafast,
 		FreeOpenAIFast:                  g.FreeOpenAIFast,
-		OpenAIGatewayPoolActiveAccounts: g.GatewayPoolActiveAccountLimit(),
 		ProfitControlEnabled:            g.ProfitControlEnabled,
 		ProfitMinMargin:                 g.ProfitMinMargin,
 		ProfitSafetyBuffer:              g.ProfitSafetyBuffer,
@@ -167,6 +167,7 @@ func GroupFromServiceAdmin(g *service.Group) *AdminGroup {
 		ActiveAccountCount:              g.ActiveAccountCount,
 		RateLimitedAccountCount:         g.RateLimitedAccountCount,
 		SortOrder:                       g.SortOrder,
+		OpenAIGatewayPoolActiveAccounts: g.GatewayPoolActiveAccountLimit(),
 	}
 	if len(g.AccountGroups) > 0 {
 		out.AccountGroups = make([]AccountGroup, 0, len(g.AccountGroups))
@@ -717,6 +718,8 @@ func usageLogFromServiceUser(l *service.UsageLog) UsageLog {
 		CacheReadTokens:           l.CacheReadTokens,
 		CacheCreation5mTokens:     l.CacheCreation5mTokens,
 		CacheCreation1hTokens:     l.CacheCreation1hTokens,
+		CacheCreation30mTokens:    l.CacheCreation30mTokens,
+		CacheCreation12hTokens:    l.CacheCreation12hTokens,
 		InputCost:                 l.InputCost,
 		OutputCost:                l.OutputCost,
 		CacheCreationCost:         l.CacheCreationCost,

@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 	"unsafe"
@@ -303,17 +304,20 @@ func extractSystemPreviewFromBody(body []byte) string {
 
 	switch {
 	case sys.IsArray():
-		for _, item := range sys.Array() {
+		var preview string
+		sys.ForEach(func(_, item gjson.Result) bool {
 			if !item.IsObject() {
-				continue
+				return true
 			}
 			if strings.EqualFold(item.Get("type").String(), "text") {
 				if t := item.Get("text").String(); strings.TrimSpace(t) != "" {
-					return t
+					preview = t
+					return false
 				}
 			}
-		}
-		return ""
+			return true
+		})
+		return preview
 	case sys.Type == gjson.String:
 		return sys.String()
 	default:
@@ -350,7 +354,7 @@ func buildClaudeMimicDebugLine(req *http.Request, body []byte, account *Account,
 
 	h := make([]string, 0, len(interesting))
 	for _, k := range interesting {
-		if v := req.Header.Get(k); v != "" {
+		if v := getHeaderRaw(req.Header, k); v != "" {
 			h = append(h, fmt.Sprintf("%s=%q", k, safeHeaderValueForLog(k, v)))
 		}
 	}
@@ -385,6 +389,64 @@ func buildClaudeMimicDebugLine(req *http.Request, body []byte, account *Account,
 	)
 }
 
+// claudeMimicDebugLine defers building the diagnostics line until an error
+// path actually needs it. The line is read only on Claude Code credential-scope
+// errors, so building it eagerly cost every OAuth request a header walk, a
+// system-prompt scan and several fmt.Sprintf calls for nothing.
+type claudeMimicDebugLine struct {
+	once            sync.Once
+	req             *http.Request
+	body            []byte
+	account         *Account
+	tokenType       string
+	mimicClaudeCode bool
+	line            string
+}
+
+func newClaudeMimicDebugLine(req *http.Request, body []byte, account *Account, tokenType string, mimicClaudeCode bool) *claudeMimicDebugLine {
+	return &claudeMimicDebugLine{
+		req:             req,
+		body:            body,
+		account:         account,
+		tokenType:       tokenType,
+		mimicClaudeCode: mimicClaudeCode,
+	}
+}
+
+func (l *claudeMimicDebugLine) String() string {
+	if l == nil {
+		return ""
+	}
+	l.once.Do(func() {
+		l.line = buildClaudeMimicDebugLine(l.req, l.body, l.account, l.tokenType, l.mimicClaudeCode)
+		// Drop references so the request/body are not retained after use.
+		l.req, l.body, l.account = nil, nil, nil
+	})
+	return l.line
+}
+
+// claudeMimicDebugLineFromContext returns the stored diagnostics line, building
+// it on first use. It also accepts a plain string for compatibility.
+func claudeMimicDebugLineFromContext(c interface {
+	Get(string) (any, bool)
+}) string {
+	if c == nil {
+		return ""
+	}
+	v, ok := c.Get(claudeMimicDebugInfoKey)
+	if !ok {
+		return ""
+	}
+	switch line := v.(type) {
+	case *claudeMimicDebugLine:
+		return line.String()
+	case string:
+		return line
+	default:
+		return ""
+	}
+}
+
 func logClaudeMimicDebug(req *http.Request, body []byte, account *Account, tokenType string, mimicClaudeCode bool) {
 	line := buildClaudeMimicDebugLine(req, body, account, tokenType, mimicClaudeCode)
 	if line == "" {
@@ -402,10 +464,7 @@ func isClaudeCodeCredentialScopeError(msg string) bool {
 		strings.Contains(m, "cannot be used for other api requests")
 }
 
-// sseDataRe matches SSE data lines with optional whitespace after colon.
-// Some upstream APIs return non-standard "data:" without space (should be "data: ").
 var (
-	sseDataRe            = regexp.MustCompile(`^data:\s*`)
 	claudeCliUserAgentRe = regexp.MustCompile(`(?i)^claude-cli/\d+\.\d+\.\d+`)
 
 	// claudeCodePromptPrefixes 用于检测 Claude Code 系统提示词的前缀列表
@@ -658,6 +717,17 @@ type ForwardResult struct {
 	// CacheStorageTokenHours 显式上下文缓存的存储量（缓存 token 数 × 存储小时数），按计费模型的
 	// 存储单价折算为费用后叠加在 token 费用之上。
 	CacheStorageTokenHours float64
+	// UpstreamPriceMultiplier 是上游按实际请求端点计价相对计费模型价格的倍数（见 VertexUpstreamPriceMultiplier），
+	// 只作用于 token 费用；0 按 1 处理。
+	UpstreamPriceMultiplier float64
+}
+
+// upstreamPriceFactor 返回 UpstreamPriceMultiplier，未设置时为 1。
+func (r *ForwardResult) upstreamPriceFactor() float64 {
+	if r == nil || r.UpstreamPriceMultiplier <= 0 {
+		return 1
+	}
+	return r.UpstreamPriceMultiplier
 }
 
 // GatewayFailureStage identifies which request stage failed. The zero value is
@@ -701,7 +771,6 @@ type UpstreamFailoverError struct {
 	ResponseHeaders           http.Header   // 上游响应头，用于透传 cf-ray/cf-mitigated/content-type 等诊断信息
 	ForceCacheBilling         bool          // Antigravity 粘性会话切换时设为 true
 	RetryableOnSameAccount    bool          // 临时性错误（如 Google 间歇性 400、空响应），应在同一账号上重试 N 次再切换
-	SameAccountRetryOnly      bool          // allow a bounded same-account retry even when switching accounts is prohibited
 	SameAccountRetryDelay     time.Duration // 同账号重试的最小间隔；零值使用 handler 默认值
 	SameAccountRetryDeadline  time.Time     // 同账号重试截止时间；零值表示仅受 retryLimit 限制
 	SameAccountRetryMax       int           // 可选的错误级同账号重试上限，低于 handler 默认预算时优先采用
@@ -716,6 +785,8 @@ type UpstreamFailoverError struct {
 	GatewayPoolRetry          bool // pre-delivery recovery, bounded by the original request's wait policy
 	ClientStatusCode          int
 	ClientMessage             string
+	StreamFailedFrame         *OpenAIStreamFailedFrame // 触发本次 failover 的流内 failed/error 帧；耗尽时用于错误透传规则匹配
+	SameAccountRetryOnly      bool                     // allow a bounded same-account retry even when switching accounts is prohibited
 	// RawRelayResponse：原样中继账号整体不可用。换号耗尽时 handler 把 StatusCode/
 	// ResponseHeaders/ResponseBody 原样写回客户端，不经错误映射与脱敏；WS 下
 	// ResponseBody 是已包好的错误帧，原样发一帧。
@@ -1457,12 +1528,12 @@ func (s *GatewayService) GetAvailableModels(ctx context.Context, groupID *int64,
 	hasAnyMapping := false
 
 	for _, acc := range accounts {
-		// Passthrough routing accepts models independently of model_mapping, so a
+		// Default passthrough accepts models independently of model_mapping, so a
 		// stale mapping on a passthrough account must not narrow the public list.
 		// Treat it like an unmapped account: skip its mapping here and let
 		// supplementUnmappedOpenAIModels contribute the default set. Mappings on
 		// the ordinary accounts in the same group still count.
-		if platform == PlatformOpenAI && acc.IsOpenAIPassthroughEnabled() {
+		if platform == PlatformOpenAI && acc.IsOpenAIPassthroughEnabled() && !acc.IsOpenAIPassthroughModelFilterEnabled() {
 			continue
 		}
 

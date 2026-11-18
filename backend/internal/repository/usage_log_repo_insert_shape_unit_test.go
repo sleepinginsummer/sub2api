@@ -130,11 +130,12 @@ func TestPrepareUsageLogInsert_UpstreamRequestIDArgWiring(t *testing.T) {
 	require.Len(t, prepared.args, len(usageLogInsertArgTypes))
 
 	// 尾部顺序：upstream_request_id, session_id, native_compaction_v2,
+	// cache_creation_30m_tokens, cache_creation_12h_tokens,
 	// turn_state, turn_state_overridden, turn_state_source, turn_state_sent,
 	// safety_buffering_enabled, safety_buffering_faster_model,
 	// route_gateway, route_pair, route_pair_overridden, route_pair_pool_gateway,
 	// route_pair_pool_version, first_answer_ms, reasoning_tokens, created_at
-	idx := len(prepared.args) - 17
+	idx := len(prepared.args) - 19
 	arg, ok := prepared.args[idx].(sql.NullString)
 	require.True(t, ok, "upstream_request_id arg should be sql.NullString, got %T", prepared.args[idx])
 	require.True(t, arg.Valid)
@@ -174,10 +175,10 @@ func TestPrepareUsageLogInsert_TurnStateArgWiring(t *testing.T) {
 	require.Len(t, prepared.args, len(usageLogInsertArgTypes))
 
 	n := len(prepared.args)
-	// 尾部顺序：... native_compaction_v2, turn_state, turn_state_overridden, turn_state_source,
+	// 尾部顺序：... native_compaction_v2, cache buckets ×2, turn_state, turn_state_overridden, turn_state_source,
 	// turn_state_sent, safety_buffering ×2, route_gateway, route_pair, route_pair_overridden,
 	// route_pair_pool_gateway, route_pair_pool_version, first_answer_ms, reasoning_tokens, created_at
-	require.Equal(t, "boolean", usageLogInsertArgTypes[n-15], "native_compaction_v2 必须仍在倒数第 15")
+	require.Equal(t, "boolean", usageLogInsertArgTypes[n-17], "native_compaction_v2 必须仍在倒数第 17")
 
 	tsArg, ok := prepared.args[n-14].(sql.NullString)
 	require.True(t, ok, "turn_state 应是 sql.NullString，实际 %T", prepared.args[n-14])

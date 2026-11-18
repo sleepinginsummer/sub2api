@@ -67,6 +67,9 @@ const usageLogsUpstreamRequestIDIndex = "idx_usage_logs_upstream_request_id"
 const affiliateWithdrawOperationIDIndexMigration = "240_affiliate_ledger_operation_id_index_notx.sql"
 const affiliateWithdrawOperationIDIndex = "idx_user_affiliate_ledger_operation_id"
 
+const usageLogsAPIKeyCostIndexMigration = "249_add_usage_logs_api_key_cost_index_notx.sql"
+const usageLogsAPIKeyCostIndex = "idx_usage_logs_api_key_created_cost"
+
 type migrationChecksumCompatibilityRule struct {
 	fileChecksum       string
 	acceptedDBChecksum map[string]struct{}
@@ -319,6 +322,8 @@ func prepareNonTransactionalMigration(ctx context.Context, db migrationConnectio
 		return dropInvalidIndexIfPresent(ctx, db, usageLogsUpstreamRequestIDIndex)
 	case affiliateWithdrawOperationIDIndexMigration:
 		return dropInvalidIndexIfPresent(ctx, db, affiliateWithdrawOperationIDIndex)
+	case usageLogsAPIKeyCostIndexMigration:
+		return dropInvalidIndexIfPresent(ctx, db, usageLogsAPIKeyCostIndex)
 	default:
 		return nil
 	}
