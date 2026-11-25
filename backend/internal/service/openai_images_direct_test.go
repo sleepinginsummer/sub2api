@@ -131,6 +131,33 @@ func TestCodexDirectImagesStreamDeliversPlainJSON(t *testing.T) {
 	require.Contains(t, rec.Body.String(), `"b64_json":"aGVsbG8="`)
 }
 
+// The live endpoint pretty-prints its JSON; the usage copied into the
+// completed event must not split the SSE data line.
+func TestCodexDirectImagesStreamKeepsPrettyPrintedUsageOnOneLine(t *testing.T) {
+	body := []byte(`{"model":"gpt-image-2","prompt":"draw","stream":true}`)
+	c, rec := newOpenAIImagesTestContext(t, body)
+	resp := openAIImagesJSONResponse()
+	resp.Body = io.NopCloser(strings.NewReader("{\n  \"created\": 1710000000,\n  \"data\": [\n    {\n      \"b64_json\": \"aGVsbG8=\"\n    }\n  ],\n  \"usage\": {\n    \"input_tokens\": 10,\n    \"output_tokens\": 20\n  }\n}\n"))
+	svc := newOpenAIImagesTestService(nil)
+	parsed, err := svc.ParseOpenAIImagesRequest(c, body)
+	require.NoError(t, err)
+	// Verify JSON-to-SSE framing independently of the fork's OAuth routing policy.
+	_, _, _, _, err = svc.handleOpenAIImagesStreamingResponse(resp, c, time.Now(), parsed)
+	require.NoError(t, err)
+
+	out := strings.TrimRight(rec.Body.String(), "\n")
+	var data string
+	for _, line := range strings.Split(out, "\n") {
+		require.True(t, line == "" || strings.HasPrefix(line, "event: ") || strings.HasPrefix(line, "data: "), "SSE line split mid-payload: %q", line)
+		if strings.HasPrefix(line, "data: ") {
+			data = strings.TrimPrefix(line, "data: ")
+		}
+	}
+	require.True(t, gjson.Valid(data), "data line is not complete JSON: %q", data)
+	require.Equal(t, "aGVsbG8=", gjson.Get(data, "b64_json").String())
+	require.Equal(t, int64(20), gjson.Get(data, "usage.output_tokens").Int())
+}
+
 func TestCodexDirectImagesMultipleOutputs(t *testing.T) {
 	requireCodexDirectImages(t)
 	for _, stream := range []bool{false, true} {
